@@ -211,6 +211,11 @@ client.identify(User {
 }).await?;
 ```
 
+## Known Limitations
+
+- **Nested Trace Spans:** The Rust SDK currently provides manual span instrumentation (`start_span`, `start_tool_span`). It does not yet automatically hook into Rust LLM frameworks (like `async-openai` or `langchain-rust`) to produce nested trace spans automatically. You must create spans manually.
+- **PII Redaction:** Automatic PII redaction (which is available in the Python SDK via `set_redact_pii`) is not yet implemented in the Rust SDK.
+
 ## Configuration
 
 | Builder method            | Default                                | Description                                              |

@@ -16,6 +16,8 @@ pub struct SpanOptions {
     pub name: String,
     /// Optional event id this span belongs to.
     pub event_id: String,
+    /// Optional operation id (e.g. "ai.toolCall", "ai.workflow"). Required for the span to survive backend ingestion filters if no other `ai.*` or `traceloop.*` attributes are present.
+    pub operation_id: String,
     /// Optional parent span. If `None`, a new trace is created.
     pub parent: Option<Span>,
     /// Association properties (will be flattened to `traceloop.association.properties.<key>`).
