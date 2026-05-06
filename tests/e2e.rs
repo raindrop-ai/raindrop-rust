@@ -1294,14 +1294,17 @@ async fn e2e_attachments_split_by_role_on_dashboard() {
     assert_eq!(output_att["name"].as_str().unwrap_or(""), "summary");
 }
 
-/// **Token usage propagation.** Manually emit `gen_ai.response.model` + `gen_ai.usage.*`
-/// on a span via `Span::set_token_usage` and verify the dashboard exposes the totals on
-/// the event. This exercises the full backend pipeline:
-///   1. `parseSpan.ts::getInputAndOutputTokens` — gates on `gen_ai.response.model`
-///   2. `toTokenUsage` — collects per-span tokens
-///   3. The token-usage Tinybird pipeline that aggregates per event
+/// **Token-usage helper smoke test.** Manually emit `gen_ai.response.model` and
+/// `gen_ai.usage.*` on a span via `Span::set_token_usage` and verify the parent event
+/// lands on the dashboard with the matching `aiData.model`. This is intentionally
+/// limited to verifying the helper SHIPS the canonical attributes and the parent
+/// event lands; the dashboard's `events.list` TRPC does not surface per-event token
+/// totals directly (token usage is stored in a separate Tinybird datasource keyed by
+/// span_id, queried by other endpoints), so an assertion on actual token counts would
+/// require a different read path. Wire-format assertions for the exact attribute
+/// shape live in `tests/wire_format.rs::span_set_token_usage_emits_gen_ai_attributes`.
 #[tokio::test]
-async fn e2e_set_token_usage_lands_token_counts_on_event() {
+async fn e2e_set_token_usage_helper_attributes_land_with_event() {
     let (write_key, dashboard_token) = match env_keys() {
         Some(v) => v,
         None => {

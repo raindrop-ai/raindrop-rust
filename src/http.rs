@@ -68,15 +68,16 @@ impl RetryingHttpClient {
         // The ingestion gateway enforces a similar cap and would return 413 otherwise.
         // Returning `Ok(())` here keeps SDK calls non-fatal — losing one payload is
         // strictly better than blocking the host application on a serialization disaster.
+        // The warning is unconditional (NOT gated on `debug`) so production callers
+        // without verbose logging still get a single line per drop and can detect
+        // accidental oversize streams.
         if payload.len() > MAX_INGEST_SIZE_BYTES {
-            if self.cfg.debug {
-                tracing::warn!(
-                    path,
-                    bytes = payload.len(),
-                    max = MAX_INGEST_SIZE_BYTES,
-                    "raindrop: dropping oversized payload (> 1 MiB)"
-                );
-            }
+            tracing::warn!(
+                path,
+                bytes = payload.len(),
+                max = MAX_INGEST_SIZE_BYTES,
+                "raindrop: dropping oversized payload (> 1 MiB)"
+            );
             return Ok(());
         }
 
