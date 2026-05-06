@@ -9,6 +9,7 @@ license = "MIT"
 homepage = "https://raindrop.ai"
 repository = "https://github.com/invisible-tools/raindrop-rust"
 readme = "README.md"
+publish = false
 
 [lib]
 name = "raindrop"
