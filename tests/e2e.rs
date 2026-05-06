@@ -18,6 +18,7 @@ use std::env;
 use std::time::Duration;
 
 use serde_json::{json, Value};
+use time::OffsetDateTime;
 use tokio::time::sleep;
 
 use raindrop::{
@@ -655,6 +656,13 @@ async fn e2e_complex_agent_trajectory_with_subagents_tools_retry_failure_and_slo
         })
         .await;
 
+    // Use explicit monotonic timestamps for every span/tool so the dashboard timeline
+    // is realistic. Avoid retroactive `duration`-only tool calls here: they derive
+    // `start = now - duration`, which can backdate a long tool before its parent if
+    // the call is made later in the synthetic scenario.
+    let base = OffsetDateTime::now_utc();
+    let at = |ms: u64| base + Duration::from_millis(ms);
+
     let root = interaction.start_span(SpanOptions {
         name: "agent.root".into(),
         operation_id: "ai.workflow".into(),
@@ -662,6 +670,7 @@ async fn e2e_complex_agent_trajectory_with_subagents_tools_retry_failure_and_slo
             Attribute::string("traceloop.span.kind", "workflow"),
             Attribute::string("agent.name", "account-health-agent"),
         ],
+        start_time: Some(at(0)),
         ..Default::default()
     });
 
@@ -673,6 +682,7 @@ async fn e2e_complex_agent_trajectory_with_subagents_tools_retry_failure_and_slo
             Attribute::string("traceloop.span.kind", "task"),
             Attribute::string("subagent.name", "planner"),
         ],
+        start_time: Some(at(10)),
         ..Default::default()
     });
     let plan_tool = interaction.start_tool_span(
@@ -683,14 +693,15 @@ async fn e2e_complex_agent_trajectory_with_subagents_tools_retry_failure_and_slo
                 "objective": "find account risks",
                 "constraints": ["no writes", "retry transient API failure"]
             })),
+            start_time: Some(at(20)),
             ..Default::default()
         },
     );
     plan_tool.set_output(&json!({
         "steps": ["load_profile", "fetch_risk_signals", "retry_failed_fetch", "summarize"]
     }));
-    plan_tool.end();
-    planner.end();
+    plan_tool.end_at(Some(at(140)));
+    planner.end_at(Some(at(160)));
 
     let researcher = interaction.start_span(SpanOptions {
         name: "subagent.researcher".into(),
@@ -700,6 +711,7 @@ async fn e2e_complex_agent_trajectory_with_subagents_tools_retry_failure_and_slo
             Attribute::string("traceloop.span.kind", "task"),
             Attribute::string("subagent.name", "researcher"),
         ],
+        start_time: Some(at(180)),
         ..Default::default()
     });
 
@@ -711,7 +723,8 @@ async fn e2e_complex_agent_trajectory_with_subagents_tools_retry_failure_and_slo
         parent: Some(researcher.clone()),
         input: Some(json!({"customer_id": "cust_123", "fields": ["plan", "usage", "health"]})),
         output: Some(json!({"plan": "enterprise", "usage": "high", "health": "warning"})),
-        duration: Some(Duration::from_millis(125)),
+        start_time: Some(at(200)),
+        end_time: Some(at(325)),
         properties: lookup_props,
         ..Default::default()
     });
@@ -728,7 +741,8 @@ async fn e2e_complex_agent_trajectory_with_subagents_tools_retry_failure_and_slo
             parent: Some(researcher.clone()),
             input: Some(json!({"regex": "(?i)billing|slow", "page": idx})),
             output: Some(json!({"matches": idx + 2})),
-            duration: Some(Duration::from_millis(450 + (idx as u64) * 80)),
+            start_time: Some(at(if idx == 0 { 350 } else { 820 })),
+            end_time: Some(at(if idx == 0 { 800 } else { 1_350 })),
             properties: repeated_props,
             ..Default::default()
         });
@@ -743,7 +757,8 @@ async fn e2e_complex_agent_trajectory_with_subagents_tools_retry_failure_and_slo
             parent: Some(researcher.clone()),
             input: Some(json!({"filter": "risk_signal", "bucket": idx})),
             output: Some(json!({"count": 10 + idx})),
-            duration: Some(Duration::from_millis(120 + (idx as u64) * 30)),
+            start_time: Some(at(if idx == 0 { 1_360 } else { 1_500 })),
+            end_time: Some(at(if idx == 0 { 1_480 } else { 1_650 })),
             properties: repeated_props,
             ..Default::default()
         });
@@ -758,7 +773,8 @@ async fn e2e_complex_agent_trajectory_with_subagents_tools_retry_failure_and_slo
         parent: Some(researcher.clone()),
         input: Some(json!({"customer_id": "cust_123", "window": "7d"})),
         error: Some("TimeoutError: risk service timed out after 2s".into()),
-        duration: Some(Duration::from_millis(210)),
+        start_time: Some(at(1_700)),
+        end_time: Some(at(1_910)),
         properties: failed_props,
         ..Default::default()
     });
@@ -774,7 +790,8 @@ async fn e2e_complex_agent_trajectory_with_subagents_tools_retry_failure_and_slo
             json!({"customer_id": "cust_123", "window": "7d", "retry_of": "risk_signal_fetch"}),
         ),
         output: Some(json!({"risk_signals": ["billing_spike", "slow_response"], "count": 2})),
-        duration: Some(Duration::from_millis(180)),
+        start_time: Some(at(1_930)),
+        end_time: Some(at(2_110)),
         properties: retry_props,
         ..Default::default()
     });
@@ -787,12 +804,13 @@ async fn e2e_complex_agent_trajectory_with_subagents_tools_retry_failure_and_slo
         parent: Some(researcher.clone()),
         input: Some(json!({"customer_id": "cust_123", "query": "recent incidents"})),
         output: Some(json!({"incidents": 3, "oldest_age_hours": 36})),
-        duration: Some(Duration::from_millis(1_350)),
+        start_time: Some(at(2_200)),
+        end_time: Some(at(3_550)),
         properties: slow_props,
         ..Default::default()
     });
-    researcher.end();
-    root.end();
+    researcher.end_at(Some(at(3_600)));
+    root.end_at(Some(at(3_650)));
 
     let mut finish_props = BTreeMap::new();
     finish_props.insert(
