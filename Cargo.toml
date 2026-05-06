@@ -31,13 +31,17 @@ serde_json = "1.0"
 uuid = { version = "1.7", features = ["v4"] }
 base64 = "0.22"
 rand = "0.8"
-time = { version = "0.3", features = ["formatting", "parsing", "macros"] }
+time = { version = "0.3", features = ["formatting", "parsing"] }
 thiserror = "1.0"
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 futures = "0.3"
 
 [dev-dependencies]
 tokio = { version = "1.36", features = ["full", "test-util"] }
+# `macros` is only needed by the test suite (e.g. `time::macros::datetime!`),
+# not the library itself. Pulling it into [dev-dependencies] keeps lib consumer
+# builds smaller.
+time = { version = "0.3", features = ["macros"] }
 wiremock = "0.6"
 serde_json = "1.0"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

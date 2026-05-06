@@ -43,8 +43,12 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
-      - name: Build with MSRV
-        run: cargo build --all-features --verbose
+      # Use --locked so the MSRV check actually verifies that the committed
+      # Cargo.lock is buildable on MSRV. Without this, cargo could pick newer
+      # minor versions of dependencies that bump the effective MSRV and the
+      # check would silently no-op.
+      - name: Build with MSRV (locked)
+        run: cargo build --all-features --locked --verbose
 
   features:
     name: Feature combinations
