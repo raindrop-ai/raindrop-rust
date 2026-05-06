@@ -485,8 +485,7 @@ impl Client {
         );
         let parent_ids = opts.parent.as_ref().and_then(|p| p.ids());
         let ids = create_span_ids(parent_ids.as_ref());
-        let mut otlp_attrs: Vec<OtlpKeyValue> =
-            Vec::with_capacity(attrs.len() + 2);
+        let mut otlp_attrs: Vec<OtlpKeyValue> = Vec::with_capacity(attrs.len() + 2);
         otlp_attrs.push(OtlpKeyValue::from(Attribute::string(
             "ai.operationId",
             "ai.toolCall",

@@ -5,10 +5,14 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use tokio::time::sleep;
 
-use raindrop::{AiEvent, Client, Signal, SpanOptions, ToolOptions, User};
+use raindrop::{AiEvent, Client, Signal, ToolOptions, User};
 
-async fn query_dashboard(token: &str, limit: usize) -> Result<Vec<Value>, Box<dyn std::error::Error>> {
-    let backend_url = env::var("RAINDROP_BACKEND_URL").unwrap_or_else(|_| "https://backend.raindrop.ai".to_string());
+async fn query_dashboard(
+    token: &str,
+    limit: usize,
+) -> Result<Vec<Value>, Box<dyn std::error::Error>> {
+    let backend_url = env::var("RAINDROP_BACKEND_URL")
+        .unwrap_or_else(|_| "https://backend.raindrop.ai".to_string());
     let input_obj = json!({
         "json": {
             "limit": limit,
@@ -27,11 +31,18 @@ async fn query_dashboard(token: &str, limit: usize) -> Result<Vec<Value>, Box<dy
         .error_for_status()?;
 
     let body: Value = resp.json().await?;
-    let data = body["result"]["data"].as_array().cloned().unwrap_or_default();
+    let data = body["result"]["data"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
     Ok(data)
 }
 
-async fn poll_events(token: &str, user_id: &str, min_count: usize) -> Result<Vec<Value>, Box<dyn std::error::Error>> {
+async fn poll_events(
+    token: &str,
+    user_id: &str,
+    min_count: usize,
+) -> Result<Vec<Value>, Box<dyn std::error::Error>> {
     let timeout = Duration::from_secs(60);
     let interval = Duration::from_secs(5);
     let start = std::time::Instant::now();
@@ -48,7 +59,11 @@ async fn poll_events(token: &str, user_id: &str, min_count: usize) -> Result<Vec
         }
         sleep(interval).await;
     }
-    Err(format!("Timeout waiting for {} events for user {}", min_count, user_id).into())
+    Err(format!(
+        "Timeout waiting for {} events for user {}",
+        min_count, user_id
+    )
+    .into())
 }
 
 #[tokio::main]
@@ -64,70 +79,85 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let write_key = write_key.unwrap();
     let dashboard_token = dashboard_token.unwrap();
 
-    let run_id = uuid::Uuid::new_v4().to_string().chars().take(8).collect::<String>();
+    let run_id = uuid::Uuid::new_v4()
+        .to_string()
+        .chars()
+        .take(8)
+        .collect::<String>();
     let user_id = format!("e2e_rust_{}", run_id);
     let convo_id = format!("e2e_rust_convo_{}", run_id);
 
     println!("Starting E2E verification for user_id: {}", user_id);
 
-    let client = Client::builder()
-        .write_key(write_key)
-        .build()?;
+    let client = Client::builder().write_key(write_key).build()?;
 
     // 1. Identify
-    client.identify(User {
-        user_id: user_id.clone(),
-        traits: BTreeMap::from([("plan".to_string(), json!("pro"))]),
-    }).await?;
+    client
+        .identify(User {
+            user_id: user_id.clone(),
+            traits: BTreeMap::from([("plan".to_string(), json!("pro"))]),
+        })
+        .await?;
 
     // 2. Track AI Event
     let mut props = BTreeMap::new();
     props.insert("ai.usage.prompt_tokens".to_string(), json!(10));
     props.insert("ai.usage.completion_tokens".to_string(), json!(20));
 
-    client.track_ai(AiEvent {
-        event_id: format!("evt_ai_{}", run_id),
-        user_id: user_id.clone(),
-        event: "ai_generation".to_string(),
-        input: "Hello Rust".to_string(),
-        output: "Hello World".to_string(),
-        model: "gpt-4o".to_string(),
-        convo_id: convo_id.clone(),
-        properties: props,
-        ..Default::default()
-    }).await?;
+    client
+        .track_ai(AiEvent {
+            event_id: format!("evt_ai_{}", run_id),
+            user_id: user_id.clone(),
+            event: "ai_generation".to_string(),
+            input: "Hello Rust".to_string(),
+            output: "Hello World".to_string(),
+            model: "gpt-4o".to_string(),
+            convo_id: convo_id.clone(),
+            properties: props,
+            ..Default::default()
+        })
+        .await?;
 
     // 3. Track Signal
-    client.track_signal(Signal {
-        event_id: format!("evt_ai_{}", run_id),
-        name: "thumbs_up".to_string(),
-        kind: "feedback".to_string(),
-        sentiment: "POSITIVE".to_string(),
-        comment: "Great SDK".to_string(),
-        ..Default::default()
-    }).await?;
+    client
+        .track_signal(Signal {
+            event_id: format!("evt_ai_{}", run_id),
+            name: "thumbs_up".to_string(),
+            kind: "feedback".to_string(),
+            sentiment: "POSITIVE".to_string(),
+            comment: "Great SDK".to_string(),
+            ..Default::default()
+        })
+        .await?;
 
     // 4. Manual Spans & Tools
-    let interaction = client.begin(raindrop::BeginOptions {
-        event_id: format!("evt_interaction_{}", run_id),
-        user_id: user_id.clone(),
-        convo_id: convo_id.clone(),
-        input: "Run tool".to_string(),
-        ..Default::default()
-    }).await;
+    let interaction = client
+        .begin(raindrop::BeginOptions {
+            event_id: format!("evt_interaction_{}", run_id),
+            user_id: user_id.clone(),
+            convo_id: convo_id.clone(),
+            input: "Run tool".to_string(),
+            ..Default::default()
+        })
+        .await;
 
-    let tool = interaction.start_tool_span("weather_lookup", ToolOptions {
-        input: Some(json!({"location": "SF"})),
-        ..Default::default()
-    });
+    let tool = interaction.start_tool_span(
+        "weather_lookup",
+        ToolOptions {
+            input: Some(json!({"location": "SF"})),
+            ..Default::default()
+        },
+    );
     sleep(Duration::from_millis(100)).await;
     tool.set_output(&json!({"temp": 72}));
     tool.end();
 
-    interaction.finish(raindrop::FinishOptions {
-        output: "The weather is 72".to_string(),
-        ..Default::default()
-    }).await?;
+    interaction
+        .finish(raindrop::FinishOptions {
+            output: "The weather is 72".to_string(),
+            ..Default::default()
+        })
+        .await?;
 
     // Flush and close
     client.close().await?;
@@ -143,13 +173,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for ev in events {
         let ai = &ev["aiData"];
         let input = ai["input"].as_str().unwrap_or("");
-        
+
         if input == "Hello Rust" {
             found_ai = true;
             assert_eq!(ai["output"].as_str().unwrap(), "Hello World");
             assert_eq!(ai["model"].as_str().unwrap(), "gpt-4o");
             assert_eq!(ai["convoId"].as_str().unwrap(), convo_id);
-            
+
             let props = &ev["properties"];
             assert_eq!(props["ai.usage.prompt_tokens"].as_u64().unwrap(), 10);
             assert_eq!(props["ai.usage.completion_tokens"].as_u64().unwrap(), 20);

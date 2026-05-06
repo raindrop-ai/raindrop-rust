@@ -8,7 +8,10 @@ authors = ["Raindrop AI <sdk@raindrop.ai>"]
 license = "MIT"
 homepage = "https://raindrop.ai"
 repository = "https://github.com/invisible-tools/raindrop-rust"
+documentation = "https://docs.rs/raindrop-ai"
 readme = "README.md"
+keywords = ["raindrop", "observability", "ai", "llm", "tracing"]
+categories = ["development-tools::debugging", "api-bindings"]
 publish = false
 
 [lib]
@@ -31,7 +34,6 @@ rand = "0.8"
 time = { version = "0.3", features = ["formatting", "parsing", "macros"] }
 thiserror = "1.0"
 tracing = { version = "0.1", default-features = false, features = ["std"] }
-async-trait = "0.1"
 futures = "0.3"
 
 [dev-dependencies]

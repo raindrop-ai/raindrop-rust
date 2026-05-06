@@ -195,19 +195,22 @@ span.end();
 ## Signals and identify
 
 ```rust
+use std::collections::BTreeMap;
+use serde_json::json;
 use raindrop::{Signal, User};
 
 client.track_signal(Signal {
-    name: "thumbs_up".into(),
     event_id: "evt_123".into(),
-    score: Some(1.0),
+    name: "thumbs_up".into(),
+    kind: "feedback".into(),
+    sentiment: "POSITIVE".into(),
+    comment: "Great answer".into(),
     ..Default::default()
 }).await?;
 
 client.identify(User {
     user_id: "user-123".into(),
-    properties: BTreeMap::from([("plan".into(), json!("pro"))]),
-    ..Default::default()
+    traits: BTreeMap::from([("plan".into(), json!("pro"))]),
 }).await?;
 ```
 
@@ -218,20 +221,22 @@ client.identify(User {
 
 ## Configuration
 
-| Builder method            | Default                                | Description                                              |
-| ------------------------- | -------------------------------------- | -------------------------------------------------------- |
-| `write_key`               | `""`                                   | Empty/missing key → SDK is disabled (no-op)              |
-| `endpoint`                | `https://api.raindrop.ai/v1/`          | Base URL                                                 |
-| `partial_flush_interval`  | `1s`                                   | Periodic event flush. `0` disables periodic flush        |
-| `trace_flush_interval`    | `1s`                                   | Periodic span flush. `0` disables periodic flush         |
-| `trace_max_batch_size`    | `50`                                   | Max spans per export request                             |
-| `trace_max_queue_size`    | `5000`                                 | Backpressure threshold for spans                         |
-| `max_attempts`            | `3`                                    | HTTP retries (1 = no retries)                            |
-| `base_delay`              | `1s`                                   | Backoff base (exponential, ±20% jitter)                  |
-| `jitter_fraction`         | `0.2`                                  | Backoff jitter fraction                                  |
-| `service_name`            | `raindrop.rust-sdk`                    | OTLP `resource.service.name`                             |
-| `library_version`         | crate version                          | `$context.library.version`                               |
-| `http_client`             | new `reqwest::Client`                  | Bring your own connection-pooled HTTP client             |
+| Builder method           | Default                       | Description                                       |
+| ------------------------ | ----------------------------- | ------------------------------------------------- |
+| `write_key`              | `""`                          | Empty/missing key → SDK is disabled (no-op)       |
+| `endpoint`               | `https://api.raindrop.ai/v1/` | Base URL                                          |
+| `debug`                  | `false`                       | Verbose debug logging via `tracing`               |
+| `partial_flush_interval` | `1s`                          | Periodic event flush. `0` disables periodic flush |
+| `trace_flush_interval`   | `1s`                          | Periodic span flush. `0` disables periodic flush  |
+| `trace_max_batch_size`   | `50`                          | Max spans per export request                      |
+| `trace_max_queue_size`   | `5000`                        | Backpressure threshold for spans                  |
+| `max_attempts`           | `3`                           | HTTP retries (1 = no retries)                     |
+| `base_delay`             | `1s`                          | Backoff base (exponential, ±20% jitter)           |
+| `jitter_fraction`        | `0.2`                         | Backoff jitter fraction (0.0–1.0)                 |
+| `service_name`           | `raindrop.rust-sdk`           | OTLP `resource.service.name`                      |
+| `library_name`           | `raindrop-rust`               | `$context.library.name`                           |
+| `library_version`        | crate version                 | `$context.library.version`                        |
+| `http_client`            | new `reqwest::Client`         | Bring your own connection-pooled HTTP client      |
 
 ## Architecture
 
@@ -248,13 +253,36 @@ client.identify(User {
 
 ## Testing
 
+The unit and integration test suite is built around `wiremock` and validates
+the wire payload shape end-to-end. Run it locally with:
+
 ```bash
 cargo test
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
+cargo doc --no-deps
 ```
 
-The test suite is built around `wiremock` and validates payload shape against the other SDKs.
+CI runs the full matrix on every push: `cargo test`, `cargo clippy`, `cargo fmt`,
+`cargo doc` (with warnings as errors), MSRV (`1.75`), and feature combinations
+(`rustls-tls`, `native-tls`).
+
+### End-to-end tests against a live backend
+
+`tests/e2e.rs` exercises `track_ai`, interactions, tool spans, signals, and
+identify against a real Raindrop ingestion endpoint and verifies the data lands
+on the dashboard. They are skipped automatically when the required environment
+variables are not set, so they are safe to leave enabled in `cargo test`. To
+opt in:
+
+```bash
+RAINDROP_WRITE_KEY=rk_... \
+RAINDROP_DASHBOARD_TOKEN=eyJ... \
+cargo test --test e2e
+```
+
+Optional overrides: `RAINDROP_ENDPOINT` (ingestion API base URL),
+`RAINDROP_BACKEND_URL` (dashboard TRPC base URL).
 
 ## License
 

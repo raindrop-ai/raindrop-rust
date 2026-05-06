@@ -28,7 +28,7 @@ pub struct SpanOptions {
     pub start_time: Option<OffsetDateTime>,
 }
 
-/// Options for [`Interaction::start_tool_span`].
+/// Options for [`crate::events::Interaction::start_tool_span`].
 #[derive(Debug, Default, Clone)]
 pub struct ToolOptions {
     /// Optional parent span.
@@ -41,7 +41,7 @@ pub struct ToolOptions {
     pub start_time: Option<OffsetDateTime>,
 }
 
-/// Options for retroactive tool tracking via [`Interaction::track_tool`] /
+/// Options for retroactive tool tracking via [`crate::events::Interaction::track_tool`] /
 /// [`Tracer::track_tool`].
 #[derive(Debug, Default, Clone)]
 pub struct TrackToolOptions {
