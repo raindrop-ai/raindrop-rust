@@ -329,9 +329,9 @@ impl Client {
         };
 
         let patch = EventPatch {
-            event_name: opts.event,
-            user_id: opts.user_id,
-            convo_id: opts.convo_id,
+            event_name: opts.event.clone(),
+            user_id: opts.user_id.clone(),
+            convo_id: opts.convo_id.clone(),
             input: opts.input,
             output: String::new(),
             model: opts.model,
@@ -346,7 +346,13 @@ impl Client {
             .clone()
             .patch(&self.inner, &event_id, patch)
             .await;
-        Interaction::new(self.clone(), event_id)
+        Interaction::new_with_context(
+            self.clone(),
+            event_id,
+            opts.user_id,
+            opts.convo_id,
+            opts.event,
+        )
     }
 
     /// Resume a previously-started interaction by event id. The returned `Interaction` shares the

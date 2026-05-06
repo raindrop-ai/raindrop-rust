@@ -199,12 +199,12 @@ span.end();
 ```rust
 use std::collections::BTreeMap;
 use serde_json::json;
-use raindrop::{Signal, User};
+use raindrop::{Signal, SignalKind, User};
 
 client.track_signal(Signal {
     event_id: "evt_123".into(),
     name: "thumbs_up".into(),
-    kind: "feedback".into(),
+    kind: SignalKind::FEEDBACK.into(),  // also: DEFAULT, STANDARD, EDIT, AGENT, AGENT_INTERNAL
     sentiment: "POSITIVE".into(),
     comment: "Great answer".into(),
     ..Default::default()
@@ -215,6 +215,39 @@ client.identify(User {
     traits: BTreeMap::from([("plan".into(), json!("pro"))]),
 }).await?;
 ```
+
+The wire field is `signal_type` and the canonical accepted values are `default`,
+`standard`, `feedback`, `edit`, `agent`, and `agent_internal` — see
+[`SignalKind`](https://docs.rs/raindrop-ai) for typed constants.
+
+## Span association properties (auto-propagated from interaction)
+
+Every span started via `interaction.start_span(...)` or `interaction.start_tool_span(...)`
+automatically inherits the interaction's `user_id`, `convo_id`, and `event` as
+`traceloop.association.properties.{user_id, convo_id, event}` attributes, so the dashboard
+groups the span under the same user, conversation, and event as the parent. User-supplied
+properties always take precedence:
+
+```rust
+let interaction = client.begin(BeginOptions {
+    user_id: "user-123".into(),
+    convo_id: "conv-456".into(),
+    event: "agent_run".into(),
+    ..Default::default()
+}).await;
+
+// This span carries `traceloop.association.properties.{user_id, convo_id, event}` automatically.
+let span = interaction.start_span(SpanOptions { name: "step".into(), ..Default::default() });
+span.end();
+```
+
+For standalone spans created via `client.start_span(...)`, set `operation_id` (e.g.
+`"ai.workflow"`) or pass `properties` so the span has at least one of the attributes
+accepted by the backend's ingestion filter (`ai.operationId`, `traceloop.span.kind`,
+`traceloop.workflow.name`, `traceloop.association.properties.*`, or `gen_ai.*`). Spans
+that don't pass that filter are silently dropped. Plain `client.start_span(...)` calls with
+just `name` + `event_id` automatically emit `traceloop.association.properties.event_id` so
+they pass.
 
 ## Known Limitations
 

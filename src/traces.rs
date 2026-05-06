@@ -184,10 +184,24 @@ impl Span {
                 return;
             }
             state.ended = true;
-            let mut attributes: Vec<OtlpKeyValue> = Vec::with_capacity(state.attrs.len() + 1);
+            // Pre-allocate for both the eventId attribute we always add and the
+            // `traceloop.association.properties.event_id` attribute we add when event_id is set.
+            // The latter is critical: the backend's `hasAIOperation` filter silently DROPS spans
+            // that don't have one of {ai.operationId, traceloop.span.kind, traceloop.workflow.name,
+            // traceloop.association.properties.{user_id,convo_id,event_id}, gen_ai.*}. A plain
+            // `start_span` with only `ai.telemetry.metadata.raindrop.eventId` would be discarded.
+            let mut attributes: Vec<OtlpKeyValue> = Vec::with_capacity(state.attrs.len() + 2);
             if !inner.event_id.is_empty() {
                 attributes.push(OtlpKeyValue::from(Attribute::string(
                     "ai.telemetry.metadata.raindrop.eventId",
+                    &inner.event_id,
+                )));
+                // Also emit the traceloop association property so the span passes ingestion.
+                // The backend's `getCustomEventId` already prefers this key over the
+                // `ai.telemetry.metadata.raindrop.eventId` fallback, so this is the canonical
+                // representation and is safe to always emit.
+                attributes.push(OtlpKeyValue::from(Attribute::string(
+                    "traceloop.association.properties.event_id",
                     &inner.event_id,
                 )));
             }

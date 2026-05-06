@@ -20,7 +20,10 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use tokio::time::sleep;
 
-use raindrop::{AiEvent, Client, Signal, ToolOptions, User};
+use raindrop::{
+    AiEvent, Attachment, Attribute, BeginOptions, Client, FinishOptions, Signal, SignalKind,
+    SpanOptions, ToolOptions, TrackToolOptions, User,
+};
 
 const DEFAULT_BACKEND_URL: &str = "https://backend.raindrop.ai";
 
@@ -318,4 +321,758 @@ async fn e2e_signals_and_identify_land_in_dashboard() {
         .unwrap_or_else(|| panic!("track_ai event not found among {:?}", events));
     assert_eq!(ev["userId"].as_str().unwrap_or(""), user_id);
     assert_eq!(ev["aiData"]["output"].as_str().unwrap_or(""), "I am rated");
+}
+
+// ────────────────────────────────────────────────────────────────────────────────────
+// Pedantic dashboard surface tests — every test below verifies a SPECIFIC field of the
+// dashboard response that the SDK is responsible for populating, with deep assertions
+// (not just "an event exists").
+//
+// Source of truth for the dashboard event shape:
+//   `dawn/packages/schemas/src/frontend/index.ts::AIAnalyticsEventSchema`
+// Source of truth for the trace span shape:
+//   `dawn/data/tinybird/datasources/traces.datasource`
+// ────────────────────────────────────────────────────────────────────────────────────
+
+/// Query the dashboard's `traces.list` endpoint for a specific event_id and return the spans.
+async fn query_traces_for_event(token: &str, event_id: &str) -> Result<Vec<Value>, String> {
+    let backend_url =
+        env::var("RAINDROP_BACKEND_URL").unwrap_or_else(|_| DEFAULT_BACKEND_URL.to_string());
+    let input_obj = json!({
+        "json": {
+            "eventId": event_id,
+            "limit": 200,
+        }
+    });
+    let encoded = urlencoding::encode(&input_obj.to_string()).into_owned();
+    let url = format!("{}/api/trpc/traces.list?input={}", backend_url, encoded);
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .map_err(|e| format!("trpc.traces.list request failed: {}", e))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!(
+            "traces.list returned {}: {}",
+            status,
+            &body.chars().take(500).collect::<String>()
+        ));
+    }
+    let body: Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("invalid traces.list json: {}", e))?;
+    Ok(body["result"]["data"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default())
+}
+
+/// Poll until at least `min_count` spans for `event_id` are visible on the dashboard, or until
+/// the deadline expires. Spans go through a separate ingestion pipeline from events, so this
+/// helper polls `traces.list` (not `events.list`).
+async fn poll_traces_for_event(
+    token: &str,
+    event_id: &str,
+    min_count: usize,
+    timeout: Duration,
+) -> Result<Vec<Value>, String> {
+    let interval = Duration::from_secs(5);
+    let start = std::time::Instant::now();
+    let mut last_seen = 0usize;
+    while start.elapsed() < timeout {
+        let spans = query_traces_for_event(token, event_id).await?;
+        last_seen = spans.len();
+        if spans.len() >= min_count {
+            return Ok(spans);
+        }
+        sleep(interval).await;
+    }
+    Err(format!(
+        "Timed out waiting for {} spans for event {} after {:?} (last seen {})",
+        min_count, event_id, timeout, last_seen
+    ))
+}
+
+/// **Convo grouping.** Three events sharing the same `convo_id` must all carry the same
+/// `aiData.convoId` on the dashboard, so the convo_list pipe can group them.
+#[tokio::test]
+async fn e2e_convo_grouping_works_across_multiple_track_ai() {
+    let (write_key, dashboard_token) = match env_keys() {
+        Some(v) => v,
+        None => {
+            eprintln!("[e2e] skipping: set RAINDROP_WRITE_KEY and RAINDROP_DASHBOARD_TOKEN to run");
+            return;
+        }
+    };
+    let user_id = unique_user_id("convo");
+    let convo_id = format!("{}_convo", user_id);
+    let client = build_client(&write_key);
+
+    let inputs = ["turn_one", "turn_two", "turn_three"];
+    let outputs = ["resp_one", "resp_two", "resp_three"];
+    for (i, o) in inputs.iter().zip(outputs.iter()) {
+        client
+            .track_ai(AiEvent {
+                user_id: user_id.clone(),
+                convo_id: convo_id.clone(),
+                event: "ai_generation".to_string(),
+                input: (*i).to_string(),
+                output: (*o).to_string(),
+                model: "gpt-4o".to_string(),
+                ..Default::default()
+            })
+            .await
+            .expect("track_ai");
+    }
+    client.close().await.expect("close");
+
+    let events = poll_events(&dashboard_token, &user_id, 3, E2E_POLL_TIMEOUT)
+        .await
+        .expect("dashboard verification");
+    assert!(
+        events.len() >= 3,
+        "expected at least 3 events for convo grouping, got {}",
+        events.len()
+    );
+
+    // Every event must share the convoId
+    for ev in &events {
+        let actual = ev["aiData"]["convoId"].as_str().unwrap_or("");
+        assert_eq!(
+            actual, convo_id,
+            "every event for user {} must carry convoId={}, got {}",
+            user_id, convo_id, actual
+        );
+    }
+
+    // Every input/output pair must appear exactly once
+    let mut seen_inputs = std::collections::HashSet::new();
+    for ev in &events {
+        if let Some(input) = ev["aiData"]["input"].as_str() {
+            seen_inputs.insert(input.to_string());
+        }
+    }
+    for input in inputs {
+        assert!(
+            seen_inputs.contains(input),
+            "missing input {} from {} events; saw {:?}",
+            input,
+            events.len(),
+            seen_inputs
+        );
+    }
+}
+
+/// **Tool calls populated on event.** When `start_tool_span` is called inside an interaction,
+/// the resulting event MUST have `toolCalls[]` with the correct tool_name, status, duration_ms,
+/// and started_at timestamp, AND `toolCallNames[]` with the tool name.
+#[tokio::test]
+async fn e2e_tool_span_populates_event_tool_calls_array() {
+    let (write_key, dashboard_token) = match env_keys() {
+        Some(v) => v,
+        None => {
+            eprintln!("[e2e] skipping: set RAINDROP_WRITE_KEY and RAINDROP_DASHBOARD_TOKEN to run");
+            return;
+        }
+    };
+    let user_id = unique_user_id("toolcall");
+    let convo_id = format!("{}_convo", user_id);
+    let client = build_client(&write_key);
+    let interaction = client
+        .begin(BeginOptions {
+            user_id: user_id.clone(),
+            convo_id: convo_id.clone(),
+            event: "agent_run".to_string(),
+            input: "Find weather".to_string(),
+            ..Default::default()
+        })
+        .await;
+
+    let tool = interaction.start_tool_span(
+        "weather_lookup",
+        ToolOptions {
+            input: Some(json!({"location": "Berlin"})),
+            ..Default::default()
+        },
+    );
+    sleep(Duration::from_millis(150)).await;
+    tool.set_output(&json!({"temp_c": 19, "condition": "rain"}));
+    tool.end();
+
+    interaction
+        .finish(FinishOptions {
+            output: "It's raining 19°C".to_string(),
+            ..Default::default()
+        })
+        .await
+        .expect("finish");
+    client.close().await.expect("close");
+
+    let events = poll_events(&dashboard_token, &user_id, 1, E2E_POLL_TIMEOUT)
+        .await
+        .expect("dashboard verification");
+    let ev = events
+        .iter()
+        .find(|e| e["aiData"]["output"].as_str().unwrap_or("") == "It's raining 19°C")
+        .unwrap_or_else(|| panic!("interaction event not found among {:?}", events));
+
+    // Tool calls array must be populated and contain the weather_lookup tool
+    let tool_calls = ev["toolCalls"]
+        .as_array()
+        .unwrap_or_else(|| panic!("toolCalls must be array, got {:?}", ev["toolCalls"]));
+    assert!(
+        !tool_calls.is_empty(),
+        "toolCalls must be non-empty after start_tool_span. event = {:?}",
+        ev
+    );
+    let weather = tool_calls
+        .iter()
+        .find(|t| t["tool_name"].as_str() == Some("weather_lookup"))
+        .unwrap_or_else(|| panic!("weather_lookup tool call missing, got {:?}", tool_calls));
+    assert_eq!(weather["status"].as_str().unwrap_or(""), "OK");
+    assert!(
+        weather["duration_ms"].as_f64().unwrap_or(0.0) > 0.0,
+        "duration_ms must be positive, got {:?}",
+        weather["duration_ms"]
+    );
+    assert!(
+        weather["started_at"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty()),
+        "started_at must be a non-empty ISO string"
+    );
+    assert!(
+        weather["span_id"].as_str().is_some_and(|s| !s.is_empty()),
+        "span_id must be present"
+    );
+
+    // toolCallNames is the flat array of unique tool names
+    let tool_names = ev["toolCallNames"].as_array();
+    if let Some(names) = tool_names {
+        let names_set: std::collections::HashSet<String> = names
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect();
+        assert!(
+            names_set.contains("weather_lookup"),
+            "toolCallNames must contain 'weather_lookup', got {:?}",
+            names_set
+        );
+    }
+}
+
+/// **Error spans populated.** When a span ends with `set_error`, the resulting event MUST
+/// have `errorSpans[]` with the correct span_name, status=ERROR, duration_ms, and (truncated)
+/// output_payload.
+#[tokio::test]
+async fn e2e_failed_tool_span_populates_event_error_spans_array() {
+    let (write_key, dashboard_token) = match env_keys() {
+        Some(v) => v,
+        None => {
+            eprintln!("[e2e] skipping: set RAINDROP_WRITE_KEY and RAINDROP_DASHBOARD_TOKEN to run");
+            return;
+        }
+    };
+    let user_id = unique_user_id("errspan");
+    let client = build_client(&write_key);
+    let interaction = client
+        .begin(BeginOptions {
+            user_id: user_id.clone(),
+            event: "agent_run".to_string(),
+            input: "Search broken".to_string(),
+            ..Default::default()
+        })
+        .await;
+    let event_id = interaction.event_id().to_string();
+
+    interaction.track_tool(TrackToolOptions {
+        name: "broken_api".into(),
+        input: Some(json!({"q": "test"})),
+        error: Some("ConnectionError: refused".into()),
+        duration: Some(Duration::from_millis(75)),
+        ..Default::default()
+    });
+
+    interaction
+        .finish(FinishOptions {
+            output: "Sorry, the API failed".to_string(),
+            ..Default::default()
+        })
+        .await
+        .expect("finish");
+    client.close().await.expect("close");
+
+    let events = poll_events(&dashboard_token, &user_id, 1, E2E_POLL_TIMEOUT)
+        .await
+        .expect("dashboard verification");
+    let ev = events
+        .iter()
+        .find(|e| e["aiData"]["output"].as_str().unwrap_or("") == "Sorry, the API failed")
+        .unwrap_or_else(|| {
+            panic!(
+                "event not found, event_id={}, events={:?}",
+                event_id, events
+            )
+        });
+
+    let error_spans = ev["errorSpans"]
+        .as_array()
+        .unwrap_or_else(|| panic!("errorSpans must be array, got {:?}", ev["errorSpans"]));
+    assert!(
+        !error_spans.is_empty(),
+        "errorSpans must be non-empty after track_tool with error. event = {:?}",
+        ev
+    );
+    let broken = error_spans
+        .iter()
+        .find(|s| s["span_name"].as_str() == Some("broken_api"))
+        .unwrap_or_else(|| panic!("broken_api error span missing, got {:?}", error_spans));
+    assert_eq!(broken["status"].as_str().unwrap_or(""), "ERROR");
+    assert_eq!(broken["span_type"].as_str().unwrap_or(""), "TOOL_CALL");
+    assert!(
+        broken["duration_ms"].as_f64().unwrap_or(0.0) > 0.0,
+        "errorSpan duration_ms must be positive"
+    );
+    assert!(
+        broken["output_payload"]
+            .as_str()
+            .unwrap_or("")
+            .contains("ConnectionError"),
+        "errorSpan output_payload should contain the error message; got {:?}",
+        broken["output_payload"]
+    );
+}
+
+/// **Signals embedded in event.** A `track_signal` call after `track_ai` (same event_id) must
+/// surface as an entry in `event.signals[]` with the correct name and signal_type.
+#[tokio::test]
+async fn e2e_track_signal_appears_in_event_signals_array() {
+    let (write_key, dashboard_token) = match env_keys() {
+        Some(v) => v,
+        None => {
+            eprintln!("[e2e] skipping: set RAINDROP_WRITE_KEY and RAINDROP_DASHBOARD_TOKEN to run");
+            return;
+        }
+    };
+    let user_id = unique_user_id("sigembed");
+    let event_id = format!("{}_evt", user_id);
+    let client = build_client(&write_key);
+
+    client
+        .track_ai(AiEvent {
+            event_id: event_id.clone(),
+            user_id: user_id.clone(),
+            input: "rate this".to_string(),
+            output: "I am to be rated".to_string(),
+            ..Default::default()
+        })
+        .await
+        .expect("track_ai");
+
+    client
+        .track_signal(Signal {
+            event_id: event_id.clone(),
+            name: "thumbs_up".to_string(),
+            kind: SignalKind::FEEDBACK.into(),
+            sentiment: "POSITIVE".to_string(),
+            comment: "great".to_string(),
+            ..Default::default()
+        })
+        .await
+        .expect("track_signal");
+
+    client.close().await.expect("close");
+
+    let events = poll_events(&dashboard_token, &user_id, 1, E2E_POLL_TIMEOUT)
+        .await
+        .expect("dashboard verification");
+    let ev = events
+        .iter()
+        .find(|e| e["aiData"]["input"].as_str().unwrap_or("") == "rate this")
+        .unwrap_or_else(|| panic!("event not found"));
+
+    // Poll until the signal also lands. Signals follow a separate ingestion path and may
+    // arrive after the event row, so we re-poll the same event a few times if signals
+    // are absent on the first read.
+    let mut signals = ev["signals"].as_array().cloned().unwrap_or_default();
+    let signals_deadline = std::time::Instant::now() + Duration::from_secs(120);
+    while signals.is_empty() && std::time::Instant::now() < signals_deadline {
+        sleep(Duration::from_secs(5)).await;
+        let refreshed = poll_events(&dashboard_token, &user_id, 1, Duration::from_secs(30))
+            .await
+            .unwrap_or_default();
+        if let Some(refreshed_ev) = refreshed
+            .iter()
+            .find(|e| e["aiData"]["input"].as_str().unwrap_or("") == "rate this")
+        {
+            signals = refreshed_ev["signals"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+        }
+    }
+    assert!(
+        !signals.is_empty(),
+        "event.signals must be non-empty after track_signal. event = {:?}",
+        ev
+    );
+    let thumbs = signals
+        .iter()
+        .find(|s| s["name"].as_str() == Some("thumbs_up"))
+        .unwrap_or_else(|| panic!("thumbs_up signal missing among {:?}", signals));
+    let signal_type = thumbs["signalType"].as_str().unwrap_or("");
+    assert_eq!(signal_type, "feedback");
+}
+
+/// **identify lands user_traits.** Calling `identify` BEFORE `track_ai` causes subsequent
+/// events for the same user to carry `userTraits` populated with the traits we sent.
+#[tokio::test]
+async fn e2e_identify_populates_user_traits_on_subsequent_events() {
+    let (write_key, dashboard_token) = match env_keys() {
+        Some(v) => v,
+        None => {
+            eprintln!("[e2e] skipping: set RAINDROP_WRITE_KEY and RAINDROP_DASHBOARD_TOKEN to run");
+            return;
+        }
+    };
+    let user_id = unique_user_id("traits");
+    let client = build_client(&write_key);
+
+    client
+        .identify(User {
+            user_id: user_id.clone(),
+            traits: BTreeMap::from([
+                ("plan".to_string(), json!("enterprise")),
+                ("country".to_string(), json!("DE")),
+                ("seats".to_string(), json!(42)),
+            ]),
+        })
+        .await
+        .expect("identify");
+
+    // Brief delay so the user row lands before the event so the join can populate traits.
+    sleep(Duration::from_secs(2)).await;
+
+    client
+        .track_ai(AiEvent {
+            user_id: user_id.clone(),
+            input: "trait test".to_string(),
+            output: "ok".to_string(),
+            ..Default::default()
+        })
+        .await
+        .expect("track_ai");
+    client.close().await.expect("close");
+
+    let events = poll_events(&dashboard_token, &user_id, 1, E2E_POLL_TIMEOUT)
+        .await
+        .expect("dashboard verification");
+    let ev = events
+        .iter()
+        .find(|e| e["aiData"]["input"].as_str().unwrap_or("") == "trait test")
+        .unwrap_or_else(|| panic!("event missing"));
+
+    // User traits join is eventually consistent — poll up to 2 minutes for the join to land.
+    let mut user_traits = ev["userTraits"].clone();
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    while user_traits.as_object().is_none_or(|o| o.is_empty())
+        && std::time::Instant::now() < deadline
+    {
+        sleep(Duration::from_secs(5)).await;
+        let refreshed = poll_events(&dashboard_token, &user_id, 1, Duration::from_secs(30))
+            .await
+            .unwrap_or_default();
+        if let Some(refreshed_ev) = refreshed
+            .iter()
+            .find(|e| e["aiData"]["input"].as_str().unwrap_or("") == "trait test")
+        {
+            user_traits = refreshed_ev["userTraits"].clone();
+        }
+    }
+    let traits = user_traits.as_object().unwrap_or_else(|| {
+        panic!(
+            "userTraits should be a non-empty object, got {:?}",
+            user_traits
+        )
+    });
+    assert_eq!(
+        traits.get("plan").and_then(|v| v.as_str()),
+        Some("enterprise"),
+        "trait `plan` not propagated; full traits: {:?}",
+        traits
+    );
+    assert_eq!(
+        traits.get("country").and_then(|v| v.as_str()),
+        Some("DE"),
+        "trait `country` not propagated; full traits: {:?}",
+        traits
+    );
+}
+
+/// **Attachments split by role.** Sending attachments with `role: "input"` and `role: "output"`
+/// must split them into `inputAttachments` vs `outputAttachments` on the dashboard event.
+#[tokio::test]
+async fn e2e_attachments_split_by_role_on_dashboard() {
+    let (write_key, dashboard_token) = match env_keys() {
+        Some(v) => v,
+        None => {
+            eprintln!("[e2e] skipping: set RAINDROP_WRITE_KEY and RAINDROP_DASHBOARD_TOKEN to run");
+            return;
+        }
+    };
+    let user_id = unique_user_id("attach");
+    let client = build_client(&write_key);
+
+    client
+        .track_ai(AiEvent {
+            user_id: user_id.clone(),
+            input: "attachment test".to_string(),
+            output: "ok".to_string(),
+            attachments: vec![
+                Attachment {
+                    kind: "code".into(),
+                    role: "input".into(),
+                    name: "user_query.py".into(),
+                    value: "print(\"hi\")".into(),
+                    language: "python".into(),
+                },
+                Attachment {
+                    kind: "text".into(),
+                    role: "output".into(),
+                    name: "summary".into(),
+                    value: "This is a long summary".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        })
+        .await
+        .expect("track_ai");
+    client.close().await.expect("close");
+
+    let events = poll_events(&dashboard_token, &user_id, 1, E2E_POLL_TIMEOUT)
+        .await
+        .expect("dashboard verification");
+    let ev = events
+        .iter()
+        .find(|e| e["aiData"]["input"].as_str().unwrap_or("") == "attachment test")
+        .unwrap_or_else(|| panic!("event missing"));
+
+    let input_atts = ev["inputAttachments"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let output_atts = ev["outputAttachments"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        !input_atts.is_empty(),
+        "inputAttachments must be populated; full event: {:?}",
+        ev
+    );
+    assert!(
+        !output_atts.is_empty(),
+        "outputAttachments must be populated; full event: {:?}",
+        ev
+    );
+
+    let code_attachment = &input_atts[0];
+    // The dashboard schema decodes attachment_type from the wire's `type` field
+    let att_type = code_attachment["attachment_type"]
+        .as_str()
+        .or_else(|| code_attachment["type"].as_str())
+        .unwrap_or("");
+    assert_eq!(att_type, "code", "input attachment type should be 'code'");
+    assert_eq!(
+        code_attachment["name"].as_str().unwrap_or(""),
+        "user_query.py"
+    );
+    assert!(code_attachment["value"]
+        .as_str()
+        .unwrap_or("")
+        .contains("print"));
+}
+
+/// **traces.list deep verification.** Spans for an event_id must form a valid trace tree
+/// when fetched via `traces.list`: parent-child linkage, span_type detection, attributes,
+/// duration_ns, and start/end times.
+#[tokio::test]
+async fn e2e_traces_list_returns_correct_span_tree() {
+    let (write_key, dashboard_token) = match env_keys() {
+        Some(v) => v,
+        None => {
+            eprintln!("[e2e] skipping: set RAINDROP_WRITE_KEY and RAINDROP_DASHBOARD_TOKEN to run");
+            return;
+        }
+    };
+    let user_id = unique_user_id("tracetree");
+    let convo_id = format!("{}_convo", user_id);
+    let client = build_client(&write_key);
+    let interaction = client
+        .begin(BeginOptions {
+            user_id: user_id.clone(),
+            convo_id: convo_id.clone(),
+            event: "agent_workflow".to_string(),
+            input: "complex".to_string(),
+            ..Default::default()
+        })
+        .await;
+    let event_id = interaction.event_id().to_string();
+
+    // Build a tree: root_workflow → child_step → tool_call
+    let root = interaction.start_span(SpanOptions {
+        name: "root_workflow".into(),
+        operation_id: "ai.workflow".into(),
+        attributes: vec![Attribute::string("traceloop.span.kind", "workflow")],
+        ..Default::default()
+    });
+    sleep(Duration::from_millis(20)).await;
+
+    let child = interaction.start_span(SpanOptions {
+        name: "child_step".into(),
+        operation_id: "ai.task".into(),
+        parent: Some(root.clone()),
+        attributes: vec![Attribute::string("traceloop.span.kind", "task")],
+        ..Default::default()
+    });
+    sleep(Duration::from_millis(20)).await;
+
+    let tool = interaction.start_tool_span(
+        "search",
+        ToolOptions {
+            input: Some(json!({"q": "rust traces"})),
+            parent: Some(child.clone()),
+            ..Default::default()
+        },
+    );
+    sleep(Duration::from_millis(50)).await;
+    tool.set_output(&json!({"hits": 7}));
+    tool.end();
+
+    child.end();
+    root.end();
+
+    interaction
+        .finish(FinishOptions {
+            output: "done".to_string(),
+            ..Default::default()
+        })
+        .await
+        .expect("finish");
+    client.close().await.expect("close");
+
+    // Wait for the event to land
+    let _ = poll_events(&dashboard_token, &user_id, 1, E2E_POLL_TIMEOUT)
+        .await
+        .expect("event verification");
+
+    // Now poll traces.list — uses event_id (public ID resolved internally).
+    let spans = poll_traces_for_event(&dashboard_token, &event_id, 3, Duration::from_secs(180))
+        .await
+        .expect("trace verification");
+    assert!(
+        spans.len() >= 3,
+        "expected at least 3 spans (root, child, tool); got {}: {:?}",
+        spans.len(),
+        spans
+    );
+
+    let by_name = |n: &str| {
+        spans
+            .iter()
+            .find(|s| s["span_name"].as_str() == Some(n))
+            .unwrap_or_else(|| panic!("span '{}' missing among {:?}", n, spans))
+    };
+    let root_span = by_name("root_workflow");
+    let child_span = by_name("child_step");
+    let tool_span = by_name("search");
+
+    // Parent-child linkage via parent_span_id
+    let root_span_id = root_span["span_id"].as_str().unwrap();
+    let child_parent_id = child_span["parent_span_id"].as_str().unwrap_or("");
+    let tool_parent_id = tool_span["parent_span_id"].as_str().unwrap_or("");
+    let child_span_id = child_span["span_id"].as_str().unwrap();
+    assert_eq!(
+        child_parent_id, root_span_id,
+        "child_step.parent_span_id must equal root_workflow.span_id"
+    );
+    assert_eq!(
+        tool_parent_id, child_span_id,
+        "search (tool).parent_span_id must equal child_step.span_id"
+    );
+
+    // All spans share the same trace_id
+    let trace_ids: std::collections::HashSet<String> = spans
+        .iter()
+        .filter_map(|s| s["trace_id"].as_str().map(String::from))
+        .collect();
+    assert_eq!(trace_ids.len(), 1, "all spans should share one trace_id");
+
+    // span_type inference: tool span MUST be TOOL_CALL
+    assert_eq!(tool_span["span_type"].as_str().unwrap_or(""), "TOOL_CALL");
+
+    // tool span carries the input/output payload as expected
+    let input_payload = tool_span["input_payload"].as_str().unwrap_or("");
+    let output_payload = tool_span["output_payload"].as_str().unwrap_or("");
+    assert!(
+        input_payload.contains("rust traces"),
+        "tool input_payload missing query, got {:?}",
+        input_payload
+    );
+    assert!(
+        output_payload.contains("\"hits\":7"),
+        "tool output_payload missing hits, got {:?}",
+        output_payload
+    );
+
+    // duration_ns must be positive (we slept 50ms inside the tool span)
+    let dur_ns: u128 = tool_span["duration_ns"]
+        .as_str()
+        .unwrap_or("0")
+        .parse()
+        .unwrap_or(0);
+    assert!(
+        dur_ns > 0,
+        "tool span duration_ns must be > 0, got {}",
+        dur_ns
+    );
+
+    // Status: tool ended without error → status="OK"
+    assert_eq!(tool_span["status"].as_str().unwrap_or(""), "OK");
+
+    // attributes_string must contain the user_id and convo_id we propagated from interaction
+    let attrs = tool_span["attributes_string"]
+        .as_object()
+        .unwrap_or_else(|| panic!("attributes_string missing on tool span: {:?}", tool_span));
+    assert_eq!(
+        attrs
+            .get("traceloop.association.properties.user_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or(""),
+        user_id,
+        "tool span must inherit user_id from interaction"
+    );
+    assert_eq!(
+        attrs
+            .get("traceloop.association.properties.convo_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or(""),
+        convo_id,
+        "tool span must inherit convo_id from interaction"
+    );
+    // tool name is preserved as traceloop.entity.name
+    assert_eq!(
+        attrs
+            .get("traceloop.entity.name")
+            .and_then(|v| v.as_str())
+            .unwrap_or(""),
+        "search"
+    );
 }

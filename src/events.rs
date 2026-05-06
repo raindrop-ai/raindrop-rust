@@ -137,6 +137,15 @@ pub struct FinishOptions {
 pub struct Interaction {
     pub(crate) client: Option<Client>,
     pub(crate) event_id: String,
+    /// Sticky `user_id` captured from `BeginOptions`. Auto-attached to spans started via this
+    /// interaction so they appear under the same user in the dashboard's traces view.
+    pub(crate) user_id: String,
+    /// Sticky `convo_id` captured from `BeginOptions`. Auto-attached to spans started via this
+    /// interaction so they're grouped under the same conversation in the dashboard.
+    pub(crate) convo_id: String,
+    /// Sticky `event` (event name) captured from `BeginOptions`. Mostly informational — used by
+    /// matching the Python/Go/JS SDK shape that exposes interaction metadata to spans.
+    pub(crate) event: String,
 }
 
 impl Interaction {
@@ -145,14 +154,38 @@ impl Interaction {
         Self {
             client: None,
             event_id: String::new(),
+            user_id: String::new(),
+            convo_id: String::new(),
+            event: String::new(),
         }
     }
 
-    /// Internal constructor.
+    /// Internal constructor for resumed/standalone interactions where only `event_id` is known.
     pub(crate) fn new(client: Client, event_id: String) -> Self {
         Self {
             client: Some(client),
             event_id,
+            user_id: String::new(),
+            convo_id: String::new(),
+            event: String::new(),
+        }
+    }
+
+    /// Internal constructor used by [`Client::begin`] to capture sticky association properties
+    /// (`user_id`, `convo_id`, `event`) so they propagate to spans started via this interaction.
+    pub(crate) fn new_with_context(
+        client: Client,
+        event_id: String,
+        user_id: String,
+        convo_id: String,
+        event: String,
+    ) -> Self {
+        Self {
+            client: Some(client),
+            event_id,
+            user_id,
+            convo_id,
+            event,
         }
     }
 
@@ -229,10 +262,17 @@ impl Interaction {
     }
 
     /// Start a manually-managed span linked to this interaction's event id.
+    ///
+    /// The span automatically inherits the interaction's sticky `user_id` and `convo_id` (set
+    /// in [`BeginOptions`]) as `traceloop.association.properties.{user_id,convo_id}` attributes,
+    /// so downstream span queries on the dashboard correctly group the span under the same
+    /// user and conversation as its parent event. User-supplied properties always override
+    /// these defaults.
     pub fn start_span(&self, mut opts: SpanOptions) -> Span {
         if opts.event_id.is_empty() {
             opts.event_id = self.event_id.clone();
         }
+        self.inject_association_properties(&mut opts.properties);
         match &self.client {
             Some(client) => client.start_span(opts),
             None => Span::noop(),
@@ -240,10 +280,36 @@ impl Interaction {
     }
 
     /// Start a manually-managed tool span linked to this interaction's event id.
-    pub fn start_tool_span(&self, name: impl Into<String>, opts: ToolOptions) -> ToolSpan {
+    ///
+    /// As with [`start_span`](Self::start_span), the underlying span inherits the interaction's
+    /// `user_id` and `convo_id` association properties.
+    pub fn start_tool_span(&self, name: impl Into<String>, mut opts: ToolOptions) -> ToolSpan {
+        self.inject_association_properties(&mut opts.properties);
         match &self.client {
             Some(client) => client.start_tool_span(name, opts, &self.event_id),
             None => ToolSpan::noop(),
+        }
+    }
+
+    /// Inject the interaction's sticky `user_id`, `convo_id`, and `event` into a properties
+    /// map without overwriting caller-supplied values. Each property becomes a
+    /// `traceloop.association.properties.<key>` attribute on the underlying span. Mirrors the
+    /// Python SDK's `Interaction.start_span` which propagates the same four keys.
+    fn inject_association_properties(&self, properties: &mut BTreeMap<String, Value>) {
+        if !self.user_id.is_empty() {
+            properties
+                .entry("user_id".to_string())
+                .or_insert_with(|| Value::String(self.user_id.clone()));
+        }
+        if !self.convo_id.is_empty() {
+            properties
+                .entry("convo_id".to_string())
+                .or_insert_with(|| Value::String(self.convo_id.clone()));
+        }
+        if !self.event.is_empty() {
+            properties
+                .entry("event".to_string())
+                .or_insert_with(|| Value::String(self.event.clone()));
         }
     }
 
@@ -271,9 +337,11 @@ impl Interaction {
     }
 
     /// Retroactively log a tool call (with start/end times or a duration). Mirrors the Go SDK's
-    /// `Interaction.TrackTool`.
-    pub fn track_tool(&self, opts: TrackToolOptions) {
+    /// `Interaction.TrackTool`. The span inherits the interaction's `user_id` and `convo_id`
+    /// (see [`start_span`](Self::start_span) for details).
+    pub fn track_tool(&self, mut opts: TrackToolOptions) {
         if let Some(client) = &self.client {
+            self.inject_association_properties(&mut opts.properties);
             client.track_tool_for_interaction(&self.event_id, opts);
         }
     }
