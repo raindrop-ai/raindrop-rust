@@ -613,7 +613,8 @@ async fn e2e_tool_span_populates_event_tool_calls_array() {
 /// - root agent span
 /// - nested planner subagent span
 /// - nested researcher subagent span
-/// - multiple tool calls
+/// - many tool calls, including repeated customer-like tool names (`search_events_regex`,
+///   `count_events`) observed in production Tinybird samples
 /// - one failed tool call followed by a successful retry
 /// - one deliberately long-running tool
 ///
@@ -715,6 +716,39 @@ async fn e2e_complex_agent_trajectory_with_subagents_tools_retry_failure_and_slo
         ..Default::default()
     });
 
+    // Production trajectory samples include many repeated tool names, especially
+    // `search_events_regex` and `count_events`. Exercise that shape explicitly so
+    // downstream aggregation does not accidentally assume tool names are unique.
+    for idx in 0..2 {
+        let mut repeated_props = BTreeMap::new();
+        repeated_props.insert("subagent".to_string(), json!("researcher"));
+        repeated_props.insert("repeat_index".to_string(), json!(idx));
+        interaction.track_tool(TrackToolOptions {
+            name: "search_events_regex".into(),
+            parent: Some(researcher.clone()),
+            input: Some(json!({"regex": "(?i)billing|slow", "page": idx})),
+            output: Some(json!({"matches": idx + 2})),
+            duration: Some(Duration::from_millis(450 + (idx as u64) * 80)),
+            properties: repeated_props,
+            ..Default::default()
+        });
+    }
+
+    for idx in 0..2 {
+        let mut repeated_props = BTreeMap::new();
+        repeated_props.insert("subagent".to_string(), json!("researcher"));
+        repeated_props.insert("repeat_index".to_string(), json!(idx));
+        interaction.track_tool(TrackToolOptions {
+            name: "count_events".into(),
+            parent: Some(researcher.clone()),
+            input: Some(json!({"filter": "risk_signal", "bucket": idx})),
+            output: Some(json!({"count": 10 + idx})),
+            duration: Some(Duration::from_millis(120 + (idx as u64) * 30)),
+            properties: repeated_props,
+            ..Default::default()
+        });
+    }
+
     let mut failed_props = BTreeMap::new();
     failed_props.insert("subagent".to_string(), json!("researcher"));
     failed_props.insert("retry_attempt".to_string(), json!(1));
@@ -788,7 +822,7 @@ async fn e2e_complex_agent_trajectory_with_subagents_tools_retry_failure_and_slo
             e["aiData"]["output"]
                 .as_str()
                 .is_some_and(|o| o.contains("succeeded on retry"))
-                && e["toolCalls"].as_array().is_some_and(|arr| arr.len() >= 5)
+                && e["toolCalls"].as_array().is_some_and(|arr| arr.len() >= 9)
                 && e["errorSpans"]
                     .as_array()
                     .is_some_and(|arr| !arr.is_empty())
@@ -835,6 +869,8 @@ async fn e2e_complex_agent_trajectory_with_subagents_tools_retry_failure_and_slo
     let expected_tools = [
         "plan_steps",
         "customer_profile_lookup",
+        "search_events_regex",
+        "count_events",
         "risk_signal_fetch",
         "risk_signal_fetch_retry",
         "warehouse_scan_slow",
@@ -852,6 +888,23 @@ async fn e2e_complex_agent_trajectory_with_subagents_tools_retry_failure_and_slo
             tool
         );
     }
+
+    let count_by_name = |name: &str| {
+        tool_calls
+            .iter()
+            .filter(|t| t["tool_name"].as_str() == Some(name))
+            .count()
+    };
+    assert_eq!(
+        count_by_name("search_events_regex"),
+        2,
+        "repeated search_events_regex calls must be preserved as distinct toolCalls"
+    );
+    assert_eq!(
+        count_by_name("count_events"),
+        2,
+        "repeated count_events calls must be preserved as distinct toolCalls"
+    );
 
     assert_eq!(
         by_tool("risk_signal_fetch")["status"]
@@ -1045,6 +1098,7 @@ async fn e2e_track_signal_appears_in_event_signals_array() {
                 .unwrap_or_default();
         }
     }
+
     assert!(
         !signals.is_empty(),
         "event.signals must be non-empty after track_signal. event = {:?}",

@@ -176,7 +176,11 @@ impl Span {
             return;
         }
 
-        let end = end_time.unwrap_or_else(OffsetDateTime::now_utc);
+        let requested_end = end_time.unwrap_or_else(OffsetDateTime::now_utc);
+        // Defensive clamp: some external producers have emitted spans with end < start, which
+        // creates negative durations downstream. Tinybird stores duration_ns as UInt64, so keep
+        // Rust SDK spans internally consistent even when a caller supplies an anomalous end time.
+        let end = requested_end.max(inner.start);
 
         let (attrs, status) = {
             let mut state = inner.state.lock().expect("span lock poisoned");
@@ -385,12 +389,10 @@ pub(crate) fn build_tool_attributes(
         ));
     }
     if let Some(d) = duration {
-        if d > std::time::Duration::ZERO {
-            attrs.push(Attribute::int(
-                "traceloop.entity.duration_ms",
-                d.as_millis() as i64,
-            ));
-        }
+        attrs.push(Attribute::int(
+            "traceloop.entity.duration_ms",
+            d.as_millis() as i64,
+        ));
     }
     attrs.extend(tool_property_attributes(properties));
     attrs

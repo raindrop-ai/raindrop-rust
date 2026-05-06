@@ -756,6 +756,61 @@ async fn tool_span_duration_ms_attribute_uses_milliseconds() {
     assert_eq!(dur["intValue"], "750");
 }
 
+/// Defensive clamp for anomalous callers: if a caller supplies end_time < start_time, the SDK
+/// must not emit a negative duration. Real production traces from non-Rust producers have shown
+/// negative `duration_ms`; Rust should never create that shape.
+#[tokio::test]
+async fn tool_span_end_before_start_is_clamped_to_zero_duration() {
+    let server = MockServer::start().await;
+    let trace_recorder = mount_path(&server, "POST", "/traces").await;
+    let _ = mount_path(&server, "POST", "/events/track_partial").await;
+    let client = fast_client_builder(&server).build().expect("build");
+    let interaction = client
+        .begin(BeginOptions {
+            event_id: "evt_negative_duration_guard".into(),
+            user_id: "u".into(),
+            ..Default::default()
+        })
+        .await;
+
+    let start = datetime!(2026-05-01 10:00:00 UTC);
+    let end = start - Duration::from_millis(250);
+    interaction.track_tool(TrackToolOptions {
+        name: "negative_duration_input".into(),
+        start_time: Some(start),
+        end_time: Some(end),
+        ..Default::default()
+    });
+    let _ = client.close().await;
+
+    let mut all_spans = Vec::new();
+    for req in trace_recorder.requests() {
+        all_spans.extend(spans_of(&req.json()));
+    }
+    let tool_span = all_spans
+        .iter()
+        .find(|s| s["name"] == "negative_duration_input")
+        .unwrap();
+    let dur =
+        span_attr(tool_span, "traceloop.entity.duration_ms").expect("traceloop.entity.duration_ms");
+    assert_eq!(dur["intValue"], "0");
+
+    let start_ns: u128 = tool_span["startTimeUnixNano"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let end_ns: u128 = tool_span["endTimeUnixNano"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(
+        end_ns, start_ns,
+        "end timestamp must be clamped up to start timestamp"
+    );
+}
+
 /// OTLP/JSON encoding: span ids must be base64-encoded random bytes, trace_id 16 bytes,
 /// span_id 8 bytes. start_time_unix_nano and end_time_unix_nano are decimal strings of
 /// nanoseconds since epoch.

@@ -665,6 +665,7 @@ fn derive_times(opts: &mut TrackToolOptions) -> (OffsetDateTime, OffsetDateTime)
         (None, None, Some(d)) => (now - d, now),
         (None, None, None) => (now, now),
     };
+    let end = end.max(start);
     if opts.duration.is_none() {
         opts.duration = Some((end - start).try_into().unwrap_or(Duration::ZERO));
     }
