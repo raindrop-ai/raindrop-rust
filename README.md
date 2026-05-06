@@ -5,9 +5,11 @@ The official Rust SDK for [Raindrop AI](https://raindrop.ai) — track AI events
 
 ## Installation
 
+> The crate is not yet published to crates.io. Install via git for now:
+
 ```toml
 [dependencies]
-raindrop-ai = "0.1.0"
+raindrop-ai = { git = "https://github.com/invisible-tools/raindrop-rust" }
 ```
 
 ## Quick start

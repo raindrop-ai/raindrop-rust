@@ -157,11 +157,11 @@ async fn e2e_track_ai_event_lands_in_dashboard() {
     let events = poll_events(&dashboard_token, &user_id, 1, Duration::from_secs(60))
         .await
         .expect("dashboard verification");
-    assert!(!events.is_empty(), "no events found for user {}", user_id);
-
-    let ev = &events[0];
+    let ev = events
+        .iter()
+        .find(|e| e["aiData"]["input"].as_str().unwrap_or("") == "Hello Rust")
+        .unwrap_or_else(|| panic!("track_ai event not found among {:?}", events));
     let ai = ev["aiData"].clone();
-    assert_eq!(ai["input"].as_str().unwrap_or_default(), "Hello Rust");
     assert_eq!(ai["output"].as_str().unwrap_or_default(), "Hello World");
     assert_eq!(ai["model"].as_str().unwrap_or_default(), "gpt-4o");
     assert_eq!(ai["convoId"].as_str().unwrap_or_default(), convo_id);
@@ -235,7 +235,7 @@ async fn e2e_interaction_with_tool_span_lands_in_dashboard() {
 
 #[tokio::test]
 async fn e2e_signals_and_identify_land_in_dashboard() {
-    let (write_key, _dashboard_token) = match env_keys() {
+    let (write_key, dashboard_token) = match env_keys() {
         Some(v) => v,
         None => {
             eprintln!("[e2e] skipping: set RAINDROP_WRITE_KEY and RAINDROP_DASHBOARD_TOKEN to run");
@@ -281,8 +281,20 @@ async fn e2e_signals_and_identify_land_in_dashboard() {
         .await
         .expect("track_signal");
 
-    // We don't have a public signals.list TRPC endpoint to assert the signal landed, so the
-    // success criterion here is "no panics, all calls returned Ok". Signal verification can
-    // be bolted on once a query endpoint is available.
     client.close().await.expect("close");
+
+    // Verify on the dashboard: the track_ai event MUST land. There is no public TRPC signals
+    // query endpoint, so this test asserts the event side of the chain (the event the signal
+    // was attached to) — which proves the API is reachable and the write key is valid even if
+    // we cannot query signals directly. Signal landing should be added here when a query
+    // endpoint becomes available.
+    let events = poll_events(&dashboard_token, &user_id, 1, Duration::from_secs(60))
+        .await
+        .expect("dashboard verification");
+    let ev = events
+        .iter()
+        .find(|e| e["aiData"]["input"].as_str().unwrap_or("") == "rate me")
+        .unwrap_or_else(|| panic!("track_ai event not found among {:?}", events));
+    assert_eq!(ev["userId"].as_str().unwrap_or(""), user_id);
+    assert_eq!(ev["aiData"]["output"].as_str().unwrap_or(""), "I am rated");
 }
