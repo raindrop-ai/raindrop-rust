@@ -131,27 +131,28 @@ async fn track_ai_attachments_serialize_with_type_role_and_optional_fields() {
                     name: "snippet.py".into(),
                     value: "print('hi')".into(),
                     language: "python".into(),
+                    ..Default::default()
                 },
                 Attachment {
                     kind: "text".into(),
                     role: "input".into(),
                     name: "extra".into(),
                     value: "long doc".into(),
-                    language: String::new(), // text doesn't have language
+                    ..Default::default()
                 },
                 Attachment {
                     kind: "image".into(),
                     role: "output".into(),
                     name: "screenshot".into(),
                     value: "https://example.com/img.png".into(),
-                    language: String::new(),
+                    ..Default::default()
                 },
                 Attachment {
                     kind: "iframe".into(),
                     role: "output".into(),
                     name: String::new(),
                     value: "<iframe src=\"...\"></iframe>".into(),
-                    language: String::new(),
+                    ..Default::default()
                 },
             ],
             ..Default::default()
@@ -1083,4 +1084,665 @@ async fn disabled_client_skips_every_endpoint() {
         0,
         "disabled client must make zero HTTP requests across every endpoint"
     );
+}
+
+// ────────────────────────────────────────────────────────────────────────────────────
+// Additional pedantic coverage discovered while sampling real production data.
+// ────────────────────────────────────────────────────────────────────────────────────
+
+/// Caller-supplied `attachment_id` round-trips on the wire so the backend can dedupe and
+/// so a follow-up `Signal { attachment_id }` can reference the exact attachment.
+///
+/// Real-prod sample (Tinybird `events_list` across 50+ orgs): 350+ attachments carry a
+/// caller-set `attachment_id`. The backend auto-generates a UUID v4 if missing
+/// (`apps/dawn/app/api/internal/ingest/track.ts:829,919`); the field is OPTIONAL on the
+/// canonical `BaseAttachmentSchema` (`@raindrop-ai/schemas/ingest`).
+#[tokio::test]
+async fn attachment_with_caller_supplied_attachment_id_round_trips_on_the_wire() {
+    let server = MockServer::start().await;
+    let recorder = mount_path(&server, "POST", "/events/track_partial").await;
+    let client = fast_client_builder(&server).build().expect("build");
+
+    client
+        .track_ai(AiEvent {
+            user_id: "u".into(),
+            input: "x".into(),
+            output: "y".into(),
+            attachments: vec![
+                Attachment {
+                    kind: "image".into(),
+                    role: "input".into(),
+                    name: "screenshot.png".into(),
+                    value: "https://cdn.example/img.png".into(),
+                    attachment_id: "att_caller_specific_uuid".into(),
+                    ..Default::default()
+                },
+                Attachment {
+                    kind: "text".into(),
+                    role: "output".into(),
+                    name: "summary".into(),
+                    value: "ok".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        })
+        .await
+        .expect("track_ai");
+    client.close().await.expect("close");
+
+    let payload = recorder.requests()[0].json();
+    let atts = payload["attachments"].as_array().expect("attachments");
+    assert_eq!(
+        atts[0]["attachment_id"].as_str().unwrap_or(""),
+        "att_caller_specific_uuid",
+        "caller-supplied attachment_id MUST be preserved on the wire"
+    );
+    // Empty attachment_id must be skip-serialized so the backend can auto-generate a UUID
+    // rather than rejecting an empty string against any future strict schema.
+    assert!(
+        atts[1].get("attachment_id").is_none() || atts[1]["attachment_id"].as_str() == Some(""),
+        "empty attachment_id should be skipped on the wire so backend can default it; got {:?}",
+        atts[1]
+    );
+}
+
+/// Token-usage helper emits the canonical OpenTelemetry GenAI numeric attributes that the
+/// backend's `parseSpan.getInputAndOutputTokens` reads to populate `event.toolCalls[]` token
+/// metadata and the per-event `aiData.usage`. See
+/// `dawn/apps/dawn/lib/traces/parseSpan.ts::getInputAndOutputTokens` for the gate condition.
+#[tokio::test]
+async fn span_set_token_usage_emits_gen_ai_attributes() {
+    let server = MockServer::start().await;
+    let trace_recorder = mount_path(&server, "POST", "/traces").await;
+    let client = fast_client_builder(&server).build().expect("build");
+
+    let span = client.start_span(SpanOptions {
+        name: "llm_call".into(),
+        event_id: "evt".into(),
+        operation_id: "ai.generateText".into(),
+        ..Default::default()
+    });
+    span.set_token_usage("gpt-4o-mini", 47, 11);
+    span.end();
+    client.flush().await.expect("flush");
+    client.close().await.expect("close");
+
+    let span_json = recorder_first_span(&trace_recorder);
+    // Backend gate: gen_ai.response.model must be present, otherwise tokens are dropped.
+    let model = span_attr(&span_json, "gen_ai.response.model").expect("gen_ai.response.model");
+    assert_eq!(model["stringValue"], "gpt-4o-mini");
+    let input_tokens =
+        span_attr(&span_json, "gen_ai.usage.input_tokens").expect("gen_ai.usage.input_tokens");
+    assert_eq!(
+        input_tokens["intValue"], "47",
+        "OTLP/JSON encodes ints as decimal strings"
+    );
+    let output_tokens =
+        span_attr(&span_json, "gen_ai.usage.output_tokens").expect("gen_ai.usage.output_tokens");
+    assert_eq!(output_tokens["intValue"], "11");
+}
+
+/// `set_token_usage` with `0` for either count omits the corresponding attribute and (when
+/// `model` is empty) omits the `gen_ai.response.model` gate. This mirrors the Python SDK's
+/// `set_llm_span_io` semantics — only emit what the caller actually has.
+#[tokio::test]
+async fn span_set_token_usage_omits_zero_and_empty_model() {
+    let server = MockServer::start().await;
+    let trace_recorder = mount_path(&server, "POST", "/traces").await;
+    let client = fast_client_builder(&server).build().expect("build");
+
+    let span = client.start_span(SpanOptions {
+        name: "llm_call".into(),
+        event_id: "evt".into(),
+        operation_id: "ai.generateText".into(),
+        ..Default::default()
+    });
+    span.set_token_usage("", 0, 0);
+    span.end();
+    client.flush().await.expect("flush");
+    client.close().await.expect("close");
+
+    let span_json = recorder_first_span(&trace_recorder);
+    assert!(span_attr(&span_json, "gen_ai.response.model").is_none());
+    assert!(span_attr(&span_json, "gen_ai.usage.input_tokens").is_none());
+    assert!(span_attr(&span_json, "gen_ai.usage.output_tokens").is_none());
+}
+
+/// A child span shares its parent's `traceId` and references the parent via `parentSpanId`.
+/// A second top-level span gets a fresh `traceId`. This is the contract for the dashboard's
+/// `traces.list` to render a connected tree.
+#[tokio::test]
+async fn parent_child_spans_share_trace_id_and_link_via_parent_span_id() {
+    let server = MockServer::start().await;
+    let trace_recorder = mount_path(&server, "POST", "/traces").await;
+    let client = fast_client_builder(&server).build().expect("build");
+
+    let root = client.start_span(SpanOptions {
+        name: "root".into(),
+        event_id: "evt_a".into(),
+        operation_id: "ai.workflow".into(),
+        ..Default::default()
+    });
+    let child = client.start_span(SpanOptions {
+        name: "child".into(),
+        event_id: "evt_a".into(),
+        operation_id: "ai.task".into(),
+        parent: Some(root.clone()),
+        ..Default::default()
+    });
+    let grandchild = client.start_span(SpanOptions {
+        name: "grandchild".into(),
+        event_id: "evt_a".into(),
+        operation_id: "ai.task".into(),
+        parent: Some(child.clone()),
+        ..Default::default()
+    });
+    grandchild.end();
+    child.end();
+    root.end();
+
+    let independent = client.start_span(SpanOptions {
+        name: "independent".into(),
+        event_id: "evt_b".into(),
+        operation_id: "ai.workflow".into(),
+        ..Default::default()
+    });
+    independent.end();
+
+    client.flush().await.expect("flush");
+    client.close().await.expect("close");
+
+    let mut all = Vec::new();
+    for r in trace_recorder.requests() {
+        all.extend(spans_of(&r.json()));
+    }
+    let by_name = |n: &str| all.iter().find(|s| s["name"] == n).expect(n);
+    let root_s = by_name("root");
+    let child_s = by_name("child");
+    let grand_s = by_name("grandchild");
+    let indep_s = by_name("independent");
+
+    assert_eq!(
+        root_s["traceId"], child_s["traceId"],
+        "child must share trace_id with root"
+    );
+    assert_eq!(
+        root_s["traceId"], grand_s["traceId"],
+        "grandchild must share trace_id with root"
+    );
+    assert_ne!(
+        root_s["traceId"], indep_s["traceId"],
+        "independent root span must get a fresh trace_id"
+    );
+    // parentSpanId linkage: child.parent_span_id == root.span_id
+    assert_eq!(
+        child_s["parentSpanId"].as_str().unwrap_or(""),
+        root_s["spanId"].as_str().unwrap_or(""),
+        "child.parentSpanId must equal root.spanId"
+    );
+    assert_eq!(
+        grand_s["parentSpanId"].as_str().unwrap_or(""),
+        child_s["spanId"].as_str().unwrap_or(""),
+        "grandchild.parentSpanId must equal child.spanId"
+    );
+    // root has no parent
+    assert!(
+        root_s
+            .get("parentSpanId")
+            .map(|v| v.as_str().unwrap_or("").is_empty())
+            .unwrap_or(true),
+        "root span must NOT serialize a non-empty parentSpanId, got {:?}",
+        root_s.get("parentSpanId")
+    );
+    // independent root has no parent
+    assert!(indep_s
+        .get("parentSpanId")
+        .map(|v| v.as_str().unwrap_or("").is_empty())
+        .unwrap_or(true));
+}
+
+/// Repeated tool name across the same event creates separate spans with distinct `spanId`s
+/// and is preserved in the dashboard's `toolCalls[]` array (which dedupes by `span_id`, not
+/// by name). Real production data shows tools repeated 5–25 times within a single event
+/// (`PARALLEL_TOOLS`, `view_bulk`, `count_events`, etc).
+#[tokio::test]
+async fn repeated_tool_names_within_one_event_get_distinct_span_ids() {
+    let server = MockServer::start().await;
+    let trace_recorder = mount_path(&server, "POST", "/traces").await;
+    let _ = mount_path(&server, "POST", "/events/track_partial").await;
+    let client = fast_client_builder(&server).build().expect("build");
+
+    let interaction = client
+        .begin(BeginOptions {
+            event_id: "evt_repeat".into(),
+            user_id: "u".into(),
+            ..Default::default()
+        })
+        .await;
+
+    for i in 0..4 {
+        interaction.track_tool(TrackToolOptions {
+            name: "search".into(),
+            input: Some(json!({"q": format!("query_{}", i)})),
+            duration: Some(Duration::from_millis(10 + i * 5)),
+            ..Default::default()
+        });
+    }
+    let _ = client.close().await;
+
+    let mut tool_spans = Vec::new();
+    for r in trace_recorder.requests() {
+        for s in spans_of(&r.json()) {
+            if s["name"] == "search" {
+                tool_spans.push(s);
+            }
+        }
+    }
+    assert_eq!(
+        tool_spans.len(),
+        4,
+        "expected 4 distinct tool spans, got {}",
+        tool_spans.len()
+    );
+    let mut span_ids = std::collections::HashSet::new();
+    for s in &tool_spans {
+        let id = s["spanId"].as_str().unwrap_or("").to_string();
+        assert!(!id.is_empty(), "span_id must be non-empty");
+        assert!(
+            span_ids.insert(id.clone()),
+            "duplicate span_id {} for repeated tool name",
+            id
+        );
+    }
+    assert_eq!(span_ids.len(), 4, "all 4 span_ids must be unique");
+}
+
+/// `track_signal` with empty optional fields skip-serializes them so the backend's
+/// `SignalEventSchema` (sentiment ∈ {POSITIVE, NEGATIVE}; attachment_id optional) doesn't
+/// reject an empty string.
+#[tokio::test]
+async fn track_signal_with_empty_optional_fields_omits_them_on_the_wire() {
+    let server = MockServer::start().await;
+    let recorder = mount_path(&server, "POST", "/signals/track").await;
+    let client = fast_client_builder(&server).build().expect("build");
+
+    client
+        .track_signal(Signal {
+            event_id: "evt".into(),
+            name: "thumbs_up".into(),
+            // sentiment, attachment_id, comment, after, timestamp, properties all empty
+            ..Default::default()
+        })
+        .await
+        .expect("track_signal");
+    client.close().await.expect("close");
+
+    let arr = recorder.requests()[0].json();
+    let sig = &arr[0];
+    assert!(
+        sig.get("sentiment").is_none(),
+        "empty sentiment must be skipped on the wire"
+    );
+    assert!(
+        sig.get("attachment_id").is_none(),
+        "empty attachment_id must be skipped on the wire"
+    );
+    assert!(
+        sig.get("timestamp").is_none() || sig["timestamp"].as_str() == Some(""),
+        "empty timestamp must be skipped"
+    );
+    // properties is always emitted as an object (possibly empty), never null
+    assert!(
+        sig["properties"].is_object(),
+        "properties must be an object even when empty"
+    );
+}
+
+/// `User.identify` with empty traits ships a `traits: {}` object — never `null`, never
+/// absent. The dashboard's join from users → events expects a JSON object body.
+#[tokio::test]
+async fn identify_with_empty_traits_ships_empty_object() {
+    let server = MockServer::start().await;
+    let recorder = mount_path(&server, "POST", "/users/identify").await;
+    let client = fast_client_builder(&server).build().expect("build");
+
+    client
+        .identify(User {
+            user_id: "u_empty".into(),
+            traits: BTreeMap::new(),
+        })
+        .await
+        .expect("identify");
+    client.close().await.expect("close");
+
+    let body = recorder.requests()[0].json();
+    assert_eq!(body["user_id"], "u_empty");
+    assert!(body["traits"].is_object(), "traits must be an object");
+    assert_eq!(
+        body["traits"].as_object().unwrap().len(),
+        0,
+        "traits should serialize as an empty object {{}}"
+    );
+}
+
+/// `track_partial` with a missing `user_id` is silently buffered (cannot ship without one)
+/// rather than erroring. A subsequent patch carrying `user_id` flushes the merged payload.
+#[tokio::test]
+async fn track_partial_without_user_id_is_buffered_and_flushes_on_later_user_id() {
+    let server = MockServer::start().await;
+    let recorder = mount_path(&server, "POST", "/events/track_partial").await;
+    let client = fast_client_builder(&server).build().expect("build");
+
+    client
+        .patch(
+            "evt_buffered",
+            PatchOptions {
+                input: "first".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("buffered patch");
+    // No request yet — patch with user_id missing must be buffered.
+    assert_eq!(recorder.count(), 0, "no request without user_id");
+
+    client
+        .patch(
+            "evt_buffered",
+            PatchOptions {
+                user_id: "u".into(),
+                output: "last".into(),
+                is_pending: Some(false),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("flush patch");
+    client.close().await.expect("close");
+
+    assert_eq!(recorder.count(), 1, "exactly one flushed request");
+    let payload = recorder.requests()[0].json();
+    assert_eq!(payload["event_id"], "evt_buffered");
+    assert_eq!(
+        payload["ai_data"]["input"], "first",
+        "buffered input from earlier patch must survive"
+    );
+    assert_eq!(payload["ai_data"]["output"], "last");
+    assert_eq!(payload["is_pending"], false);
+}
+
+/// `track_event` (non-AI) with properties: the wire payload preserves user-set property
+/// keys EXACTLY (no flattening, no rename, no implicit prefixing) and adds the SDK's
+/// `$context` block — matching the JS SDK's `EventShipper.trackEvent`.
+#[tokio::test]
+async fn track_event_preserves_user_properties_verbatim() {
+    let server = MockServer::start().await;
+    let recorder = mount_path(&server, "POST", "/events/track_partial").await;
+    let client = fast_client_builder(&server).build().expect("build");
+
+    let mut props = BTreeMap::new();
+    props.insert("source".into(), json!("dashboard"));
+    props.insert("buildVersion".into(), json!("3.1.157"));
+    props.insert("nested.dotted.key".into(), json!("ok"));
+    // Real-prod sample: `tags` arrives as a JSON-stringified array on some orgs; the SDK
+    // must not auto-decode or modify it.
+    props.insert(
+        "tags".into(),
+        json!("[\"production\",\"plan:pro\",\"trigger:user\"]"),
+    );
+
+    client
+        .track_event(Event {
+            user_id: "u".into(),
+            event: "session_started".into(),
+            properties: props,
+            ..Default::default()
+        })
+        .await
+        .expect("track_event");
+    client.close().await.expect("close");
+
+    let payload = recorder.requests()[0].json();
+    let p = &payload["properties"];
+    assert_eq!(p["source"], "dashboard");
+    assert_eq!(p["buildVersion"], "3.1.157");
+    assert_eq!(
+        p["nested.dotted.key"], "ok",
+        "dotted keys must round-trip verbatim (not nest under .nested.dotted)"
+    );
+    assert_eq!(
+        p["tags"], "[\"production\",\"plan:pro\",\"trigger:user\"]",
+        "stringified tag arrays must round-trip without auto-decoding"
+    );
+    assert!(p.get("$context").is_some(), "$context auto-injected");
+    assert!(
+        payload.get("ai_data").is_none() || payload["ai_data"].is_null(),
+        "non-AI event must not carry ai_data"
+    );
+}
+
+/// `track_ai` properties merge into the same `properties` object as `$context` (i.e. SDK
+/// must not clobber caller properties when injecting `$context`).
+#[tokio::test]
+async fn track_ai_user_properties_and_context_coexist() {
+    let server = MockServer::start().await;
+    let recorder = mount_path(&server, "POST", "/events/track_partial").await;
+    let client = fast_client_builder(&server).build().expect("build");
+
+    let mut props = BTreeMap::new();
+    props.insert("temperature".into(), json!(0.7));
+    props.insert("organizationId".into(), json!("org_123"));
+
+    client
+        .track_ai(AiEvent {
+            user_id: "u".into(),
+            input: "x".into(),
+            output: "y".into(),
+            properties: props,
+            ..Default::default()
+        })
+        .await
+        .expect("track_ai");
+    client.close().await.expect("close");
+
+    let p = &recorder.requests()[0].json()["properties"];
+    assert_eq!(p["temperature"], 0.7);
+    assert_eq!(p["organizationId"], "org_123");
+    assert!(p["$context"].is_object());
+}
+
+/// Identify followed by a track_ai for the same `user_id`: the SDK must NOT auto-merge
+/// traits onto subsequent track_ai payloads. Traits live ONLY on `/users/identify`. This
+/// mirrors how the dashboard's user→event join works server-side.
+#[tokio::test]
+async fn identify_does_not_leak_traits_into_subsequent_track_ai() {
+    let server = MockServer::start().await;
+    let identify_recorder = mount_path(&server, "POST", "/users/identify").await;
+    let track_recorder = mount_path(&server, "POST", "/events/track_partial").await;
+    let client = fast_client_builder(&server).build().expect("build");
+
+    client
+        .identify(User {
+            user_id: "u_join".into(),
+            traits: BTreeMap::from([
+                ("plan".into(), json!("pro")),
+                ("country".into(), json!("US")),
+            ]),
+        })
+        .await
+        .expect("identify");
+    client
+        .track_ai(AiEvent {
+            user_id: "u_join".into(),
+            input: "x".into(),
+            output: "y".into(),
+            ..Default::default()
+        })
+        .await
+        .expect("track_ai");
+    client.close().await.expect("close");
+
+    assert_eq!(identify_recorder.count(), 1);
+    assert_eq!(track_recorder.count(), 1);
+    let track_payload = track_recorder.requests()[0].json();
+    let p = &track_payload["properties"];
+    assert!(
+        p.get("plan").is_none(),
+        "traits must NOT leak into track_ai properties; got {:?}",
+        p
+    );
+    assert!(
+        p.get("country").is_none(),
+        "traits must NOT leak into track_ai properties; got {:?}",
+        p
+    );
+}
+
+/// `traceloop.span.kind = workflow` and `traceloop.span.kind = task` survive ingestion.
+/// Real production samples show these used for agent.root and subagent spans (e.g. Vercel
+/// AI SDK + Raindrop) — our SDK accepts arbitrary kind values via [`Attribute::string`].
+#[tokio::test]
+async fn manual_span_with_workflow_or_task_kind_attribute_survives_filter() {
+    let server = MockServer::start().await;
+    let trace_recorder = mount_path(&server, "POST", "/traces").await;
+    let client = fast_client_builder(&server).build().expect("build");
+
+    let workflow = client.start_span(SpanOptions {
+        name: "agent.root".into(),
+        event_id: "evt_workflow".into(),
+        attributes: vec![Attribute::string("traceloop.span.kind", "workflow")],
+        // Note: no operation_id — exercising that traceloop.span.kind alone passes the filter
+        ..Default::default()
+    });
+    workflow.end();
+
+    let task = client.start_span(SpanOptions {
+        name: "subagent.planner".into(),
+        event_id: "evt_workflow".into(),
+        attributes: vec![Attribute::string("traceloop.span.kind", "task")],
+        ..Default::default()
+    });
+    task.end();
+
+    client.flush().await.expect("flush");
+    client.close().await.expect("close");
+
+    let mut all = Vec::new();
+    for r in trace_recorder.requests() {
+        all.extend(spans_of(&r.json()));
+    }
+    let workflow_span = all.iter().find(|s| s["name"] == "agent.root").unwrap();
+    let kind = span_attr(workflow_span, "traceloop.span.kind").expect("traceloop.span.kind");
+    assert_eq!(kind["stringValue"], "workflow");
+    let task_span = all
+        .iter()
+        .find(|s| s["name"] == "subagent.planner")
+        .unwrap();
+    let kind = span_attr(task_span, "traceloop.span.kind").expect("traceloop.span.kind");
+    assert_eq!(kind["stringValue"], "task");
+}
+
+/// Oversized payloads (> 1 MiB) are dropped client-side before the HTTP request is fired,
+/// matching the JS and Python SDKs' `MAX_INGEST_SIZE_BYTES` / `max_ingest_size_bytes`
+/// behavior. This prevents 413 storms on the gateway and protects host applications from
+/// runaway memory when a caller accidentally streams a giant prompt.
+#[tokio::test]
+async fn oversized_track_ai_payload_is_dropped_client_side() {
+    let server = MockServer::start().await;
+    let recorder = mount_path(&server, "POST", "/events/track_partial").await;
+    let client = fast_client_builder(&server).build().expect("build");
+
+    // Build a payload that comfortably exceeds 1 MiB after JSON serialization.
+    let huge_input: String = "x".repeat(2 * 1024 * 1024);
+    client
+        .track_ai(AiEvent {
+            user_id: "u".into(),
+            input: huge_input,
+            output: "y".into(),
+            ..Default::default()
+        })
+        .await
+        .expect("track_ai must NOT error on oversized payload");
+    client.close().await.expect("close");
+
+    assert_eq!(
+        recorder.count(),
+        0,
+        "oversized payload (> 1 MiB) must be dropped before hitting the wire"
+    );
+}
+
+/// `add_attachments` across multiple patches in an interaction must accumulate (not replace)
+/// the attachments list, with input/output ordering preserved. Mirrors the JS SDK's
+/// `mergeAttachments` semantics.
+#[tokio::test]
+async fn add_attachments_across_patches_accumulates_in_order() {
+    let server = MockServer::start().await;
+    let recorder = mount_path(&server, "POST", "/events/track_partial").await;
+    let client = fast_client_builder(&server).build().expect("build");
+
+    let interaction = client
+        .begin(BeginOptions {
+            event_id: "evt_attach_acc".into(),
+            user_id: "u".into(),
+            input: "go".into(),
+            attachments: vec![Attachment {
+                kind: "text".into(),
+                role: "input".into(),
+                name: "first".into(),
+                value: "alpha".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        })
+        .await;
+
+    interaction
+        .add_attachments(vec![Attachment {
+            kind: "text".into(),
+            role: "output".into(),
+            name: "second".into(),
+            value: "beta".into(),
+            ..Default::default()
+        }])
+        .await
+        .expect("add second");
+    interaction
+        .add_attachments(vec![Attachment {
+            kind: "image".into(),
+            role: "output".into(),
+            name: "third".into(),
+            value: "https://x/img.png".into(),
+            ..Default::default()
+        }])
+        .await
+        .expect("add third");
+
+    interaction
+        .finish(FinishOptions {
+            output: "done".into(),
+            ..Default::default()
+        })
+        .await
+        .expect("finish");
+    client.close().await.expect("close");
+
+    let final_payload = recorder
+        .requests()
+        .last()
+        .expect("at least one request")
+        .json();
+    let atts = final_payload["attachments"]
+        .as_array()
+        .expect("attachments");
+    assert_eq!(
+        atts.len(),
+        3,
+        "all three attachments must accumulate, got {:?}",
+        atts
+    );
+    assert_eq!(atts[0]["name"], "first");
+    assert_eq!(atts[1]["name"], "second");
+    assert_eq!(atts[2]["name"], "third");
 }

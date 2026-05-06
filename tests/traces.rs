@@ -582,3 +582,65 @@ async fn empty_event_id_is_filled_when_starting_via_interaction() {
     let evt_id_attr = span_attr(s, "ai.telemetry.metadata.raindrop.eventId").unwrap();
     assert_eq!(evt_id_attr["stringValue"], "evt_link");
 }
+
+/// `Span::set_token_usage` after `end()` is a no-op (it goes through `set_attributes`,
+/// which is documented to be safe-after-end and silently drop).
+#[tokio::test]
+async fn set_token_usage_after_end_is_dropped() {
+    let server = MockServer::start().await;
+    let trace_recorder = mount_path(&server, "POST", "/traces").await;
+    let client = fast_client_builder(&server).build().expect("build");
+
+    let span = client.start_span(SpanOptions {
+        name: "ended".into(),
+        event_id: "evt".into(),
+        operation_id: "ai.generateText".into(),
+        ..Default::default()
+    });
+    span.end();
+    span.set_token_usage("gpt-4o", 100, 50);
+    client.flush().await.expect("flush");
+    client.close().await.expect("close");
+
+    let payload = trace_recorder.requests()[0].json();
+    let s = &spans_of(&payload)[0];
+    assert!(
+        span_attr(s, "gen_ai.response.model").is_none(),
+        "set_token_usage after end MUST be a no-op"
+    );
+    assert!(span_attr(s, "gen_ai.usage.input_tokens").is_none());
+}
+
+/// `ToolSpan::set_token_usage` forwards to the underlying span. Useful when an LLM-driven
+/// tool reports its own token usage (rare but real).
+#[tokio::test]
+async fn tool_span_set_token_usage_forwards_to_underlying_span() {
+    let server = MockServer::start().await;
+    let trace_recorder = mount_path(&server, "POST", "/traces").await;
+    let _ = mount_path(&server, "POST", "/events/track_partial").await;
+    let client = fast_client_builder(&server).build().expect("build");
+
+    let interaction = client
+        .begin(BeginOptions {
+            event_id: "evt_tool_tokens".into(),
+            user_id: "u".into(),
+            ..Default::default()
+        })
+        .await;
+    let tool = interaction.start_tool_span("rerank", ToolOptions::default());
+    tool.set_token_usage("voyage-rerank-2", 1024, 0);
+    tool.end();
+    let _ = client.close().await;
+
+    let mut all = Vec::new();
+    for r in trace_recorder.requests() {
+        all.extend(spans_of(&r.json()));
+    }
+    let s = all.iter().find(|s| s["name"] == "rerank").unwrap();
+    let model = span_attr(s, "gen_ai.response.model").unwrap();
+    assert_eq!(model["stringValue"], "voyage-rerank-2");
+    let input_tokens = span_attr(s, "gen_ai.usage.input_tokens").unwrap();
+    assert_eq!(input_tokens["intValue"], "1024");
+    // 0 output tokens → omitted
+    assert!(span_attr(s, "gen_ai.usage.output_tokens").is_none());
+}

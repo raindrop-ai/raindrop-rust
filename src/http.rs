@@ -10,6 +10,12 @@ use tokio::sync::Mutex;
 
 use crate::error::{Error, Result};
 
+/// Maximum payload size accepted by the ingestion gateway (1 MiB). Mirrors the JS SDK's
+/// `MAX_INGEST_SIZE_BYTES` and the Python SDK's `max_ingest_size_bytes`. Oversized payloads
+/// are silently dropped client-side; this matches the behavior of the other SDKs and avoids
+/// a 413 on the gateway.
+pub(crate) const MAX_INGEST_SIZE_BYTES: usize = 1024 * 1024;
+
 /// Configuration for the retrying HTTP transport.
 #[derive(Clone)]
 pub(crate) struct TransportConfig {
@@ -56,6 +62,24 @@ impl RetryingHttpClient {
             path.strip_prefix('/').unwrap_or(path)
         );
         let payload = serde_json::to_vec(body)?;
+
+        // Drop oversized payloads on the floor to match the Python and JS SDKs
+        // (`MAX_INGEST_SIZE_BYTES` and Python's `max_ingest_size_bytes` of ~1 MiB).
+        // The ingestion gateway enforces a similar cap and would return 413 otherwise.
+        // Returning `Ok(())` here keeps SDK calls non-fatal — losing one payload is
+        // strictly better than blocking the host application on a serialization disaster.
+        if payload.len() > MAX_INGEST_SIZE_BYTES {
+            if self.cfg.debug {
+                tracing::warn!(
+                    path,
+                    bytes = payload.len(),
+                    max = MAX_INGEST_SIZE_BYTES,
+                    "raindrop: dropping oversized payload (> 1 MiB)"
+                );
+            }
+            return Ok(());
+        }
+
         let mut last_err: Option<Error> = None;
 
         for attempt in 1..=self.cfg.max_attempts {

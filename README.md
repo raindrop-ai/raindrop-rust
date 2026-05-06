@@ -81,6 +81,9 @@ child.set_attributes([
     Attribute::string("ai.model.id", "gpt-4o"),
     Attribute::int("ai.usage.prompt_tokens", 10),
 ]);
+// Or, for the canonical OpenTelemetry GenAI shape that the Raindrop backend's
+// `parseSpan.getInputAndOutputTokens` reads to populate per-event token totals:
+child.set_token_usage("gpt-4o", /* input */ 47, /* output */ 11);
 child.end();
 
 // You can also end a span with an explicit time, e.g. when wrapping a call you've already made.
@@ -249,10 +252,43 @@ that don't pass that filter are silently dropped. Plain `client.start_span(...)`
 just `name` + `event_id` automatically emit `traceloop.association.properties.event_id` so
 they pass.
 
+## Attachments
+
+Attachments are split by `role` into the dashboard's `inputAttachments[]` and
+`outputAttachments[]`. The wire schema accepts four `kind` values: `"text"`, `"code"`,
+`"image"`, `"iframe"`. (The dashboard's display schema only renders `text | image | iframe`
+— `code` survives ingestion but is filtered from the visual attachments tab.)
+
+```rust
+use raindrop::Attachment;
+
+let attachment = Attachment {
+    kind: "image".into(),
+    role: "input".into(),
+    name: "screenshot.png".into(),
+    value: "https://cdn.example/img.png".into(),
+    // Optional: pre-assign an attachment_id so a follow-up `Signal { attachment_id }`
+    // can reference it. If empty, the backend auto-assigns a UUID.
+    attachment_id: "att-abc-123".into(),
+    ..Default::default()
+};
+```
+
+## Token usage
+
+`Span::set_token_usage(model, input_tokens, output_tokens)` emits the canonical
+OpenTelemetry GenAI semantic-convention attributes (`gen_ai.response.model`,
+`gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`) so the Raindrop backend's
+[`parseSpan.getInputAndOutputTokens`](https://github.com/invisible-tools/dawn/blob/main/apps/dawn/lib/traces/parseSpan.ts)
+correctly populates per-span and per-event token totals on the dashboard. Pass `0` for
+either count or an empty `model` to omit the corresponding attribute.
+
 ## Known Limitations
 
 - **Nested Trace Spans:** The Rust SDK currently provides manual span instrumentation (`start_span`, `start_tool_span`). It does not yet automatically hook into Rust LLM frameworks (like `async-openai` or `langchain-rust`) to produce nested trace spans automatically. You must create spans manually.
-- **PII Redaction:** Automatic PII redaction (which is available in the Python SDK via `set_redact_pii`) is not yet implemented in the Rust SDK.
+- **PII Redaction:** Automatic PII redaction (which is available in the Python SDK via `set_redact_pii` and the JS SDK via `redactPii`) is not yet implemented in the Rust SDK. If your application logs PII into events, redact at the call site or upstream of `track_ai` / `track_event`.
+- **Local debugger mirroring (`RAINDROP_LOCAL_DEBUGGER`):** The JS and Python SDKs mirror traces and partial events to a local Workshop instance via `RAINDROP_LOCAL_DEBUGGER`. The Rust SDK currently ships only to the configured `endpoint`; mirroring to a local debugger is on the roadmap.
+- **Oversized payload guard:** Payloads larger than 1 MiB after JSON serialization are dropped client-side (matching the JS / Python SDKs' `MAX_INGEST_SIZE_BYTES` / `max_ingest_size_bytes`) to avoid 413s on the gateway. The drop is logged when `debug=true` and is otherwise silent.
 
 ## Configuration
 

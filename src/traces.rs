@@ -161,6 +161,38 @@ impl Span {
         }
     }
 
+    /// Record LLM token usage on this span using the canonical OpenTelemetry GenAI semantic
+    /// conventions. The backend's [`parseSpan`][parse-span] derives the per-event
+    /// `input_tokens`, `output_tokens`, and `model` columns from these attributes:
+    ///
+    /// - `gen_ai.response.model` — required gate (the backend silently drops token usage when
+    ///   this is missing, see `getInputAndOutputTokens`)
+    /// - `gen_ai.usage.input_tokens` (preferred) or `gen_ai.usage.prompt_tokens`
+    /// - `gen_ai.usage.output_tokens` (preferred) or `gen_ai.usage.completion_tokens`
+    ///
+    /// Pass `0` for either token count to omit it. Pass an empty `model` to skip the gate
+    /// (the SDK will not emit `gen_ai.response.model`, so the backend will treat tokens as 0
+    /// for this span — useful when the caller wants to set tokens on a manual span without
+    /// claiming a model).
+    ///
+    /// [parse-span]: https://github.com/invisible-tools/dawn/blob/main/apps/dawn/lib/traces/parseSpan.ts
+    pub fn set_token_usage(&self, model: impl AsRef<str>, input_tokens: i64, output_tokens: i64) {
+        let model = model.as_ref();
+        let mut attrs: Vec<Attribute> = Vec::with_capacity(3);
+        if !model.is_empty() {
+            attrs.push(Attribute::string("gen_ai.response.model", model));
+        }
+        if input_tokens > 0 {
+            attrs.push(Attribute::int("gen_ai.usage.input_tokens", input_tokens));
+        }
+        if output_tokens > 0 {
+            attrs.push(Attribute::int("gen_ai.usage.output_tokens", output_tokens));
+        }
+        if !attrs.is_empty() {
+            self.set_attributes(attrs);
+        }
+    }
+
     /// End the span at the current time.
     pub fn end(&self) {
         self.end_at(None)
@@ -284,6 +316,12 @@ impl ToolSpan {
     /// Mark the tool span as failed.
     pub fn set_error(&self, message: impl Into<String>) {
         self.span.set_error(message)
+    }
+
+    /// See [`Span::set_token_usage`]. Forwarded to the underlying span.
+    pub fn set_token_usage(&self, model: impl AsRef<str>, input_tokens: i64, output_tokens: i64) {
+        self.span
+            .set_token_usage(model, input_tokens, output_tokens)
     }
 
     /// End the tool span. Computes a `traceloop.entity.duration_ms` attribute when the start time

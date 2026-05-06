@@ -8,20 +8,37 @@ use crate::client::Client;
 use crate::error::Result;
 use crate::traces::{Span, SpanOptions, ToolOptions, ToolSpan, TrackToolOptions};
 
-/// Attachment shape shared across event payloads. Mirrors the Go SDK's `Attachment` struct.
+/// Attachment shape shared across event payloads. Mirrors the canonical
+/// `BaseAttachmentSchema` from `@raindrop-ai/schemas/ingest` and the Go SDK's `Attachment`
+/// struct.
+///
+/// On the dashboard, attachments are split by `role` into `inputAttachments[]` vs
+/// `outputAttachments[]`. Backend ingestion auto-generates an `attachment_id` (UUID v4) when
+/// not supplied, but callers can pass their own — useful for retries and for cross-referencing
+/// the same attachment from a follow-up `Signal::attachment_id`.
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Attachment {
-    /// Type of attachment, e.g. "text", "code", "image".
+    /// Type of attachment. Accepted values: `"text"`, `"code"`, `"image"`, `"iframe"`.
+    /// Note: the dashboard frontend's `AttachmentSchema` only displays
+    /// `"text" | "image" | "iframe"` — `"code"` attachments survive ingestion but are
+    /// filtered from the dashboard's attachment view.
     #[serde(rename = "type")]
     pub kind: String,
-    /// Whether the attachment belongs to the model "input" or "output".
+    /// Whether the attachment belongs to the model `"input"` or `"output"`. Any value other
+    /// than `"input"` is treated as `"output"` by the backend.
     pub role: String,
-    /// Optional logical name.
+    /// Optional UUID identifying this attachment. If empty on the wire, the backend
+    /// auto-assigns one. Set explicitly to round-trip with
+    /// [`Signal::attachment_id`](crate::signals::Signal::attachment_id) or for idempotent retries.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub attachment_id: String,
+    /// Optional logical name (e.g. `"snippet.py"`, `"summary.md"`).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub name: String,
     /// Attachment value (typically a string body or URL).
     pub value: String,
-    /// Optional language hint for code attachments.
+    /// Optional language hint. Only emitted for `kind == "code"` attachments per the
+    /// canonical schema's discriminated union.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub language: String,
 }
