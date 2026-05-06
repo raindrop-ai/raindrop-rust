@@ -2,7 +2,7 @@
 name = "raindrop-ai"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.88"
 description = "Raindrop AI observability SDK for Rust — track AI events, signals, and OTLP-style traces."
 authors = ["Raindrop AI <sdk@raindrop.ai>"]
 license = "MIT"
