@@ -1,15 +1,13 @@
 # Raindrop Rust SDK
 
-Production-ready Rust SDK for [Raindrop AI](https://raindrop.ai/). Mirrors the public API of the
-official [Go](https://github.com/raindrop-ai/go), [Python](https://github.com/raindrop-ai/python),
-and [JavaScript](https://github.com/raindrop-ai/js) SDKs and ships byte-compatible payloads.
+The official Rust SDK for [Raindrop AI](https://raindrop.ai) — track AI events, collect user signals, and instrument LLM applications with OpenTelemetry-based tracing.
 
-> **Internal:** this crate is not published to crates.io.
-> Vendor it via a git dependency in your `Cargo.toml`.
+
+## Installation
 
 ```toml
 [dependencies]
-raindrop-ai = { git = "ssh://git@github.com/invisible-tools/raindrop-rust" }
+raindrop-ai = "0.1.0"
 ```
 
 ## Quick start
@@ -255,4 +253,4 @@ The test suite is built around `wiremock` and validates payload shape against th
 
 ## License
 
-Proprietary — internal use only.
+MIT

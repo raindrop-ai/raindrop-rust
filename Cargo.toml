@@ -4,10 +4,11 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.75"
 description = "Raindrop AI observability SDK for Rust — track AI events, signals, and OTLP-style traces."
-license = "Apache-2.0"
+authors = ["Raindrop AI <sdk@raindrop.ai>"]
+license = "MIT"
 homepage = "https://raindrop.ai"
+repository = "https://github.com/invisible-tools/raindrop-rust"
 readme = "README.md"
-publish = false
 
 [lib]
 name = "raindrop"
