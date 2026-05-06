@@ -608,6 +608,295 @@ async fn e2e_tool_span_populates_event_tool_calls_array() {
     }
 }
 
+/// **User-like complex trajectory.** Simulates a realistic agent run:
+///
+/// - root agent span
+/// - nested planner subagent span
+/// - nested researcher subagent span
+/// - multiple tool calls
+/// - one failed tool call followed by a successful retry
+/// - one deliberately long-running tool
+///
+/// Dashboard assertions cover the user-visible trajectory row: event input/output,
+/// convo grouping, custom properties, `toolCalls[]`, `errorSpans[]`, statuses, retry
+/// metadata, and long-tool duration. This is intentionally closer to a customer run
+/// than the smaller smoke tests above.
+#[tokio::test]
+async fn e2e_complex_agent_trajectory_with_subagents_tools_retry_failure_and_slow_tool() {
+    let (write_key, dashboard_token) = match env_keys() {
+        Some(v) => v,
+        None => {
+            eprintln!("[e2e] skipping: set RAINDROP_WRITE_KEY and RAINDROP_DASHBOARD_TOKEN to run");
+            return;
+        }
+    };
+    let user_id = unique_user_id("complex_agent");
+    let convo_id = format!("{}_convo", user_id);
+
+    let mut begin_props = BTreeMap::new();
+    begin_props.insert(
+        "scenario".to_string(),
+        json!("complex_agent_retry_slow_tool"),
+    );
+    begin_props.insert("retry_count".to_string(), json!(1));
+    begin_props.insert("subagents.expected".to_string(), json!(2));
+
+    let client = build_client(&write_key);
+    let interaction = client
+        .begin(BeginOptions {
+            user_id: user_id.clone(),
+            convo_id: convo_id.clone(),
+            event: "agent_run".to_string(),
+            input: "Research account health, retry failed API calls, and summarize risks."
+                .to_string(),
+            properties: begin_props,
+            ..Default::default()
+        })
+        .await;
+
+    let root = interaction.start_span(SpanOptions {
+        name: "agent.root".into(),
+        operation_id: "ai.workflow".into(),
+        attributes: vec![
+            Attribute::string("traceloop.span.kind", "workflow"),
+            Attribute::string("agent.name", "account-health-agent"),
+        ],
+        ..Default::default()
+    });
+
+    let planner = interaction.start_span(SpanOptions {
+        name: "subagent.planner".into(),
+        operation_id: "ai.subagent".into(),
+        parent: Some(root.clone()),
+        attributes: vec![
+            Attribute::string("traceloop.span.kind", "task"),
+            Attribute::string("subagent.name", "planner"),
+        ],
+        ..Default::default()
+    });
+    let plan_tool = interaction.start_tool_span(
+        "plan_steps",
+        ToolOptions {
+            parent: Some(planner.clone()),
+            input: Some(json!({
+                "objective": "find account risks",
+                "constraints": ["no writes", "retry transient API failure"]
+            })),
+            ..Default::default()
+        },
+    );
+    plan_tool.set_output(&json!({
+        "steps": ["load_profile", "fetch_risk_signals", "retry_failed_fetch", "summarize"]
+    }));
+    plan_tool.end();
+    planner.end();
+
+    let researcher = interaction.start_span(SpanOptions {
+        name: "subagent.researcher".into(),
+        operation_id: "ai.subagent".into(),
+        parent: Some(root.clone()),
+        attributes: vec![
+            Attribute::string("traceloop.span.kind", "task"),
+            Attribute::string("subagent.name", "researcher"),
+        ],
+        ..Default::default()
+    });
+
+    let mut lookup_props = BTreeMap::new();
+    lookup_props.insert("subagent".to_string(), json!("researcher"));
+    lookup_props.insert("retry_attempt".to_string(), json!(0));
+    interaction.track_tool(TrackToolOptions {
+        name: "customer_profile_lookup".into(),
+        parent: Some(researcher.clone()),
+        input: Some(json!({"customer_id": "cust_123", "fields": ["plan", "usage", "health"]})),
+        output: Some(json!({"plan": "enterprise", "usage": "high", "health": "warning"})),
+        duration: Some(Duration::from_millis(125)),
+        properties: lookup_props,
+        ..Default::default()
+    });
+
+    let mut failed_props = BTreeMap::new();
+    failed_props.insert("subagent".to_string(), json!("researcher"));
+    failed_props.insert("retry_attempt".to_string(), json!(1));
+    failed_props.insert("retryable".to_string(), json!(true));
+    interaction.track_tool(TrackToolOptions {
+        name: "risk_signal_fetch".into(),
+        parent: Some(researcher.clone()),
+        input: Some(json!({"customer_id": "cust_123", "window": "7d"})),
+        error: Some("TimeoutError: risk service timed out after 2s".into()),
+        duration: Some(Duration::from_millis(210)),
+        properties: failed_props,
+        ..Default::default()
+    });
+
+    let mut retry_props = BTreeMap::new();
+    retry_props.insert("subagent".to_string(), json!("researcher"));
+    retry_props.insert("retry_attempt".to_string(), json!(2));
+    retry_props.insert("retryable".to_string(), json!(true));
+    interaction.track_tool(TrackToolOptions {
+        name: "risk_signal_fetch_retry".into(),
+        parent: Some(researcher.clone()),
+        input: Some(
+            json!({"customer_id": "cust_123", "window": "7d", "retry_of": "risk_signal_fetch"}),
+        ),
+        output: Some(json!({"risk_signals": ["billing_spike", "slow_response"], "count": 2})),
+        duration: Some(Duration::from_millis(180)),
+        properties: retry_props,
+        ..Default::default()
+    });
+
+    let mut slow_props = BTreeMap::new();
+    slow_props.insert("subagent".to_string(), json!("researcher"));
+    slow_props.insert("slow_tool".to_string(), json!(true));
+    interaction.track_tool(TrackToolOptions {
+        name: "warehouse_scan_slow".into(),
+        parent: Some(researcher.clone()),
+        input: Some(json!({"customer_id": "cust_123", "query": "recent incidents"})),
+        output: Some(json!({"incidents": 3, "oldest_age_hours": 36})),
+        duration: Some(Duration::from_millis(1_350)),
+        properties: slow_props,
+        ..Default::default()
+    });
+    researcher.end();
+    root.end();
+
+    let mut finish_props = BTreeMap::new();
+    finish_props.insert(
+        "agent.final_status".to_string(),
+        json!("completed_with_retry"),
+    );
+    finish_props.insert("agent.retry_count".to_string(), json!(1));
+    finish_props.insert("agent.subagent_count".to_string(), json!(2));
+
+    interaction
+        .finish(FinishOptions {
+            output:
+                "Account is healthy enough to proceed, but has billing spike and slow response risks. One risk fetch timed out and succeeded on retry."
+                    .to_string(),
+            model: "gpt-4o-mini".to_string(),
+            properties: finish_props,
+            ..Default::default()
+        })
+        .await
+        .expect("finish complex agent trajectory");
+    client.close().await.expect("close");
+
+    let ev = poll_event_until(
+        &dashboard_token,
+        &user_id,
+        |e| {
+            e["aiData"]["output"]
+                .as_str()
+                .is_some_and(|o| o.contains("succeeded on retry"))
+                && e["toolCalls"].as_array().is_some_and(|arr| arr.len() >= 5)
+                && e["errorSpans"]
+                    .as_array()
+                    .is_some_and(|arr| !arr.is_empty())
+        },
+        E2E_DERIVED_POLL_TIMEOUT,
+    )
+    .await
+    .expect("complex agent event with toolCalls and errorSpans");
+
+    assert_eq!(ev["userId"].as_str().unwrap_or(""), user_id);
+    assert_eq!(ev["name"].as_str().unwrap_or(""), "agent_run");
+    assert_eq!(ev["aiData"]["convoId"].as_str().unwrap_or(""), convo_id);
+    assert_eq!(ev["aiData"]["model"].as_str().unwrap_or(""), "gpt-4o-mini");
+    assert!(
+        ev["aiData"]["input"]
+            .as_str()
+            .unwrap_or("")
+            .contains("retry failed API calls"),
+        "input should look like the user-like agent request"
+    );
+
+    let props = &ev["properties"];
+    assert_eq!(
+        props["scenario"].as_str(),
+        Some("complex_agent_retry_slow_tool")
+    );
+    assert_eq!(
+        numeric_property(&props["agent.retry_count"]),
+        1.0,
+        "finish property agent.retry_count should survive"
+    );
+    assert_eq!(
+        props["agent.final_status"].as_str(),
+        Some("completed_with_retry")
+    );
+
+    let tool_calls = ev["toolCalls"].as_array().unwrap();
+    let by_tool = |name: &str| {
+        tool_calls
+            .iter()
+            .find(|t| t["tool_name"].as_str() == Some(name))
+            .unwrap_or_else(|| panic!("missing tool {} in {:?}", name, tool_calls))
+    };
+    let expected_tools = [
+        "plan_steps",
+        "customer_profile_lookup",
+        "risk_signal_fetch",
+        "risk_signal_fetch_retry",
+        "warehouse_scan_slow",
+    ];
+    for tool in expected_tools {
+        let call = by_tool(tool);
+        assert!(
+            call["span_id"].as_str().is_some_and(|s| !s.is_empty()),
+            "{} should include span_id",
+            tool
+        );
+        assert!(
+            call["started_at"].as_str().is_some_and(|s| !s.is_empty()),
+            "{} should include started_at",
+            tool
+        );
+    }
+
+    assert_eq!(
+        by_tool("risk_signal_fetch")["status"]
+            .as_str()
+            .unwrap_or(""),
+        "ERROR",
+        "first risk fetch should be marked ERROR"
+    );
+    assert_eq!(
+        by_tool("risk_signal_fetch_retry")["status"]
+            .as_str()
+            .unwrap_or(""),
+        "OK",
+        "retry should be marked OK"
+    );
+    assert!(
+        by_tool("warehouse_scan_slow")["duration_ms"]
+            .as_f64()
+            .unwrap_or(0.0)
+            >= 1_000.0,
+        "slow warehouse scan should have >= 1000ms duration, got {:?}",
+        by_tool("warehouse_scan_slow")["duration_ms"]
+    );
+
+    let error_spans = ev["errorSpans"].as_array().unwrap();
+    let failure = error_spans
+        .iter()
+        .find(|s| s["span_name"].as_str() == Some("risk_signal_fetch"))
+        .unwrap_or_else(|| {
+            panic!(
+                "risk_signal_fetch missing from errorSpans: {:?}",
+                error_spans
+            )
+        });
+    assert_eq!(failure["status"].as_str().unwrap_or(""), "ERROR");
+    assert_eq!(failure["span_type"].as_str().unwrap_or(""), "TOOL_CALL");
+    assert!(
+        failure["output_payload"]
+            .as_str()
+            .unwrap_or("")
+            .contains("TimeoutError"),
+        "error output payload should preserve the timeout message"
+    );
+}
+
 /// **Error spans populated.** When a span ends with `set_error`, the resulting event MUST
 /// have `errorSpans[]` with the correct span_name, status=ERROR, duration_ms, and (truncated)
 /// output_payload.
