@@ -82,6 +82,13 @@ async fn query_dashboard(token: &str, limit: usize) -> Result<Vec<Value>, String
         .unwrap_or_default())
 }
 
+/// Default polling deadline. Empirically, the Raindrop ingestion → events.list pipeline
+/// can take over a minute (sometimes 90–120s) before a freshly-shipped event surfaces on
+/// the dashboard, so we mirror the Python SDK's e2e suite (which uses 240s) and pick a
+/// generous default here. CI without dashboard credentials skips these tests entirely,
+/// so the longer timeout has no effect on routine CI runtime.
+const E2E_POLL_TIMEOUT: Duration = Duration::from_secs(180);
+
 /// Poll until at least `min_count` events for `user_id` are visible on the dashboard, or until
 /// the deadline expires.
 async fn poll_events(
@@ -106,8 +113,8 @@ async fn poll_events(
         sleep(interval).await;
     }
     Err(format!(
-        "Timed out waiting for {} events for user {} (last seen {})",
-        min_count, user_id, last_seen
+        "Timed out waiting for {} events for user {} after {:?} (last seen {})",
+        min_count, user_id, timeout, last_seen
     ))
 }
 
@@ -154,7 +161,7 @@ async fn e2e_track_ai_event_lands_in_dashboard() {
 
     client.close().await.expect("close");
 
-    let events = poll_events(&dashboard_token, &user_id, 1, Duration::from_secs(60))
+    let events = poll_events(&dashboard_token, &user_id, 1, E2E_POLL_TIMEOUT)
         .await
         .expect("dashboard verification");
     let ev = events
@@ -167,16 +174,30 @@ async fn e2e_track_ai_event_lands_in_dashboard() {
     assert_eq!(ai["convoId"].as_str().unwrap_or_default(), convo_id);
 
     let p = &ev["properties"];
+    // The dashboard normalizes numeric properties to strings (e.g. "10"), so accept both
+    // JSON numbers and stringified numbers and parse the numeric value.
+    let prompt_tokens = numeric_property(&p["ai.usage.prompt_tokens"]);
+    let completion_tokens = numeric_property(&p["ai.usage.completion_tokens"]);
     assert!(
-        p["ai.usage.prompt_tokens"].as_u64().unwrap_or(0) > 0,
+        prompt_tokens > 0.0,
         "expected prompt_tokens > 0, got {:?}",
         p["ai.usage.prompt_tokens"]
     );
     assert!(
-        p["ai.usage.completion_tokens"].as_u64().unwrap_or(0) > 0,
+        completion_tokens > 0.0,
         "expected completion_tokens > 0, got {:?}",
         p["ai.usage.completion_tokens"]
     );
+}
+
+/// Read a numeric property from a dashboard event. Some pipelines return numeric properties as
+/// JSON numbers, others as stringified numbers (e.g. `"10"`); accept either.
+fn numeric_property(value: &Value) -> f64 {
+    match value {
+        Value::Number(n) => n.as_f64().unwrap_or(0.0),
+        Value::String(s) => s.parse::<f64>().unwrap_or(0.0),
+        _ => 0.0,
+    }
 }
 
 #[tokio::test]
@@ -223,7 +244,7 @@ async fn e2e_interaction_with_tool_span_lands_in_dashboard() {
         .expect("finish");
     client.close().await.expect("close");
 
-    let events = poll_events(&dashboard_token, &user_id, 1, Duration::from_secs(60))
+    let events = poll_events(&dashboard_token, &user_id, 1, E2E_POLL_TIMEOUT)
         .await
         .expect("dashboard verification");
     let ev = events
@@ -288,7 +309,7 @@ async fn e2e_signals_and_identify_land_in_dashboard() {
     // was attached to) — which proves the API is reachable and the write key is valid even if
     // we cannot query signals directly. Signal landing should be added here when a query
     // endpoint becomes available.
-    let events = poll_events(&dashboard_token, &user_id, 1, Duration::from_secs(60))
+    let events = poll_events(&dashboard_token, &user_id, 1, E2E_POLL_TIMEOUT)
         .await
         .expect("dashboard verification");
     let ev = events
