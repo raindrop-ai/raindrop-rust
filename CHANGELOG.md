@@ -29,7 +29,8 @@ release-plz at that point — it's overkill until then).
 
 ## [0.0.2] - 2026-05-07
 
-Dependency upgrade: bump `reqwest` from `0.12` to `0.13`.
+Dependency upgrade: bump `reqwest` from `0.12` to `0.13`. No consumer-facing
+API or feature-flag changes.
 
 ### Changed
 
@@ -41,27 +42,11 @@ Dependency upgrade: bump `reqwest` from `0.12` to `0.13`.
   `headers`, `text`, `HeaderMap`, `StatusCode`) is unchanged. See
   [reqwest's 0.13 release notes](https://github.com/seanmonstar/reqwest/blob/master/CHANGELOG.md#v0130)
   for the full list of upstream breaking changes.
-- **Renamed feature `rustls-tls` → `rustls`** to match reqwest 0.13's
-  upstream feature name (in 0.13 reqwest renamed `rustls-tls` → `rustls`).
-  Consumers selecting the rustls backend explicitly need to update:
-  ```toml
-  raindrop-ai = { ..., default-features = false, features = ["rustls"] }
-  ```
-  The default feature set still selects rustls, so consumers using
-  `default-features = true` (the common case) need no change. `native-tls`
-  is unchanged.
-
-### Migration
-
-If you depend on this crate with `default-features = false` and an explicit
-TLS feature:
-
-```diff
-- raindrop-ai = { git = "...", tag = "v0.0.1", default-features = false, features = ["rustls-tls"] }
-+ raindrop-ai = { git = "...", tag = "v0.0.2", default-features = false, features = ["rustls"] }
-```
-
-No source-level changes are required.
+- **Public Cargo features are unchanged** (`rustls-tls`, `native-tls`).
+  Reqwest renamed its internal `rustls-tls` feature to `rustls` in 0.13, but
+  this crate's feature names are part of its public API surface and are kept
+  stable across reqwest upgrades — only the RHS of the feature mapping
+  follows the rename. Consumers' `Cargo.toml` files do not need to change.
 
 ## [0.0.1] - 2026-05-06
 
