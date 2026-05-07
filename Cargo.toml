@@ -19,11 +19,8 @@ name = "raindrop"
 path = "src/lib.rs"
 
 [features]
-# Public feature names are part of this crate's API surface and are kept stable
-# across reqwest upgrades. Upstream reqwest renamed `rustls-tls` → `rustls` in
-# 0.13, but consumers of `raindrop-ai` should not have to update their Cargo
-# manifests for an internal dep bump, so the LHS stays `rustls-tls` and only
-# the RHS follows the rename.
+# Public feature names are this crate's stable API; decoupled from reqwest's
+# internal feature naming.
 default = ["rustls-tls"]
 rustls-tls = ["reqwest/rustls"]
 native-tls = ["reqwest/native-tls"]
