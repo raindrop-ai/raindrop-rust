@@ -4,6 +4,29 @@ All notable changes to this crate are documented here. Format follows [Keep a Ch
 
 ## [Unreleased]
 
+<!--
+Release process (no automation; everything is manual + reviewable):
+
+1. Bump `version` in `Cargo.toml` and run `cargo build` so `Cargo.lock` updates.
+2. Move the contents of `[Unreleased]` above into a new `[X.Y.Z] - YYYY-MM-DD`
+   section and update the link refs at the bottom.
+3. Run the full local quality gate:
+     cargo fmt --check
+     cargo clippy --all-targets --all-features -- -D warnings
+     cargo test --all-features
+     RUSTDOCFLAGS=-D\ warnings cargo doc --no-deps --all-features
+4. Open a PR with the version bump + changelog. Merge once CI is green.
+5. From `main` after the merge:
+     git tag -a vX.Y.Z -m "..."
+     git push origin vX.Y.Z
+     gh release create vX.Y.Z --title "..." --notes "..."
+6. Update the README install snippet's `tag = "vX.Y.Z"`.
+
+When ready to publish to crates.io: flip `publish = true` in `Cargo.toml`,
+add `CRATES_IO_TOKEN` to repo secrets, and `cargo publish` (or re-introduce
+release-plz at that point — it's overkill until then).
+-->
+
 ## [0.0.1] - 2026-05-06
 
 Initial **beta** release. The wire contract against the Raindrop ingestion API is stable and verified end-to-end against the live backend on every push; the Rust crate API may still change in minor ways before `0.1.0`.
