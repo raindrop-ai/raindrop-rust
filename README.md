@@ -2,6 +2,8 @@
 
 The official Rust SDK for [Raindrop AI](https://raindrop.ai) — track AI events, collect user signals, and instrument LLM applications with OpenTelemetry-based tracing.
 
+📖 **Full documentation:** [docs.raindrop.ai/sdk/rust](https://docs.raindrop.ai/sdk/rust). This README is the quick reference; the docs page is the canonical narrative tour.
+
 > **Beta.** The crate is `0.0.1`. The wire contract against the Raindrop ingestion API is stable and verified end-to-end against the live backend on every push, but the crate API may still change in minor ways before `0.1.0`. We recommend pinning the git revision in your `Cargo.toml` and reviewing the [Known Limitations](#known-limitations) before using it in production.
 
 ## Installation
@@ -15,6 +17,8 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
 Track the latest tagged release at [github.com/raindrop-ai/raindrop-rust/releases](https://github.com/raindrop-ai/raindrop-rust/releases). For development against the bleeding edge, drop the `tag` field to follow `main`.
+
+The Rust SDK requires **Rust 1.88+** (MSRV). It is `async`-first and uses `tokio`. Most fallible methods return `Result<_, Error>` — `track_ai`, `track_event`, `identify`, `track_signal`, the `Interaction` mutators (`set_input`, `set_property`, `set_properties`, `add_attachments`, `patch`, `finish`), and `Client::flush` / `Client::close`. Propagate errors with `?` as you would for any fallible call. The two constructors — `Client::begin(...).await` and `Client::resume_interaction(...)` — are **infallible**: they always return an `Interaction` (a no-op handle when the client is disabled), so don't put a `?` on those.
 
 ## Quick start
 
@@ -291,7 +295,7 @@ either count or an empty `model` to omit the corresponding attribute.
 - **Nested Trace Spans:** The Rust SDK currently provides manual span instrumentation (`start_span`, `start_tool_span`). It does not yet automatically hook into Rust LLM frameworks (like `async-openai` or `langchain-rust`) to produce nested trace spans automatically. You must create spans manually.
 - **PII Redaction:** Automatic PII redaction (which is available in the Python SDK via `set_redact_pii` and the JS SDK via `redactPii`) is not yet implemented in the Rust SDK. If your application logs PII into events, redact at the call site or upstream of `track_ai` / `track_event`.
 - **Local debugger mirroring (`RAINDROP_LOCAL_DEBUGGER`):** The JS and Python SDKs mirror traces and partial events to a local Workshop instance via `RAINDROP_LOCAL_DEBUGGER`. The Rust SDK currently ships only to the configured `endpoint`; mirroring to a local debugger is on the roadmap.
-- **Oversized payload guard:** Payloads larger than 1 MiB after JSON serialization are dropped client-side (matching the JS / Python SDKs' `MAX_INGEST_SIZE_BYTES` / `max_ingest_size_bytes`) to avoid 413s on the gateway. The drop is logged when `debug=true` and is otherwise silent.
+- **Oversized payload guard:** Payloads larger than 1 MiB after JSON serialization are dropped client-side (matching the JS / Python SDKs' `MAX_INGEST_SIZE_BYTES` / `max_ingest_size_bytes`) to avoid 413s on the gateway. Each drop emits a `tracing::warn!` event so production callers can detect it without enabling `debug=true`.
 
 ## Configuration
 
