@@ -14,6 +14,7 @@ The official Rust SDK for [Raindrop AI](https://raindrop.ai) — track AI events
 [dependencies]
 raindrop-ai = { git = "https://github.com/raindrop-ai/raindrop-rust", tag = "v0.0.1" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+serde_json = "1"
 ```
 
 Track the latest tagged release at [github.com/raindrop-ai/raindrop-rust/releases](https://github.com/raindrop-ai/raindrop-rust/releases). For development against the bleeding edge, drop the `tag` field to follow `main`.
