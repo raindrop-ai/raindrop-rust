@@ -162,11 +162,11 @@ impl Span {
     }
 
     /// Record LLM token usage on this span using the canonical OpenTelemetry GenAI semantic
-    /// conventions. The backend's [`parseSpan`][parse-span] derives the per-event
-    /// `input_tokens`, `output_tokens`, and `model` columns from these attributes:
+    /// conventions. The Raindrop backend derives the per-event `input_tokens`,
+    /// `output_tokens`, and `model` columns from these attributes:
     ///
-    /// - `gen_ai.response.model` — required gate (the backend silently drops token usage when
-    ///   this is missing, see `getInputAndOutputTokens`)
+    /// - `gen_ai.response.model` — required gate (the backend silently drops token usage
+    ///   when this is missing)
     /// - `gen_ai.usage.input_tokens` (preferred) or `gen_ai.usage.prompt_tokens`
     /// - `gen_ai.usage.output_tokens` (preferred) or `gen_ai.usage.completion_tokens`
     ///
@@ -174,8 +174,6 @@ impl Span {
     /// (the SDK will not emit `gen_ai.response.model`, so the backend will treat tokens as 0
     /// for this span — useful when the caller wants to set tokens on a manual span without
     /// claiming a model).
-    ///
-    /// [parse-span]: https://github.com/invisible-tools/dawn/blob/main/apps/dawn/lib/traces/parseSpan.ts
     pub fn set_token_usage(&self, model: impl AsRef<str>, input_tokens: i64, output_tokens: i64) {
         let model = model.as_ref();
         let mut attrs: Vec<Attribute> = Vec::with_capacity(3);

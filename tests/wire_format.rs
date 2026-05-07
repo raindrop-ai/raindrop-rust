@@ -523,7 +523,7 @@ async fn identify_with_empty_user_id_makes_no_request() {
 
 /// hasAIOperation filter: a span with ONLY `event_id` set must still pass the backend's
 /// `hasAIOperation` filter. This is the bug we just fixed — without this, plain `start_span`
-/// gets silently dropped at ingestion. See `apps/dawn/lib/traces/parseSpan.ts::hasAIOperation`.
+/// gets silently dropped at ingestion.
 #[tokio::test]
 async fn plain_span_passes_has_ai_operation_filter_via_traceloop_event_id() {
     let server = MockServer::start().await;
@@ -1177,10 +1177,9 @@ async fn manual_span_emits_traceloop_event_id_exactly_once() {
 /// Caller-supplied `attachment_id` round-trips on the wire so the backend can dedupe and
 /// so a follow-up `Signal { attachment_id }` can reference the exact attachment.
 ///
-/// Real-prod sample (Tinybird `events_list` across 50+ orgs): 350+ attachments carry a
-/// caller-set `attachment_id`. The backend auto-generates a UUID v4 if missing
-/// (`apps/dawn/app/api/internal/ingest/track.ts:829,919`); the field is OPTIONAL on the
-/// canonical `BaseAttachmentSchema` (`@raindrop-ai/schemas/ingest`).
+/// Real-prod sample (across 50+ orgs): 350+ attachments carry a caller-set `attachment_id`.
+/// The backend auto-generates a UUID v4 if missing; the field is OPTIONAL on the canonical
+/// `BaseAttachmentSchema` (`@raindrop-ai/schemas/ingest`).
 #[tokio::test]
 async fn attachment_with_caller_supplied_attachment_id_round_trips_on_the_wire() {
     let server = MockServer::start().await;
@@ -1232,9 +1231,9 @@ async fn attachment_with_caller_supplied_attachment_id_round_trips_on_the_wire()
 }
 
 /// Token-usage helper emits the canonical OpenTelemetry GenAI numeric attributes that the
-/// backend's `parseSpan.getInputAndOutputTokens` reads to populate `event.toolCalls[]` token
-/// metadata and the per-event `aiData.usage`. See
-/// `dawn/apps/dawn/lib/traces/parseSpan.ts::getInputAndOutputTokens` for the gate condition.
+/// Raindrop backend reads to populate `event.toolCalls[]` token metadata and the per-event
+/// `aiData.usage`. The backend gates on the presence of `gen_ai.response.model` — without
+/// it, token usage is silently dropped.
 #[tokio::test]
 async fn span_set_token_usage_emits_gen_ai_attributes() {
     let server = MockServer::start().await;
