@@ -1,6 +1,6 @@
 [package]
 name = "raindrop-ai"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2021"
 rust-version = "1.88"
 description = "Raindrop AI observability SDK for Rust (Beta) — track AI events, signals, and OTLP-style traces."
@@ -19,12 +19,17 @@ name = "raindrop"
 path = "src/lib.rs"
 
 [features]
-default = ["rustls-tls"]
-rustls-tls = ["reqwest/rustls-tls"]
+# Feature names mirror reqwest 0.13's TLS backend selectors. In 0.13 reqwest's
+# `rustls` backend defaults to `rustls-platform-verifier` for roots and
+# `aws-lc-rs` (instead of `ring`) as the crypto provider — both transparent to
+# this SDK, but customers who depend on those backends benefit from being on
+# the same reqwest major as us so cargo can dedupe.
+default = ["rustls"]
+rustls = ["reqwest/rustls"]
 native-tls = ["reqwest/native-tls"]
 
 [dependencies]
-reqwest = { version = "0.12", default-features = false, features = ["json"] }
+reqwest = { version = "0.13", default-features = false, features = ["json"] }
 tokio = { version = "1.36", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

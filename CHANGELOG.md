@@ -27,6 +27,42 @@ add `CRATES_IO_TOKEN` to repo secrets, and `cargo publish` (or re-introduce
 release-plz at that point — it's overkill until then).
 -->
 
+## [0.0.2] - 2026-05-07
+
+Dependency upgrade: bump `reqwest` from `0.12` to `0.13`.
+
+### Changed
+
+- **`reqwest` 0.12 → 0.13.** Picks up the new TLS backend defaults: rustls'
+  crypto provider is now `aws-lc-rs` (was `ring`), and root certificates come
+  from `rustls-platform-verifier` (replacing the previous webpki/native roots
+  features). No SDK code changes were required — all reqwest API surface we
+  use (`Client::builder`, `post`, `header`, `body`, `send`, `status`,
+  `headers`, `text`, `HeaderMap`, `StatusCode`) is unchanged. See
+  [reqwest's 0.13 release notes](https://github.com/seanmonstar/reqwest/blob/master/CHANGELOG.md#v0130)
+  for the full list of upstream breaking changes.
+- **Renamed feature `rustls-tls` → `rustls`** to match reqwest 0.13's
+  upstream feature name (in 0.13 reqwest renamed `rustls-tls` → `rustls`).
+  Consumers selecting the rustls backend explicitly need to update:
+  ```toml
+  raindrop-ai = { ..., default-features = false, features = ["rustls"] }
+  ```
+  The default feature set still selects rustls, so consumers using
+  `default-features = true` (the common case) need no change. `native-tls`
+  is unchanged.
+
+### Migration
+
+If you depend on this crate with `default-features = false` and an explicit
+TLS feature:
+
+```diff
+- raindrop-ai = { git = "...", tag = "v0.0.1", default-features = false, features = ["rustls-tls"] }
++ raindrop-ai = { git = "...", tag = "v0.0.2", default-features = false, features = ["rustls"] }
+```
+
+No source-level changes are required.
+
 ## [0.0.1] - 2026-05-06
 
 Initial **beta** release. The wire contract against the Raindrop ingestion API is stable and verified end-to-end against the live backend on every push; the Rust crate API may still change in minor ways before `0.1.0`.
@@ -53,5 +89,6 @@ Initial **beta** release. The wire contract against the Raindrop ingestion API i
 - No client-side PII redaction (Python's `set_redact_pii` and JS's `redactPii` have no Rust equivalent yet).
 - No local-debugger mirroring (no `RAINDROP_LOCAL_DEBUGGER` support).
 
-[Unreleased]: https://github.com/raindrop-ai/raindrop-rust/compare/v0.0.1...HEAD
+[Unreleased]: https://github.com/raindrop-ai/raindrop-rust/compare/v0.0.2...HEAD
+[0.0.2]: https://github.com/raindrop-ai/raindrop-rust/compare/v0.0.1...v0.0.2
 [0.0.1]: https://github.com/raindrop-ai/raindrop-rust/releases/tag/v0.0.1

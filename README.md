@@ -344,7 +344,7 @@ cargo doc --no-deps
 
 CI runs the full matrix on every push: `cargo test`, `cargo clippy`, `cargo fmt`,
 `cargo doc` (with warnings as errors), MSRV (`1.88`), and feature combinations
-(`rustls-tls`, `native-tls`).
+(`rustls`, `native-tls`).
 
 ### End-to-end tests against a live backend
 
