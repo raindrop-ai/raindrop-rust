@@ -236,10 +236,22 @@ impl Span {
                 // The backend's `getCustomEventId` already prefers this key over the
                 // `ai.telemetry.metadata.raindrop.eventId` fallback, so this is the canonical
                 // representation and is safe to always emit.
-                attributes.push(OtlpKeyValue::from(Attribute::string(
-                    "traceloop.association.properties.event_id",
-                    &inner.event_id,
-                )));
+                //
+                // Dedupe: tool spans created via `Client::start_tool_span` already inject
+                // `event_id` into their `properties` map (so it propagates through
+                // `tool_property_attributes` as `traceloop.association.properties.event_id`).
+                // Without this guard, every tool span would emit the attribute twice — same
+                // value, but a violation of OTLP's "attribute keys MUST be unique" invariant.
+                let already_emitted = state
+                    .attrs
+                    .iter()
+                    .any(|a| a.key == "traceloop.association.properties.event_id");
+                if !already_emitted {
+                    attributes.push(OtlpKeyValue::from(Attribute::string(
+                        "traceloop.association.properties.event_id",
+                        &inner.event_id,
+                    )));
+                }
             }
             for attr in state.attrs.drain(..) {
                 attributes.push(OtlpKeyValue::from(attr));

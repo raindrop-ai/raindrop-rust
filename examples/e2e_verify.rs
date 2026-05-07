@@ -7,6 +7,18 @@ use tokio::time::sleep;
 
 use raindrop::{AiEvent, Client, Signal, ToolOptions, User};
 
+/// Read a numeric property from a dashboard event. Some pipelines return numeric
+/// properties as JSON numbers, others as stringified numbers (e.g. `"10"`); accept either.
+/// Mirrors `tests/e2e.rs::numeric_property` so the example doesn't `unwrap()`-panic when
+/// the dashboard happens to return strings instead of numbers.
+fn numeric_property(value: &Value) -> f64 {
+    match value {
+        Value::Number(n) => n.as_f64().unwrap_or(0.0),
+        Value::String(s) => s.parse::<f64>().unwrap_or(0.0),
+        _ => 0.0,
+    }
+}
+
 async fn query_dashboard(
     token: &str,
     limit: usize,
@@ -181,8 +193,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             assert_eq!(ai["convoId"].as_str().unwrap(), convo_id);
 
             let props = &ev["properties"];
-            assert_eq!(props["ai.usage.prompt_tokens"].as_u64().unwrap(), 10);
-            assert_eq!(props["ai.usage.completion_tokens"].as_u64().unwrap(), 20);
+            // The dashboard normalizes numeric properties to strings (e.g. `"10"`) on
+            // some pipelines, so accept both JSON numbers and stringified numbers.
+            // Same fix applied in tests/e2e.rs::numeric_property.
+            assert_eq!(numeric_property(&props["ai.usage.prompt_tokens"]), 10.0);
+            assert_eq!(numeric_property(&props["ai.usage.completion_tokens"]), 20.0);
         } else if input == "Run tool" {
             found_interaction = true;
             assert_eq!(ai["output"].as_str().unwrap(), "The weather is 72");

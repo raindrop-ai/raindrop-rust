@@ -1090,6 +1090,90 @@ async fn disabled_client_skips_every_endpoint() {
 // Additional pedantic coverage discovered while sampling real production data.
 // ────────────────────────────────────────────────────────────────────────────────────
 
+/// Tool spans MUST NOT emit `traceloop.association.properties.event_id` more than once.
+/// Two paths converge on the same span: `Client::start_tool_span` injects `event_id` into
+/// the properties map (which `tool_property_attributes` lifts into the attributes vec),
+/// and `Span::end_at` ALSO emits the attribute when `inner.event_id` is non-empty for the
+/// `hasAIOperation` filter. Without dedupe, every tool span would carry the attribute
+/// twice — same value, but a violation of OTLP's "attribute keys MUST be unique"
+/// invariant. Regression test for the duplicate-attribute bug Devin Review caught.
+#[tokio::test]
+async fn tool_span_emits_traceloop_event_id_exactly_once() {
+    let server = MockServer::start().await;
+    let trace_recorder = mount_path(&server, "POST", "/traces").await;
+    let _ = mount_path(&server, "POST", "/events/track_partial").await;
+    let client = fast_client_builder(&server).build().expect("build");
+
+    let interaction = client
+        .begin(BeginOptions {
+            event_id: "evt_dedupe".into(),
+            user_id: "u".into(),
+            ..Default::default()
+        })
+        .await;
+    let tool = interaction.start_tool_span("dedupe_tool", ToolOptions::default());
+    tool.end();
+    let _ = client.close().await;
+
+    let mut tool_spans = Vec::new();
+    for r in trace_recorder.requests() {
+        for s in spans_of(&r.json()) {
+            if s["name"] == "dedupe_tool" {
+                tool_spans.push(s);
+            }
+        }
+    }
+    assert_eq!(tool_spans.len(), 1);
+    let attrs = tool_spans[0]["attributes"].as_array().expect("attributes");
+    let count = attrs
+        .iter()
+        .filter(|a| a["key"].as_str() == Some("traceloop.association.properties.event_id"))
+        .count();
+    assert_eq!(
+        count, 1,
+        "traceloop.association.properties.event_id must appear EXACTLY once on tool spans, got {}: {:?}",
+        count, attrs
+    );
+    // Confirm the value is still our event_id (dedupe must not drop it entirely).
+    let kept = attrs
+        .iter()
+        .find(|a| a["key"].as_str() == Some("traceloop.association.properties.event_id"))
+        .unwrap();
+    assert_eq!(kept["value"]["stringValue"], "evt_dedupe");
+}
+
+/// Manual (non-tool) spans started via `Client::start_span` should also emit the attribute
+/// exactly once — this is the existing path covered by
+/// `plain_span_passes_has_ai_operation_filter_via_traceloop_event_id`, but we re-verify
+/// the count here to make sure dedupe didn't accidentally drop the canonical emission.
+#[tokio::test]
+async fn manual_span_emits_traceloop_event_id_exactly_once() {
+    let server = MockServer::start().await;
+    let trace_recorder = mount_path(&server, "POST", "/traces").await;
+    let client = fast_client_builder(&server).build().expect("build");
+
+    let span = client.start_span(SpanOptions {
+        name: "plain".into(),
+        event_id: "evt_plain".into(),
+        ..Default::default()
+    });
+    span.end();
+    client.flush().await.expect("flush");
+    client.close().await.expect("close");
+
+    let payload = trace_recorder.requests()[0].json();
+    let span_json = &spans_of(&payload)[0];
+    let attrs = span_json["attributes"].as_array().expect("attributes");
+    let count = attrs
+        .iter()
+        .filter(|a| a["key"].as_str() == Some("traceloop.association.properties.event_id"))
+        .count();
+    assert_eq!(
+        count, 1,
+        "manual span must emit traceloop.association.properties.event_id exactly once"
+    );
+}
+
 /// Caller-supplied `attachment_id` round-trips on the wire so the backend can dedupe and
 /// so a follow-up `Signal { attachment_id }` can reference the exact attachment.
 ///
