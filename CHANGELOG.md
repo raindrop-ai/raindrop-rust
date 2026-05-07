@@ -27,6 +27,27 @@ add `CRATES_IO_TOKEN` to repo secrets, and `cargo publish` (or re-introduce
 release-plz at that point — it's overkill until then).
 -->
 
+## [0.0.2] - 2026-05-07
+
+Dependency upgrade: bump `reqwest` from `0.12` to `0.13`. No consumer-facing
+API or feature-flag changes.
+
+### Changed
+
+- **`reqwest` 0.12 → 0.13.** Picks up the new TLS backend defaults: rustls'
+  crypto provider is now `aws-lc-rs` (was `ring`), and root certificates come
+  from `rustls-platform-verifier` (replacing the previous webpki/native roots
+  features). No SDK code changes were required — all reqwest API surface we
+  use (`Client::builder`, `post`, `header`, `body`, `send`, `status`,
+  `headers`, `text`, `HeaderMap`, `StatusCode`) is unchanged. See
+  [reqwest's 0.13 release notes](https://github.com/seanmonstar/reqwest/blob/master/CHANGELOG.md#v0130)
+  for the full list of upstream breaking changes.
+- **Public Cargo features are unchanged** (`rustls-tls`, `native-tls`).
+  Reqwest renamed its internal `rustls-tls` feature to `rustls` in 0.13, but
+  this crate's feature names are part of its public API surface and are kept
+  stable across reqwest upgrades — only the RHS of the feature mapping
+  follows the rename. Consumers' `Cargo.toml` files do not need to change.
+
 ## [0.0.1] - 2026-05-06
 
 Initial **beta** release. The wire contract against the Raindrop ingestion API is stable and verified end-to-end against the live backend on every push; the Rust crate API may still change in minor ways before `0.1.0`.
@@ -53,5 +74,6 @@ Initial **beta** release. The wire contract against the Raindrop ingestion API i
 - No client-side PII redaction (Python's `set_redact_pii` and JS's `redactPii` have no Rust equivalent yet).
 - No local-debugger mirroring (no `RAINDROP_LOCAL_DEBUGGER` support).
 
-[Unreleased]: https://github.com/raindrop-ai/raindrop-rust/compare/v0.0.1...HEAD
+[Unreleased]: https://github.com/raindrop-ai/raindrop-rust/compare/v0.0.2...HEAD
+[0.0.2]: https://github.com/raindrop-ai/raindrop-rust/compare/v0.0.1...v0.0.2
 [0.0.1]: https://github.com/raindrop-ai/raindrop-rust/releases/tag/v0.0.1
