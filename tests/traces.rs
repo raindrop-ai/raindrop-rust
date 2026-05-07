@@ -440,6 +440,115 @@ async fn manual_span_set_attributes_after_end_is_safe() {
 }
 
 #[tokio::test]
+async fn span_with_operation_id_emits_ai_operation_id_attribute() {
+    // SKILL.md rule #25: spans missing `ai.operationId` are silently dropped by the backend
+    // ingestion filter. Verify that setting `operation_id` adds the `ai.operationId` attribute.
+    let server = MockServer::start().await;
+    let trace_recorder = mount_path(&server, "POST", "/traces").await;
+
+    let client = fast_client_builder(&server).build().expect("build");
+
+    let span = client.start_span(SpanOptions {
+        name: "agent.run".into(),
+        event_id: "evt_op".into(),
+        operation_id: "ai.workflow".into(),
+        ..Default::default()
+    });
+    span.end();
+
+    client.flush().await.expect("flush");
+    client.close().await.expect("close");
+
+    let payload = trace_recorder.requests()[0].json();
+    let spans = spans_of(&payload);
+    let op_attr = span_attr(&spans[0], "ai.operationId").expect("ai.operationId attribute");
+    assert_eq!(op_attr["stringValue"], "ai.workflow");
+}
+
+#[tokio::test]
+async fn span_without_operation_id_omits_attribute() {
+    // Backward compatibility: when `operation_id` is empty (default), the attribute is not added.
+    let server = MockServer::start().await;
+    let trace_recorder = mount_path(&server, "POST", "/traces").await;
+
+    let client = fast_client_builder(&server).build().expect("build");
+
+    let span = client.start_span(SpanOptions {
+        name: "no_op_id".into(),
+        event_id: "evt".into(),
+        ..Default::default()
+    });
+    span.end();
+
+    client.flush().await.expect("flush");
+    client.close().await.expect("close");
+
+    let payload = trace_recorder.requests()[0].json();
+    let spans = spans_of(&payload);
+    assert!(
+        span_attr(&spans[0], "ai.operationId").is_none(),
+        "ai.operationId should not be present when operation_id is unset",
+    );
+}
+
+#[tokio::test]
+async fn tool_span_emits_ai_tool_call_operation_id() {
+    // start_tool_span and track_tool MUST always set `ai.operationId=ai.toolCall` so tool spans
+    // pass the backend ingestion filter (SKILL.md rule #25).
+    let server = MockServer::start().await;
+    let trace_recorder = mount_path(&server, "POST", "/traces").await;
+    let _ = mount_path(&server, "POST", "/events/track_partial").await;
+
+    let client = fast_client_builder(&server).build().expect("build");
+    let interaction = client
+        .begin(BeginOptions {
+            event_id: "evt_tool_op".into(),
+            user_id: "user-123".into(),
+            ..Default::default()
+        })
+        .await;
+
+    let tool = interaction.start_tool_span(
+        "live_lookup",
+        ToolOptions {
+            input: Some(json!({"q": "weather"})),
+            ..Default::default()
+        },
+    );
+    tool.end();
+
+    interaction.track_tool(TrackToolOptions {
+        name: "retro_lookup".into(),
+        input: Some(json!({"q": "news"})),
+        duration: Some(Duration::from_millis(50)),
+        ..Default::default()
+    });
+
+    client.flush().await.expect("flush");
+    client.close().await.expect("close");
+
+    let mut all_spans = Vec::new();
+    for req in trace_recorder.requests() {
+        all_spans.extend(spans_of(&req.json()));
+    }
+    assert!(all_spans.len() >= 2, "expected at least two tool spans");
+
+    for span in &all_spans {
+        let name = span["name"].as_str().unwrap_or("");
+        if name == "live_lookup" || name == "retro_lookup" {
+            let op_attr = span_attr(span, "ai.operationId").unwrap_or_else(|| {
+                panic!("missing ai.operationId on tool span {}: {:#?}", name, span)
+            });
+            assert_eq!(
+                op_attr["stringValue"], "ai.toolCall",
+                "tool span {} must have ai.operationId=ai.toolCall",
+                name
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn empty_event_id_is_filled_when_starting_via_interaction() {
     let server = MockServer::start().await;
     let trace_recorder = mount_path(&server, "POST", "/traces").await;
@@ -472,4 +581,66 @@ async fn empty_event_id_is_filled_when_starting_via_interaction() {
         .unwrap();
     let evt_id_attr = span_attr(s, "ai.telemetry.metadata.raindrop.eventId").unwrap();
     assert_eq!(evt_id_attr["stringValue"], "evt_link");
+}
+
+/// `Span::set_token_usage` after `end()` is a no-op (it goes through `set_attributes`,
+/// which is documented to be safe-after-end and silently drop).
+#[tokio::test]
+async fn set_token_usage_after_end_is_dropped() {
+    let server = MockServer::start().await;
+    let trace_recorder = mount_path(&server, "POST", "/traces").await;
+    let client = fast_client_builder(&server).build().expect("build");
+
+    let span = client.start_span(SpanOptions {
+        name: "ended".into(),
+        event_id: "evt".into(),
+        operation_id: "ai.generateText".into(),
+        ..Default::default()
+    });
+    span.end();
+    span.set_token_usage("gpt-4o", 100, 50);
+    client.flush().await.expect("flush");
+    client.close().await.expect("close");
+
+    let payload = trace_recorder.requests()[0].json();
+    let s = &spans_of(&payload)[0];
+    assert!(
+        span_attr(s, "gen_ai.response.model").is_none(),
+        "set_token_usage after end MUST be a no-op"
+    );
+    assert!(span_attr(s, "gen_ai.usage.input_tokens").is_none());
+}
+
+/// `ToolSpan::set_token_usage` forwards to the underlying span. Useful when an LLM-driven
+/// tool reports its own token usage (rare but real).
+#[tokio::test]
+async fn tool_span_set_token_usage_forwards_to_underlying_span() {
+    let server = MockServer::start().await;
+    let trace_recorder = mount_path(&server, "POST", "/traces").await;
+    let _ = mount_path(&server, "POST", "/events/track_partial").await;
+    let client = fast_client_builder(&server).build().expect("build");
+
+    let interaction = client
+        .begin(BeginOptions {
+            event_id: "evt_tool_tokens".into(),
+            user_id: "u".into(),
+            ..Default::default()
+        })
+        .await;
+    let tool = interaction.start_tool_span("rerank", ToolOptions::default());
+    tool.set_token_usage("voyage-rerank-2", 1024, 0);
+    tool.end();
+    let _ = client.close().await;
+
+    let mut all = Vec::new();
+    for r in trace_recorder.requests() {
+        all.extend(spans_of(&r.json()));
+    }
+    let s = all.iter().find(|s| s["name"] == "rerank").unwrap();
+    let model = span_attr(s, "gen_ai.response.model").unwrap();
+    assert_eq!(model["stringValue"], "voyage-rerank-2");
+    let input_tokens = span_attr(s, "gen_ai.usage.input_tokens").unwrap();
+    assert_eq!(input_tokens["intValue"], "1024");
+    // 0 output tokens → omitted
+    assert!(span_attr(s, "gen_ai.usage.output_tokens").is_none());
 }

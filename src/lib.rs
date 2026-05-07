@@ -51,7 +51,7 @@ pub use events::{
     AiEvent, Attachment, BeginOptions, Event, FinishOptions, Interaction, PatchOptions,
 };
 pub use otlp::{Attribute, AttributeValue, SpanStatusCode};
-pub use signals::Signal;
+pub use signals::{Signal, SignalKind};
 pub use traces::{
     with_tool, with_tool_async, Span, SpanOptions, ToolOptions, ToolSpan, Tracer, TrackToolOptions,
 };

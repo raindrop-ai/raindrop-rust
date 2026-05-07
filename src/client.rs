@@ -329,9 +329,9 @@ impl Client {
         };
 
         let patch = EventPatch {
-            event_name: opts.event,
-            user_id: opts.user_id,
-            convo_id: opts.convo_id,
+            event_name: opts.event.clone(),
+            user_id: opts.user_id.clone(),
+            convo_id: opts.convo_id.clone(),
             input: opts.input,
             output: String::new(),
             model: opts.model,
@@ -346,7 +346,13 @@ impl Client {
             .clone()
             .patch(&self.inner, &event_id, patch)
             .await;
-        Interaction::new(self.clone(), event_id)
+        Interaction::new_with_context(
+            self.clone(),
+            event_id,
+            opts.user_id,
+            opts.convo_id,
+            opts.event,
+        )
     }
 
     /// Resume a previously-started interaction by event id. The returned `Interaction` shares the
@@ -417,6 +423,9 @@ impl Client {
         let parent_ids = opts.parent.as_ref().and_then(|p| p.ids());
         let ids = create_span_ids(parent_ids.as_ref());
         let mut attrs = opts.attributes;
+        if !opts.operation_id.is_empty() {
+            attrs.push(Attribute::string("ai.operationId", &opts.operation_id));
+        }
         attrs.extend(tool_property_attributes(&opts.properties));
         Span::new(
             self.clone(),
@@ -450,6 +459,7 @@ impl Client {
         let span_opts = SpanOptions {
             name,
             event_id: event_id.to_string(),
+            operation_id: "ai.toolCall".to_string(),
             parent: opts.parent,
             properties: BTreeMap::new(),
             attributes: attrs,
@@ -481,8 +491,11 @@ impl Client {
         );
         let parent_ids = opts.parent.as_ref().and_then(|p| p.ids());
         let ids = create_span_ids(parent_ids.as_ref());
-        let mut otlp_attrs: Vec<OtlpKeyValue> =
-            Vec::with_capacity(attrs.len() + (event_id.is_empty() as usize ^ 1));
+        let mut otlp_attrs: Vec<OtlpKeyValue> = Vec::with_capacity(attrs.len() + 2);
+        otlp_attrs.push(OtlpKeyValue::from(Attribute::string(
+            "ai.operationId",
+            "ai.toolCall",
+        )));
         if !event_id.is_empty() {
             otlp_attrs.push(OtlpKeyValue::from(Attribute::string(
                 "ai.telemetry.metadata.raindrop.eventId",
@@ -652,6 +665,7 @@ fn derive_times(opts: &mut TrackToolOptions) -> (OffsetDateTime, OffsetDateTime)
         (None, None, Some(d)) => (now - d, now),
         (None, None, None) => (now, now),
     };
+    let end = end.max(start);
     if opts.duration.is_none() {
         opts.duration = Some((end - start).try_into().unwrap_or(Duration::ZERO));
     }

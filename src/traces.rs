@@ -16,6 +16,8 @@ pub struct SpanOptions {
     pub name: String,
     /// Optional event id this span belongs to.
     pub event_id: String,
+    /// Optional operation id (e.g. "ai.toolCall", "ai.workflow"). Required for the span to survive backend ingestion filters if no other `ai.*` or `traceloop.*` attributes are present.
+    pub operation_id: String,
     /// Optional parent span. If `None`, a new trace is created.
     pub parent: Option<Span>,
     /// Association properties (will be flattened to `traceloop.association.properties.<key>`).
@@ -26,7 +28,7 @@ pub struct SpanOptions {
     pub start_time: Option<OffsetDateTime>,
 }
 
-/// Options for [`Interaction::start_tool_span`].
+/// Options for [`crate::events::Interaction::start_tool_span`].
 #[derive(Debug, Default, Clone)]
 pub struct ToolOptions {
     /// Optional parent span.
@@ -39,7 +41,7 @@ pub struct ToolOptions {
     pub start_time: Option<OffsetDateTime>,
 }
 
-/// Options for retroactive tool tracking via [`Interaction::track_tool`] /
+/// Options for retroactive tool tracking via [`crate::events::Interaction::track_tool`] /
 /// [`Tracer::track_tool`].
 #[derive(Debug, Default, Clone)]
 pub struct TrackToolOptions {
@@ -159,6 +161,38 @@ impl Span {
         }
     }
 
+    /// Record LLM token usage on this span using the canonical OpenTelemetry GenAI semantic
+    /// conventions. The backend's [`parseSpan`][parse-span] derives the per-event
+    /// `input_tokens`, `output_tokens`, and `model` columns from these attributes:
+    ///
+    /// - `gen_ai.response.model` — required gate (the backend silently drops token usage when
+    ///   this is missing, see `getInputAndOutputTokens`)
+    /// - `gen_ai.usage.input_tokens` (preferred) or `gen_ai.usage.prompt_tokens`
+    /// - `gen_ai.usage.output_tokens` (preferred) or `gen_ai.usage.completion_tokens`
+    ///
+    /// Pass `0` for either token count to omit it. Pass an empty `model` to skip the gate
+    /// (the SDK will not emit `gen_ai.response.model`, so the backend will treat tokens as 0
+    /// for this span — useful when the caller wants to set tokens on a manual span without
+    /// claiming a model).
+    ///
+    /// [parse-span]: https://github.com/invisible-tools/dawn/blob/main/apps/dawn/lib/traces/parseSpan.ts
+    pub fn set_token_usage(&self, model: impl AsRef<str>, input_tokens: i64, output_tokens: i64) {
+        let model = model.as_ref();
+        let mut attrs: Vec<Attribute> = Vec::with_capacity(3);
+        if !model.is_empty() {
+            attrs.push(Attribute::string("gen_ai.response.model", model));
+        }
+        if input_tokens > 0 {
+            attrs.push(Attribute::int("gen_ai.usage.input_tokens", input_tokens));
+        }
+        if output_tokens > 0 {
+            attrs.push(Attribute::int("gen_ai.usage.output_tokens", output_tokens));
+        }
+        if !attrs.is_empty() {
+            self.set_attributes(attrs);
+        }
+    }
+
     /// End the span at the current time.
     pub fn end(&self) {
         self.end_at(None)
@@ -174,7 +208,11 @@ impl Span {
             return;
         }
 
-        let end = end_time.unwrap_or_else(OffsetDateTime::now_utc);
+        let requested_end = end_time.unwrap_or_else(OffsetDateTime::now_utc);
+        // Defensive clamp: some external producers have emitted spans with end < start, which
+        // creates negative durations downstream. Tinybird stores duration_ns as UInt64, so keep
+        // Rust SDK spans internally consistent even when a caller supplies an anomalous end time.
+        let end = requested_end.max(inner.start);
 
         let (attrs, status) = {
             let mut state = inner.state.lock().expect("span lock poisoned");
@@ -182,12 +220,38 @@ impl Span {
                 return;
             }
             state.ended = true;
-            let mut attributes: Vec<OtlpKeyValue> = Vec::with_capacity(state.attrs.len() + 1);
+            // Pre-allocate for both the eventId attribute we always add and the
+            // `traceloop.association.properties.event_id` attribute we add when event_id is set.
+            // The latter is critical: the backend's `hasAIOperation` filter silently DROPS spans
+            // that don't have one of {ai.operationId, traceloop.span.kind, traceloop.workflow.name,
+            // traceloop.association.properties.{user_id,convo_id,event_id}, gen_ai.*}. A plain
+            // `start_span` with only `ai.telemetry.metadata.raindrop.eventId` would be discarded.
+            let mut attributes: Vec<OtlpKeyValue> = Vec::with_capacity(state.attrs.len() + 2);
             if !inner.event_id.is_empty() {
                 attributes.push(OtlpKeyValue::from(Attribute::string(
                     "ai.telemetry.metadata.raindrop.eventId",
                     &inner.event_id,
                 )));
+                // Also emit the traceloop association property so the span passes ingestion.
+                // The backend's `getCustomEventId` already prefers this key over the
+                // `ai.telemetry.metadata.raindrop.eventId` fallback, so this is the canonical
+                // representation and is safe to always emit.
+                //
+                // Dedupe: tool spans created via `Client::start_tool_span` already inject
+                // `event_id` into their `properties` map (so it propagates through
+                // `tool_property_attributes` as `traceloop.association.properties.event_id`).
+                // Without this guard, every tool span would emit the attribute twice — same
+                // value, but a violation of OTLP's "attribute keys MUST be unique" invariant.
+                let already_emitted = state
+                    .attrs
+                    .iter()
+                    .any(|a| a.key == "traceloop.association.properties.event_id");
+                if !already_emitted {
+                    attributes.push(OtlpKeyValue::from(Attribute::string(
+                        "traceloop.association.properties.event_id",
+                        &inner.event_id,
+                    )));
+                }
             }
             for attr in state.attrs.drain(..) {
                 attributes.push(OtlpKeyValue::from(attr));
@@ -264,6 +328,12 @@ impl ToolSpan {
     /// Mark the tool span as failed.
     pub fn set_error(&self, message: impl Into<String>) {
         self.span.set_error(message)
+    }
+
+    /// See [`Span::set_token_usage`]. Forwarded to the underlying span.
+    pub fn set_token_usage(&self, model: impl AsRef<str>, input_tokens: i64, output_tokens: i64) {
+        self.span
+            .set_token_usage(model, input_tokens, output_tokens)
     }
 
     /// End the tool span. Computes a `traceloop.entity.duration_ms` attribute when the start time
@@ -369,12 +439,10 @@ pub(crate) fn build_tool_attributes(
         ));
     }
     if let Some(d) = duration {
-        if d > std::time::Duration::ZERO {
-            attrs.push(Attribute::int(
-                "traceloop.entity.duration_ms",
-                d.as_millis() as i64,
-            ));
-        }
+        attrs.push(Attribute::int(
+            "traceloop.entity.duration_ms",
+            d.as_millis() as i64,
+        ));
     }
     attrs.extend(tool_property_attributes(properties));
     attrs

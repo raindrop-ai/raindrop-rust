@@ -1,15 +1,15 @@
 # Raindrop Rust SDK
 
-Production-ready Rust SDK for [Raindrop AI](https://raindrop.ai/). Mirrors the public API of the
-official [Go](https://github.com/raindrop-ai/go), [Python](https://github.com/raindrop-ai/python),
-and [JavaScript](https://github.com/raindrop-ai/js) SDKs and ships byte-compatible payloads.
+The official Rust SDK for [Raindrop AI](https://raindrop.ai) — track AI events, collect user signals, and instrument LLM applications with OpenTelemetry-based tracing.
 
-> **Internal:** this crate is not published to crates.io.
-> Vendor it via a git dependency in your `Cargo.toml`.
+
+## Installation
+
+> The crate is not yet published to crates.io. Install via git for now:
 
 ```toml
 [dependencies]
-raindrop-ai = { git = "ssh://git@github.com/invisible-tools/raindrop-rust" }
+raindrop-ai = { git = "https://github.com/invisible-tools/raindrop-rust" }
 ```
 
 ## Quick start
@@ -81,6 +81,9 @@ child.set_attributes([
     Attribute::string("ai.model.id", "gpt-4o"),
     Attribute::int("ai.usage.prompt_tokens", 10),
 ]);
+// Or, for the canonical OpenTelemetry GenAI shape that the Raindrop backend's
+// `parseSpan.getInputAndOutputTokens` reads to populate per-event token totals:
+child.set_token_usage("gpt-4o", /* input */ 47, /* output */ 11);
 child.end();
 
 // You can also end a span with an explicit time, e.g. when wrapping a call you've already made.
@@ -197,38 +200,114 @@ span.end();
 ## Signals and identify
 
 ```rust
-use raindrop::{Signal, User};
+use std::collections::BTreeMap;
+use serde_json::json;
+use raindrop::{Signal, SignalKind, User};
 
 client.track_signal(Signal {
-    name: "thumbs_up".into(),
     event_id: "evt_123".into(),
-    score: Some(1.0),
+    name: "thumbs_up".into(),
+    kind: SignalKind::FEEDBACK.into(),  // also: DEFAULT, STANDARD, EDIT, AGENT, AGENT_INTERNAL
+    sentiment: "POSITIVE".into(),
+    comment: "Great answer".into(),
     ..Default::default()
 }).await?;
 
 client.identify(User {
     user_id: "user-123".into(),
-    properties: BTreeMap::from([("plan".into(), json!("pro"))]),
-    ..Default::default()
+    traits: BTreeMap::from([("plan".into(), json!("pro"))]),
 }).await?;
 ```
 
+The wire field is `signal_type` and the canonical accepted values are `default`,
+`standard`, `feedback`, `edit`, `agent`, and `agent_internal` — see
+[`SignalKind`](https://docs.rs/raindrop-ai) for typed constants.
+
+## Span association properties (auto-propagated from interaction)
+
+Every span started via `interaction.start_span(...)` or `interaction.start_tool_span(...)`
+automatically inherits the interaction's `user_id`, `convo_id`, and `event` as
+`traceloop.association.properties.{user_id, convo_id, event}` attributes, so the dashboard
+groups the span under the same user, conversation, and event as the parent. User-supplied
+properties always take precedence:
+
+```rust
+let interaction = client.begin(BeginOptions {
+    user_id: "user-123".into(),
+    convo_id: "conv-456".into(),
+    event: "agent_run".into(),
+    ..Default::default()
+}).await;
+
+// This span carries `traceloop.association.properties.{user_id, convo_id, event}` automatically.
+let span = interaction.start_span(SpanOptions { name: "step".into(), ..Default::default() });
+span.end();
+```
+
+For standalone spans created via `client.start_span(...)`, set `operation_id` (e.g.
+`"ai.workflow"`) or pass `properties` so the span has at least one of the attributes
+accepted by the backend's ingestion filter (`ai.operationId`, `traceloop.span.kind`,
+`traceloop.workflow.name`, `traceloop.association.properties.*`, or `gen_ai.*`). Spans
+that don't pass that filter are silently dropped. Plain `client.start_span(...)` calls with
+just `name` + `event_id` automatically emit `traceloop.association.properties.event_id` so
+they pass.
+
+## Attachments
+
+Attachments are split by `role` into the dashboard's `inputAttachments[]` and
+`outputAttachments[]`. The wire schema accepts four `kind` values: `"text"`, `"code"`,
+`"image"`, `"iframe"`. (The dashboard's display schema only renders `text | image | iframe`
+— `code` survives ingestion but is filtered from the visual attachments tab.)
+
+```rust
+use raindrop::Attachment;
+
+let attachment = Attachment {
+    kind: "image".into(),
+    role: "input".into(),
+    name: "screenshot.png".into(),
+    value: "https://cdn.example/img.png".into(),
+    // Optional: pre-assign an attachment_id so a follow-up `Signal { attachment_id }`
+    // can reference it. If empty, the backend auto-assigns a UUID.
+    attachment_id: "att-abc-123".into(),
+    ..Default::default()
+};
+```
+
+## Token usage
+
+`Span::set_token_usage(model, input_tokens, output_tokens)` emits the canonical
+OpenTelemetry GenAI semantic-convention attributes (`gen_ai.response.model`,
+`gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`) so the Raindrop backend's
+[`parseSpan.getInputAndOutputTokens`](https://github.com/invisible-tools/dawn/blob/main/apps/dawn/lib/traces/parseSpan.ts)
+correctly populates per-span and per-event token totals on the dashboard. Pass `0` for
+either count or an empty `model` to omit the corresponding attribute.
+
+## Known Limitations
+
+- **Nested Trace Spans:** The Rust SDK currently provides manual span instrumentation (`start_span`, `start_tool_span`). It does not yet automatically hook into Rust LLM frameworks (like `async-openai` or `langchain-rust`) to produce nested trace spans automatically. You must create spans manually.
+- **PII Redaction:** Automatic PII redaction (which is available in the Python SDK via `set_redact_pii` and the JS SDK via `redactPii`) is not yet implemented in the Rust SDK. If your application logs PII into events, redact at the call site or upstream of `track_ai` / `track_event`.
+- **Local debugger mirroring (`RAINDROP_LOCAL_DEBUGGER`):** The JS and Python SDKs mirror traces and partial events to a local Workshop instance via `RAINDROP_LOCAL_DEBUGGER`. The Rust SDK currently ships only to the configured `endpoint`; mirroring to a local debugger is on the roadmap.
+- **Oversized payload guard:** Payloads larger than 1 MiB after JSON serialization are dropped client-side (matching the JS / Python SDKs' `MAX_INGEST_SIZE_BYTES` / `max_ingest_size_bytes`) to avoid 413s on the gateway. The drop is logged when `debug=true` and is otherwise silent.
+
 ## Configuration
 
-| Builder method            | Default                                | Description                                              |
-| ------------------------- | -------------------------------------- | -------------------------------------------------------- |
-| `write_key`               | `""`                                   | Empty/missing key → SDK is disabled (no-op)              |
-| `endpoint`                | `https://api.raindrop.ai/v1/`          | Base URL                                                 |
-| `partial_flush_interval`  | `1s`                                   | Periodic event flush. `0` disables periodic flush        |
-| `trace_flush_interval`    | `1s`                                   | Periodic span flush. `0` disables periodic flush         |
-| `trace_max_batch_size`    | `50`                                   | Max spans per export request                             |
-| `trace_max_queue_size`    | `5000`                                 | Backpressure threshold for spans                         |
-| `max_attempts`            | `3`                                    | HTTP retries (1 = no retries)                            |
-| `base_delay`              | `1s`                                   | Backoff base (exponential, ±20% jitter)                  |
-| `jitter_fraction`         | `0.2`                                  | Backoff jitter fraction                                  |
-| `service_name`            | `raindrop.rust-sdk`                    | OTLP `resource.service.name`                             |
-| `library_version`         | crate version                          | `$context.library.version`                               |
-| `http_client`             | new `reqwest::Client`                  | Bring your own connection-pooled HTTP client             |
+| Builder method           | Default                       | Description                                       |
+| ------------------------ | ----------------------------- | ------------------------------------------------- |
+| `write_key`              | `""`                          | Empty/missing key → SDK is disabled (no-op)       |
+| `endpoint`               | `https://api.raindrop.ai/v1/` | Base URL                                          |
+| `debug`                  | `false`                       | Verbose debug logging via `tracing`               |
+| `partial_flush_interval` | `1s`                          | Periodic event flush. `0` disables periodic flush |
+| `trace_flush_interval`   | `1s`                          | Periodic span flush. `0` disables periodic flush  |
+| `trace_max_batch_size`   | `50`                          | Max spans per export request                      |
+| `trace_max_queue_size`   | `5000`                        | Backpressure threshold for spans                  |
+| `max_attempts`           | `3`                           | HTTP retries (1 = no retries)                     |
+| `base_delay`             | `1s`                          | Backoff base (exponential, ±20% jitter)           |
+| `jitter_fraction`        | `0.2`                         | Backoff jitter fraction (0.0–1.0)                 |
+| `service_name`           | `raindrop.rust-sdk`           | OTLP `resource.service.name`                      |
+| `library_name`           | `raindrop-rust`               | `$context.library.name`                           |
+| `library_version`        | crate version                 | `$context.library.version`                        |
+| `http_client`            | new `reqwest::Client`         | Bring your own connection-pooled HTTP client      |
 
 ## Architecture
 
@@ -245,14 +324,37 @@ client.identify(User {
 
 ## Testing
 
+The unit and integration test suite is built around `wiremock` and validates
+the wire payload shape end-to-end. Run it locally with:
+
 ```bash
 cargo test
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
+cargo doc --no-deps
 ```
 
-The test suite is built around `wiremock` and validates payload shape against the other SDKs.
+CI runs the full matrix on every push: `cargo test`, `cargo clippy`, `cargo fmt`,
+`cargo doc` (with warnings as errors), MSRV (`1.88`), and feature combinations
+(`rustls-tls`, `native-tls`).
+
+### End-to-end tests against a live backend
+
+`tests/e2e.rs` exercises `track_ai`, interactions, tool spans, signals, and
+identify against a real Raindrop ingestion endpoint and verifies the data lands
+on the dashboard. They are skipped automatically when the required environment
+variables are not set, so they are safe to leave enabled in `cargo test`. To
+opt in:
+
+```bash
+RAINDROP_WRITE_KEY=rk_... \
+RAINDROP_DASHBOARD_TOKEN=eyJ... \
+cargo test --test e2e
+```
+
+Optional overrides: `RAINDROP_ENDPOINT` (ingestion API base URL),
+`RAINDROP_BACKEND_URL` (dashboard TRPC base URL).
 
 ## License
 
-Proprietary — internal use only.
+MIT
