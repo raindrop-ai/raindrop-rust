@@ -224,8 +224,8 @@ client.identify(User {
 ```
 
 The wire field is `signal_type` and the canonical accepted values are `default`,
-`standard`, `feedback`, `edit`, `agent`, and `agent_internal` — see
-[`SignalKind`](https://docs.rs/raindrop-ai) for typed constants.
+`standard`, `feedback`, `edit`, `agent`, and `agent_internal` — typed constants
+are exposed via the `SignalKind` re-export at the crate root.
 
 ## Span association properties (auto-propagated from interaction)
 
@@ -282,8 +282,7 @@ let attachment = Attachment {
 
 `Span::set_token_usage(model, input_tokens, output_tokens)` emits the canonical
 OpenTelemetry GenAI semantic-convention attributes (`gen_ai.response.model`,
-`gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`) so the Raindrop backend's
-[`parseSpan.getInputAndOutputTokens`](https://github.com/invisible-tools/dawn/blob/main/apps/dawn/lib/traces/parseSpan.ts)
+`gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`) so the Raindrop backend
 correctly populates per-span and per-event token totals on the dashboard. Pass `0` for
 either count or an empty `model` to omit the corresponding attribute.
 
