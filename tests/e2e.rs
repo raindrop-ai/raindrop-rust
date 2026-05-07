@@ -1356,76 +1356,14 @@ async fn e2e_set_token_usage_helper_attributes_land_with_event() {
     assert_eq!(ev["aiData"]["model"].as_str().unwrap_or(""), "gpt-4o-mini");
 }
 
-/// **Signal sentiment lands on dashboard.** A POSITIVE/NEGATIVE sentiment on a feedback
-/// signal MUST round-trip into `event.signals[]` so the dashboard can render the thumb
-/// emoji color. The wire format goes through `SignalEventSchema.sentiment ∈ {POSITIVE,
-/// NEGATIVE}`.
-#[tokio::test]
-async fn e2e_signal_sentiment_round_trips_to_dashboard() {
-    let (write_key, dashboard_token) = match env_keys() {
-        Some(v) => v,
-        None => {
-            eprintln!("[e2e] skipping: set RAINDROP_WRITE_KEY and RAINDROP_DASHBOARD_TOKEN to run");
-            return;
-        }
-    };
-    let user_id = unique_user_id("sentiment");
-    let event_id = format!("{}_evt", user_id);
-    let client = build_client(&write_key);
-
-    client
-        .track_ai(AiEvent {
-            event_id: event_id.clone(),
-            user_id: user_id.clone(),
-            input: "rate the answer".into(),
-            output: "I am rated".into(),
-            ..Default::default()
-        })
-        .await
-        .expect("track_ai");
-    client
-        .track_signal(Signal {
-            event_id: event_id.clone(),
-            name: "thumbs_down".into(),
-            kind: SignalKind::FEEDBACK.into(),
-            sentiment: "NEGATIVE".into(),
-            comment: "wrong".into(),
-            ..Default::default()
-        })
-        .await
-        .expect("track_signal");
-    client.close().await.expect("close");
-
-    // Wait for both the event and the signal to land. Signals are ingested separately
-    // and stitched into events via a downstream pipeline, so we re-poll.
-    let ev = poll_event_until(
-        &dashboard_token,
-        &user_id,
-        |e| {
-            e["aiData"]["input"].as_str() == Some("rate the answer")
-                && e["signals"].as_array().is_some_and(|arr| !arr.is_empty())
-        },
-        E2E_DERIVED_POLL_TIMEOUT,
-    )
-    .await
-    .expect("event with signal");
-
-    let signals = ev["signals"].as_array().unwrap();
-    let thumbs = signals
-        .iter()
-        .find(|s| s["name"].as_str() == Some("thumbs_down"))
-        .unwrap_or_else(|| panic!("thumbs_down signal missing among {:?}", signals));
-    assert_eq!(thumbs["signalType"].as_str().unwrap_or(""), "feedback");
-    // sentiment lives inside properties (the dashboard's SignalSchema parses
-    // `properties` as JSON; the underlying signal payload merges sentiment into
-    // properties on its way through Tinybird's `mv_signals_into_wide`).
-    let props = &thumbs["properties"];
-    let comment = props["comment"].as_str().unwrap_or("");
-    assert_eq!(
-        comment, "wrong",
-        "signal feedback comment must round-trip to dashboard"
-    );
-}
+// NOTE: There is intentionally no `e2e_signal_sentiment_round_trips_to_dashboard` test.
+// The dashboard's `SignalSchema` (`packages/schemas/src/frontend/index.ts`) exposes
+// only `{name, timestamp, attachmentId?, properties, signalType?}` — sentiment is NOT
+// a frontend-visible field, so it cannot be e2e-asserted from the dashboard. The wire
+// contract is covered by `tests/wire_format.rs::track_signal_payload_uses_canonical_shape`
+// (asserts `sentiment: "POSITIVE"` and `"NEGATIVE"` round-trip correctly on the
+// `/signals/track` payload), and the signal-embedded-in-event flow is covered by
+// `e2e_track_signal_appears_in_event_signals_array` below.
 
 /// **Convo grouping via `conversations.list`.** Three events sharing a `convo_id` must
 /// surface as one convo row in the dashboard's `conversations.list` TRPC endpoint, with
