@@ -1,14 +1,14 @@
 [package]
 name = "raindrop-ai"
-version = "0.1.0"
+version = "0.0.1"
 edition = "2021"
 rust-version = "1.88"
-description = "Raindrop AI observability SDK for Rust — track AI events, signals, and OTLP-style traces."
+description = "Raindrop AI observability SDK for Rust (Beta) — track AI events, signals, and OTLP-style traces."
 authors = ["Raindrop AI <sdk@raindrop.ai>"]
 license = "MIT"
 homepage = "https://raindrop.ai"
-repository = "https://github.com/invisible-tools/raindrop-rust"
-documentation = "https://docs.rs/raindrop-ai"
+repository = "https://github.com/raindrop-ai/raindrop-rust"
+documentation = "https://docs.raindrop.ai/sdk/rust"
 readme = "README.md"
 keywords = ["raindrop", "observability", "ai", "llm", "tracing"]
 categories = ["development-tools::debugging", "api-bindings"]

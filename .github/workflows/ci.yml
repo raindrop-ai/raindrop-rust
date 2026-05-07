@@ -35,8 +35,20 @@ jobs:
         run: cargo build --all-targets --all-features --verbose
       - name: Run clippy (all targets, all features)
         run: cargo clippy --all-targets --all-features -- -D warnings
-      - name: Run tests
-        run: cargo test --all-features --verbose
+      # Run unit tests, doc tests, and every integration test EXCEPT `tests/e2e.rs`.
+      # The e2e suite hits the live Raindrop backend and requires write/dashboard tokens that
+      # we don't expose to PR runs. It runs on a separate cadence (currently `release-plz` on
+      # push to `main`, see `.github/workflows/release.yml`).
+      - name: Run tests (excluding e2e)
+        run: |
+          cargo test --all-features --lib --doc --verbose
+          cargo test --all-features \
+            --test concurrency \
+            --test events \
+            --test traces \
+            --test transport \
+            --test wire_format \
+            --verbose
       - name: Build docs
         run: cargo doc --no-deps --all-features
 
@@ -68,5 +80,12 @@ jobs:
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
       - name: Build with ${{ matrix.features }}
         run: cargo build --no-default-features --features ${{ matrix.features }} --verbose
-      - name: Test with ${{ matrix.features }}
-        run: cargo test --no-default-features --features ${{ matrix.features }}
+      - name: Test with ${{ matrix.features }} (excluding e2e)
+        run: |
+          cargo test --no-default-features --features ${{ matrix.features }} --lib --doc
+          cargo test --no-default-features --features ${{ matrix.features }} \
+            --test concurrency \
+            --test events \
+            --test traces \
+            --test transport \
+            --test wire_format

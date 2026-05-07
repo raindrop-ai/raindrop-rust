@@ -1,6 +1,10 @@
-//! Raindrop AI observability SDK for Rust.
+//! Raindrop AI observability SDK for Rust (Beta).
 //!
 //! Track AI events, user signals, and OTLP-style traces.
+//!
+//! **Status: Beta.** The wire contract against the Raindrop ingestion API is stable and
+//! continuously verified against the live backend, but the crate API may still change in
+//! minor ways before `0.1.0`.
 //!
 //! # Quick start
 //!
