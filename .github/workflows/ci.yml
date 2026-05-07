@@ -39,9 +39,13 @@ jobs:
       # The e2e suite hits the live Raindrop backend and requires write/dashboard tokens that
       # we don't expose to PR runs. It runs on a separate cadence (currently `release-plz` on
       # push to `main`, see `.github/workflows/release.yml`).
+      #
+      # `--lib` and `--doc` can't be combined in a single invocation (cargo rejects it as
+      # "can't mix --doc with other target selecting options"), so we run them sequentially.
       - name: Run tests (excluding e2e)
         run: |
-          cargo test --all-features --lib --doc --verbose
+          cargo test --all-features --lib --verbose
+          cargo test --all-features --doc --verbose
           cargo test --all-features \
             --test concurrency \
             --test events \
@@ -82,7 +86,8 @@ jobs:
         run: cargo build --no-default-features --features ${{ matrix.features }} --verbose
       - name: Test with ${{ matrix.features }} (excluding e2e)
         run: |
-          cargo test --no-default-features --features ${{ matrix.features }} --lib --doc
+          cargo test --no-default-features --features ${{ matrix.features }} --lib
+          cargo test --no-default-features --features ${{ matrix.features }} --doc
           cargo test --no-default-features --features ${{ matrix.features }} \
             --test concurrency \
             --test events \
