@@ -82,7 +82,15 @@ impl ClientInner {
         };
         let payload = match serde_json::to_vec(body) {
             Ok(b) => b,
-            Err(_) => return,
+            Err(err) => {
+                if self.debug {
+                    tracing::debug!(
+                        error = %err,
+                        "raindrop: workshop mirror failed to serialize body (swallowed)"
+                    );
+                }
+                return;
+            }
         };
         let url = format!("{}{}", workshop_url, path.strip_prefix('/').unwrap_or(path));
         let http = self.workshop_http.clone();
@@ -302,7 +310,7 @@ impl ClientBuilder {
             None => reqwest::Client::builder()
                 .timeout(Duration::from_secs(10))
                 .build()
-                .map_err(|e| Error::Config(format!("could not build http client: {}", e)))?,
+                .map_err(|e| Error::Config(format!("could not build http client: {e}")))?,
         };
 
         let transport = RetryingHttpClient::new(
@@ -343,7 +351,7 @@ impl ClientBuilder {
         let workshop_http = reqwest::Client::builder()
             .timeout(Duration::from_secs(2))
             .build()
-            .map_err(|e| Error::Config(format!("could not build workshop http client: {}", e)))?;
+            .map_err(|e| Error::Config(format!("could not build workshop http client: {e}")))?;
 
         let inner = Arc::new(ClientInner {
             transport,

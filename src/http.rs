@@ -234,7 +234,7 @@ pub(crate) fn format_endpoint(endpoint: &str) -> String {
     if endpoint.ends_with('/') {
         endpoint.to_string()
     } else {
-        format!("{}/", endpoint)
+        format!("{endpoint}/")
     }
 }
 

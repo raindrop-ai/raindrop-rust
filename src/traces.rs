@@ -226,56 +226,68 @@ impl Span {
             // traceloop.association.properties.{user_id,convo_id,event_id}, gen_ai.*}. A plain
             // `start_span` with only `ai.telemetry.metadata.raindrop.eventId` would be discarded.
             let mut attributes: Vec<OtlpKeyValue> = Vec::with_capacity(state.attrs.len() + 8);
+            // Helper: only push an SDK-managed key if the caller didn't already
+            // stamp it via `SpanOptions::attributes`. OTLP requires attribute
+            // keys to be unique within a span, and several SDK-managed keys
+            // (e.g. `traceloop.association.properties.event_id` from
+            // `tool_property_attributes`) can also appear in the caller's
+            // attribute vec — without this guard, the resulting span would
+            // carry two entries for the same key.
+            let push_unique = |attributes: &mut Vec<OtlpKeyValue>,
+                               existing: &[Attribute],
+                               key: &str,
+                               value: &str| {
+                if existing.iter().any(|a| a.key == key) {
+                    return;
+                }
+                attributes.push(OtlpKeyValue::from(Attribute::string(key, value)));
+            };
             if !inner.event_id.is_empty() {
-                attributes.push(OtlpKeyValue::from(Attribute::string(
+                // Triple-stamp the event id across the AI-SDK metadata, Traceloop
+                // association, and canonical raindrop.* namespaces so spans pass
+                // dawn ingestion's `hasAIOperation` filter while Workshop reads
+                // the canonical key preferentially.
+                push_unique(
+                    &mut attributes,
+                    &state.attrs,
                     "ai.telemetry.metadata.raindrop.eventId",
                     &inner.event_id,
-                )));
-                // Also emit the traceloop association property so the span passes ingestion.
-                // The backend's `getCustomEventId` already prefers this key over the
-                // `ai.telemetry.metadata.raindrop.eventId` fallback, so this is the canonical
-                // representation and is safe to always emit.
-                //
-                // Dedupe: tool spans created via `Client::start_tool_span` already inject
-                // `event_id` into their `properties` map (so it propagates through
-                // `tool_property_attributes` as `traceloop.association.properties.event_id`).
-                // Without this guard, every tool span would emit the attribute twice — same
-                // value, but a violation of OTLP's "attribute keys MUST be unique" invariant.
-                let already_emitted = state
-                    .attrs
-                    .iter()
-                    .any(|a| a.key == "traceloop.association.properties.event_id");
-                if !already_emitted {
-                    attributes.push(OtlpKeyValue::from(Attribute::string(
-                        "traceloop.association.properties.event_id",
-                        &inner.event_id,
-                    )));
-                }
-                // Canonical contract-v1 attribute. Emitted alongside the
-                // upstream-owned `traceloop.association.properties.event_id`
-                // above; Workshop reads the canonical key preferentially while
-                // dawn ingestion continues to read the upstream namespace.
-                attributes.push(OtlpKeyValue::from(Attribute::string(
+                );
+                push_unique(
+                    &mut attributes,
+                    &state.attrs,
+                    "traceloop.association.properties.event_id",
+                    &inner.event_id,
+                );
+                push_unique(
+                    &mut attributes,
+                    &state.attrs,
                     raindrop_attr_keys::EVENT_ID,
                     &inner.event_id,
-                )));
+                );
             }
             // Stamp workspace identity (configured at builder time) on every
             // span. Workshop scopes the dashboard view by these attrs; the
             // dawn backend ignores unknown attrs so this is additive-safe.
             if let Some(ws) = inner.client.workspace_metadata() {
-                attributes.push(OtlpKeyValue::from(Attribute::string(
+                push_unique(
+                    &mut attributes,
+                    &state.attrs,
                     raindrop_attr_keys::WORKSPACE_ID,
                     &ws.id,
-                )));
-                attributes.push(OtlpKeyValue::from(Attribute::string(
+                );
+                push_unique(
+                    &mut attributes,
+                    &state.attrs,
                     raindrop_attr_keys::WORKSPACE_NAME,
                     &ws.name,
-                )));
-                attributes.push(OtlpKeyValue::from(Attribute::string(
+                );
+                push_unique(
+                    &mut attributes,
+                    &state.attrs,
                     raindrop_attr_keys::WORKSPACE_ROOT,
                     &ws.root,
-                )));
+                );
             }
             for attr in state.attrs.drain(..) {
                 attributes.push(OtlpKeyValue::from(attr));
@@ -485,7 +497,7 @@ pub(crate) fn tool_property_attributes(properties: &BTreeMap<String, Value>) -> 
         if key.is_empty() || matches!(value, Value::Null) {
             continue;
         }
-        let attr_key = format!("traceloop.association.properties.{}", key);
+        let attr_key = format!("traceloop.association.properties.{key}");
         let attr = match value {
             Value::String(s) => Attribute::string(attr_key, s),
             Value::Bool(b) => Attribute::bool(attr_key, *b),
