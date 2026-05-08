@@ -51,11 +51,14 @@ fn unique_user_id(suffix: &str) -> String {
 async fn query_dashboard(token: &str, limit: usize) -> Result<Vec<Value>, String> {
     let backend_url =
         env::var("RAINDROP_BACKEND_URL").unwrap_or_else(|_| DEFAULT_BACKEND_URL.to_string());
+    // dawn's tRPC server has no superjson transformer configured, so wrapping
+    // the input in `{ json: {...} }` makes Zod silently strip every field and
+    // the procedure runs with all parameters undefined. Send the raw input.
+    // `orderBy.direction` is the uppercase enum `"DESC"` (lowercase fails
+    // Zod's `["ASC", "DESC"]` validation once Bug #1 is fixed).
     let input_obj = json!({
-        "json": {
-            "limit": limit,
-            "orderBy": { "field": "timestamp", "direction": "desc" }
-        }
+        "limit": limit,
+        "orderBy": { "field": "timestamp", "direction": "DESC" }
     });
     let encoded = urlencoding::encode(&input_obj.to_string()).into_owned();
     let url = format!("{}/api/trpc/events.list?input={}", backend_url, encoded);
@@ -379,11 +382,12 @@ async fn e2e_signals_and_identify_land_in_dashboard() {
 async fn query_traces_for_event(token: &str, event_id: &str) -> Result<Vec<Value>, String> {
     let backend_url =
         env::var("RAINDROP_BACKEND_URL").unwrap_or_else(|_| DEFAULT_BACKEND_URL.to_string());
+    // Send raw input — dawn's tRPC server has no superjson transformer, so a
+    // `{ json: {...} }` wrapper would be stripped by Zod and `traces.list`
+    // would return `[]` for every event_id.
     let input_obj = json!({
-        "json": {
-            "eventId": event_id,
-            "limit": 200,
-        }
+        "eventId": event_id,
+        "limit": 200,
     });
     let encoded = urlencoding::encode(&input_obj.to_string()).into_owned();
     let url = format!("{}/api/trpc/traces.list?input={}", backend_url, encoded);
@@ -1372,13 +1376,12 @@ async fn e2e_set_token_usage_helper_attributes_land_with_event() {
 /// `dawn/packages/schemas/src/tinybird/query/shared.ts::ConvosTable.schema.list`. To filter
 /// by our user, we use `filters.user_id.$eq` (the canonical convo-table column name).
 ///
-/// Marked `#[ignore]` because the convo aggregation Tinybird pipeline (`convo_list`) is
-/// eventually-consistent on a noticeably longer cadence than `events.list`, so this test
-/// can take >3 minutes to flip green even though the underlying convo grouping is correct
-/// (the simpler `e2e_convo_grouping_works_across_multiple_track_ai` already gates on
-/// `events.list[].aiData.convoId` for the same scenario).
+/// Previously `#[ignore]`d under the (incorrect) hypothesis of slow convo_list
+/// aggregation. The actual cause was Bug #1 (the `{ json: {...} }` envelope
+/// wrapper on the trpc input) which made `conversations.list` silently fall
+/// through to defaults and never return the convo. After dropping the wrapper,
+/// the test passes in <10s.
 #[tokio::test]
-#[ignore = "convo_list aggregation has high tail latency relative to events.list"]
 async fn e2e_conversations_list_shows_grouped_events_for_convo_id() {
     let (write_key, dashboard_token) = match env_keys() {
         Some(v) => v,
@@ -1415,11 +1418,10 @@ async fn e2e_conversations_list_shows_grouped_events_for_convo_id() {
     // ConvosTable.schema.list.filters == { user_id?: { $eq: ..., $ne: ..., ... } }.
     let backend_url =
         env::var("RAINDROP_BACKEND_URL").unwrap_or_else(|_| DEFAULT_BACKEND_URL.to_string());
+    // Send raw input (no `{ json: {...} }` wrapper) — see `query_dashboard`.
     let input_obj = json!({
-        "json": {
-            "filters": { "user_id": { "$eq": user_id } },
-            "limit": 25,
-        }
+        "filters": { "user_id": { "$eq": user_id } },
+        "limit": 25,
     });
     let encoded = urlencoding::encode(&input_obj.to_string()).into_owned();
     let url = format!(
