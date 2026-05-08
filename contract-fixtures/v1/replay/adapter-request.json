@@ -1,0 +1,24 @@
+{
+  "sourceRunId": "8351249bb0a5be11bd049b4a17a2bb64",
+  "replayRunId": "replay_xyz_001",
+  "replayPrompt": "Try again with a stricter compliance check.",
+  "messages": [
+    { "role": "system", "content": "You are a careful financial-risk reviewer." },
+    { "role": "user", "content": "Review account risk for tenant 42." },
+    { "role": "assistant", "content": "Let me look up the latest compliance gates." },
+    { "role": "tool", "content": "[{\"id\":1,\"title\":\"Compliance Guide\"}]", "toolCallId": "tool_call_search_docs_1" },
+    { "role": "assistant", "content": "Risk is HIGH until compliance gates close." }
+  ],
+  "systemPrompt": "You are a careful financial-risk reviewer.",
+  "userMessage": "Review account risk for tenant 42.",
+  "model": "claude-sonnet-4-6",
+  "providerOptions": {
+    "anthropic": {
+      "thinking": { "type": "enabled", "budget_tokens": 1024 }
+    }
+  },
+  "context": {
+    "tenantId": "42",
+    "userId": "user_456"
+  }
+}

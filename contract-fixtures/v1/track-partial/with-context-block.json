@@ -1,0 +1,18 @@
+{
+  "event_id": "evt_context_1",
+  "event": "anthropic_chat",
+  "user_id": "user_456",
+  "timestamp": "2026-05-07T19:00:00.000Z",
+  "is_pending": true,
+  "ai_data": {
+    "model": "claude-sonnet-4-6",
+    "input": "Review account risk."
+  },
+  "properties": {
+    "$context": {
+      "page": "/dashboard/risk",
+      "feature_flags": ["risk_v2"],
+      "release": "2026.05.07"
+    }
+  }
+}

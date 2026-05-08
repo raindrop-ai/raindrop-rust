@@ -1,0 +1,9 @@
+{
+  "event_id": "evt_top_level_input",
+  "event": "anthropic_chat",
+  "user_id": "user_456",
+  "timestamp": "2026-05-07T19:00:00.000Z",
+  "is_pending": true,
+  "input": "Top-level input that some SDKs send instead of ai_data.input.",
+  "properties": {}
+}

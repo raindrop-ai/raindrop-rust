@@ -1,0 +1,37 @@
+{
+  "resourceSpans": [
+    {
+      "resource": {
+        "attributes": [
+          { "key": "service.name", "value": { "stringValue": "anthropic-chat-example" } }
+        ]
+      },
+      "scopeSpans": [
+        {
+          "scope": { "name": "@raindrop-ai/ai-sdk", "version": "0.0.26" },
+          "spans": [
+            {
+              "traceId": "8351249bb0a5be11bd049b4a17a2bb64",
+              "spanId": "b5e012f33a8d11cc",
+              "name": "ai.streamText.doStream",
+              "kind": 1,
+              "startTimeUnixNano": "1778181160000000000",
+              "endTimeUnixNano": "1778181164000000000",
+              "status": { "code": 1 },
+              "attributes": [
+                { "key": "raindrop.span.kind", "value": { "stringValue": "llm_call" } },
+                { "key": "raindrop.event.id", "value": { "stringValue": "evt_abc123" } },
+                { "key": "ai.model.id", "value": { "stringValue": "claude-sonnet-4-6" } },
+                { "key": "ai.model.provider", "value": { "stringValue": "anthropic" } },
+                { "key": "ai.prompt", "value": { "stringValue": "{\"messages\":[{\"role\":\"user\",\"content\":\"Review account risk for tenant 42.\"}]}" } },
+                { "key": "ai.result.text", "value": { "stringValue": "Risk is HIGH until compliance gates close." } },
+                { "key": "ai.usage.inputTokens", "value": { "intValue": "120" } },
+                { "key": "ai.usage.outputTokens", "value": { "intValue": "42" } }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

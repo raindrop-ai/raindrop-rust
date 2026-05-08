@@ -1,0 +1,70 @@
+{
+  "version": "1",
+  "description": "Golden corpus of canonical wire payloads for Contract v1. Every fixture is one example payload that all four implementations of the wire (Workshop HTTP server, raindrop-js zod schemas, Python pydantic mirrors, Rust serde mirrors) must agree on. Drift in any single implementation surfaces as a fixture-test failure in that language.",
+  "endpoints": {
+    "live": "/v1/live",
+    "track": "/v1/events/track",
+    "track-partial": "/v1/events/track_partial",
+    "traces": "/v1/traces"
+  },
+  "schemas": {
+    "live": "LiveEventSchema",
+    "track": "TrackBodySchema",
+    "track-partial": "TrackPartialEventSchema",
+    "traces": "OtlpExportTraceServiceRequest",
+    "replay/adapter-request": "ReplayAdapterRequestSchema",
+    "replay/adapter-response": "ReplayAdapterResponseSchema",
+    "replay/health-response": "ReplayAdapterHealthResponseSchema",
+    "replay/register-request": "ReplayAdapterRegisterRequestSchema"
+  },
+  "fixtures": {
+    "live": [
+      "tool-start",
+      "tool-result",
+      "text-delta",
+      "reasoning-delta",
+      "status",
+      "tool-start-with-workspace-meta",
+      "tool-start-with-event-correlation",
+      "tool-start-missing-spanid",
+      "bad-tracehex"
+    ],
+    "track": [
+      "single-event",
+      "array-batch",
+      "with-workspace-properties",
+      "with-replay-runid"
+    ],
+    "track-partial": [
+      "begin",
+      "finish",
+      "top-level-input",
+      "with-trace-id-only",
+      "with-context-block"
+    ],
+    "traces": [
+      "single-tool-span",
+      "single-llm-span",
+      "multi-span-batch",
+      "legacy-only",
+      "dual-emission"
+    ],
+    "replay": [
+      "adapter-request",
+      "adapter-response",
+      "health-response",
+      "register-request"
+    ]
+  },
+  "validity": {
+    "live/tool-start-missing-spanid": "invalid",
+    "live/bad-tracehex": "invalid"
+  },
+  "schemaSkip": [
+    "track-partial/with-trace-id-only"
+  ],
+  "notes": {
+    "track-partial/with-trace-id-only": "Documents Workshop's trace-only-attach case. /v1/events/track_partial accepts a body with no event_id when properties.trace_id is present (the run is keyed by trace_id directly). The current TrackPartialEventSchema in raindrop-js requires event_id; once Workshop adopts that schema (Phase B), either the fixture or the schema must be reconciled.",
+    "replay/*": "These fixtures describe wire shapes between Workshop and a user-repo replay adapter. adapter-request, adapter-response, and health-response do NOT have a Workshop-side endpoint to POST to (they are consumed by the user's /replay and /health). register-request targets POST /api/replay/adapters/register, which is not yet implemented in Workshop; the test validates the fixture parses as JSON without asserting an HTTP response."
+  }
+}

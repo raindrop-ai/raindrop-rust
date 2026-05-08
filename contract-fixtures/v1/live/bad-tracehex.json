@@ -1,0 +1,6 @@
+{
+  "traceId": "not-hex-at-all",
+  "type": "status",
+  "content": "this trace id is not 32 hex chars",
+  "timestamp": 1778181167200
+}
