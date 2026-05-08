@@ -3,7 +3,7 @@
     {
       "resource": {
         "attributes": [
-          { "key": "service.name", "value": { "stringValue": "legacy-traceloop-example" } }
+          { "key": "service.name", "value": { "stringValue": "ai-sdk-and-traceloop-example" } }
         ]
       },
       "scopeSpans": [

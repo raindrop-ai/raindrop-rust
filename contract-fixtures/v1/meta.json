@@ -46,7 +46,7 @@
       "single-tool-span",
       "single-llm-span",
       "multi-span-batch",
-      "legacy-only",
+      "ai-sdk-and-traceloop-only",
       "dual-emission"
     ],
     "replay": [
