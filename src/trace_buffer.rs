@@ -72,6 +72,13 @@ impl TraceBuffer {
             }
             let payload =
                 build_export_request(batch.clone(), &client.service_name, &client.version);
+
+            // Mirror OTLP exports to the local Workshop daemon (fire-and-forget).
+            // Same payload, same path; Workshop accepts the OTLP/JSON envelope on
+            // `/v1/traces`. We mirror BEFORE the cloud send so the local UI sees
+            // streaming spans without waiting on the cloud round-trip.
+            client.mirror_to_workshop("traces", &payload);
+
             match client.transport.post_json("traces", &payload).await {
                 Ok(_) => continue,
                 Err(err) => {

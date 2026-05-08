@@ -37,6 +37,10 @@ time = { version = "0.3", features = ["formatting", "parsing"] }
 thiserror = "1.0"
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 futures = "0.3"
+# Used by `contract::v1::workshop_detection::should_auto_enable_workshop` to detect
+# interactive terminals as a fallback Workshop trigger. Modern replacement for the
+# deprecated `atty` crate.
+is-terminal = "0.4"
 
 [dev-dependencies]
 tokio = { version = "1.36", features = ["full", "test-util"] }

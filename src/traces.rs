@@ -6,6 +6,7 @@ use serde_json::Value;
 use time::OffsetDateTime;
 
 use crate::client::Client;
+use crate::contract::v1::attrs::attr_keys as raindrop_attr_keys;
 use crate::helpers::{merge_maps, stringify_value, unix_nanos_string};
 use crate::otlp::{Attribute, OtlpKeyValue, OtlpSpan, OtlpStatus, SpanIds, SpanStatusCode};
 
@@ -224,7 +225,7 @@ impl Span {
             // that don't have one of {ai.operationId, traceloop.span.kind, traceloop.workflow.name,
             // traceloop.association.properties.{user_id,convo_id,event_id}, gen_ai.*}. A plain
             // `start_span` with only `ai.telemetry.metadata.raindrop.eventId` would be discarded.
-            let mut attributes: Vec<OtlpKeyValue> = Vec::with_capacity(state.attrs.len() + 2);
+            let mut attributes: Vec<OtlpKeyValue> = Vec::with_capacity(state.attrs.len() + 8);
             if !inner.event_id.is_empty() {
                 attributes.push(OtlpKeyValue::from(Attribute::string(
                     "ai.telemetry.metadata.raindrop.eventId",
@@ -250,6 +251,30 @@ impl Span {
                         &inner.event_id,
                     )));
                 }
+                // Canonical contract-v1 attribute. Emitted ALONGSIDE the legacy
+                // keys above; Workshop's parser prefers this one. Production
+                // dawn ingestion still reads the legacy keys, so we emit both.
+                attributes.push(OtlpKeyValue::from(Attribute::string(
+                    raindrop_attr_keys::EVENT_ID,
+                    &inner.event_id,
+                )));
+            }
+            // Stamp workspace identity (configured at builder time) on every
+            // span. Workshop scopes the dashboard view by these attrs; the
+            // dawn backend ignores unknown attrs so this is additive-safe.
+            if let Some(ws) = inner.client.workspace_metadata() {
+                attributes.push(OtlpKeyValue::from(Attribute::string(
+                    raindrop_attr_keys::WORKSPACE_ID,
+                    &ws.id,
+                )));
+                attributes.push(OtlpKeyValue::from(Attribute::string(
+                    raindrop_attr_keys::WORKSPACE_NAME,
+                    &ws.name,
+                )));
+                attributes.push(OtlpKeyValue::from(Attribute::string(
+                    raindrop_attr_keys::WORKSPACE_ROOT,
+                    &ws.root,
+                )));
             }
             for attr in state.attrs.drain(..) {
                 attributes.push(OtlpKeyValue::from(attr));
@@ -412,7 +437,10 @@ impl Tracer {
 }
 
 /// Build the standard set of tool attributes (kind, name, input/output, duration, association
-/// properties).
+/// properties). Emits both the legacy `traceloop.*` keys and the canonical
+/// contract-v1 `raindrop.span.kind = "tool_call"` + `raindrop.tool.name` keys
+/// so Workshop's parser sees the new namespace and dawn ingestion still passes
+/// the `hasAIOperation` filter via the legacy keys.
 pub(crate) fn build_tool_attributes(
     name: &str,
     input: Option<&Value>,
@@ -423,6 +451,8 @@ pub(crate) fn build_tool_attributes(
     let mut attrs = vec![
         Attribute::string("traceloop.span.kind", "tool"),
         Attribute::string("traceloop.entity.name", name),
+        Attribute::string(raindrop_attr_keys::SPAN_KIND, "tool_call"),
+        Attribute::string(raindrop_attr_keys::TOOL_NAME, name),
     ];
     if let Some(input) = input {
         attrs.push(Attribute::string(

@@ -1385,6 +1385,193 @@ async fn parent_child_spans_share_trace_id_and_link_via_parent_span_id() {
         .unwrap_or(true));
 }
 
+// ────────────────────────────────────────────────────────────────────────────────────
+// Contract v1 canonical attributes — emitted alongside the legacy keys.
+// ────────────────────────────────────────────────────────────────────────────────────
+
+/// Plain spans with an `event_id` MUST emit the canonical `raindrop.event.id`
+/// attribute alongside the legacy `ai.telemetry.metadata.raindrop.eventId` and
+/// `traceloop.association.properties.event_id` attrs. Workshop's parser prefers
+/// the canonical key; dawn ingestion still reads the legacy keys.
+#[tokio::test]
+async fn span_emits_canonical_raindrop_event_id_alongside_legacy_keys() {
+    let server = MockServer::start().await;
+    let trace_recorder = mount_path(&server, "POST", "/traces").await;
+    let client = fast_client_builder(&server).build().expect("build");
+
+    let span = client.start_span(SpanOptions {
+        name: "canonical_attrs".into(),
+        event_id: "evt_canon".into(),
+        ..Default::default()
+    });
+    span.end();
+    client.flush().await.expect("flush");
+    client.close().await.expect("close");
+
+    let payload = trace_recorder.requests()[0].json();
+    let span_json = &spans_of(&payload)[0];
+
+    let canonical = span_attr(span_json, "raindrop.event.id")
+        .expect("raindrop.event.id MUST be emitted alongside legacy keys");
+    assert_eq!(canonical["stringValue"], "evt_canon");
+
+    // Legacy keys must still be there (dawn ingestion reads them).
+    let legacy_ai = span_attr(span_json, "ai.telemetry.metadata.raindrop.eventId").unwrap();
+    assert_eq!(legacy_ai["stringValue"], "evt_canon");
+    let legacy_traceloop =
+        span_attr(span_json, "traceloop.association.properties.event_id").unwrap();
+    assert_eq!(legacy_traceloop["stringValue"], "evt_canon");
+}
+
+/// Tool spans get the canonical `raindrop.span.kind = tool_call` and
+/// `raindrop.tool.name` keys alongside the legacy traceloop keys.
+#[tokio::test]
+async fn tool_span_emits_canonical_raindrop_span_kind_and_tool_name() {
+    let server = MockServer::start().await;
+    let trace_recorder = mount_path(&server, "POST", "/traces").await;
+    let _ = mount_path(&server, "POST", "/events/track_partial").await;
+    let client = fast_client_builder(&server).build().expect("build");
+
+    let interaction = client
+        .begin(BeginOptions {
+            event_id: "evt_tool_canon".into(),
+            user_id: "u".into(),
+            ..Default::default()
+        })
+        .await;
+    let tool = interaction.start_tool_span("lookup", ToolOptions::default());
+    tool.end();
+    let _ = client.close().await;
+
+    let mut all = Vec::new();
+    for r in trace_recorder.requests() {
+        all.extend(spans_of(&r.json()));
+    }
+    let tool_span = all.iter().find(|s| s["name"] == "lookup").unwrap();
+
+    let kind = span_attr(tool_span, "raindrop.span.kind").expect("raindrop.span.kind");
+    assert_eq!(kind["stringValue"], "tool_call");
+    let name = span_attr(tool_span, "raindrop.tool.name").expect("raindrop.tool.name");
+    assert_eq!(name["stringValue"], "lookup");
+
+    // Legacy keys still emitted for dawn.
+    let legacy_kind = span_attr(tool_span, "traceloop.span.kind").unwrap();
+    assert_eq!(legacy_kind["stringValue"], "tool");
+    let legacy_name = span_attr(tool_span, "traceloop.entity.name").unwrap();
+    assert_eq!(legacy_name["stringValue"], "lookup");
+}
+
+/// When the client is configured with workspace metadata, every OTLP span MUST
+/// carry the canonical `raindrop.workspace.{id,name,root}` attributes so
+/// Workshop can scope the dashboard view to that workspace.
+#[tokio::test]
+async fn span_emits_canonical_workspace_attributes_when_configured() {
+    let server = MockServer::start().await;
+    let trace_recorder = mount_path(&server, "POST", "/traces").await;
+    let client = fast_client_builder(&server)
+        .workspace(raindrop::contract::v1::workspace::LocalWorkspaceMetadata {
+            id: "ws_pedantic".into(),
+            name: "Pedantic Workspace".into(),
+            root: "/tmp/pedantic".into(),
+        })
+        .build()
+        .expect("build");
+
+    let span = client.start_span(SpanOptions {
+        name: "ws_span".into(),
+        event_id: "evt".into(),
+        ..Default::default()
+    });
+    span.end();
+    client.flush().await.expect("flush");
+    client.close().await.expect("close");
+
+    let span_json = &spans_of(&trace_recorder.requests()[0].json())[0];
+    assert_eq!(
+        span_attr(span_json, "raindrop.workspace.id").unwrap()["stringValue"],
+        "ws_pedantic"
+    );
+    assert_eq!(
+        span_attr(span_json, "raindrop.workspace.name").unwrap()["stringValue"],
+        "Pedantic Workspace"
+    );
+    assert_eq!(
+        span_attr(span_json, "raindrop.workspace.root").unwrap()["stringValue"],
+        "/tmp/pedantic"
+    );
+}
+
+/// `track_partial` payloads must carry `properties.workspace` when the client
+/// has workspace metadata configured. Workshop reads this to scope partial
+/// events without needing OTLP attrs.
+#[tokio::test]
+async fn track_partial_auto_stamps_workspace_when_configured() {
+    let server = MockServer::start().await;
+    let recorder = mount_path(&server, "POST", "/events/track_partial").await;
+    let client = fast_client_builder(&server)
+        .workspace(raindrop::contract::v1::workspace::LocalWorkspaceMetadata {
+            id: "ws_track".into(),
+            name: "Track Workspace".into(),
+            root: "/tmp/track".into(),
+        })
+        .build()
+        .expect("build");
+
+    client
+        .track_ai(AiEvent {
+            user_id: "u".into(),
+            input: "x".into(),
+            output: "y".into(),
+            ..Default::default()
+        })
+        .await
+        .expect("track_ai");
+    client.close().await.expect("close");
+
+    let payload = recorder.requests()[0].json();
+    let ws = &payload["properties"]["workspace"];
+    assert_eq!(ws["id"], "ws_track");
+    assert_eq!(ws["name"], "Track Workspace");
+    assert_eq!(ws["root"], "/tmp/track");
+}
+
+/// Caller-supplied `properties.workspace` MUST NOT be overwritten by the
+/// auto-stamp. The reader treats explicit caller intent as the source of truth.
+#[tokio::test]
+async fn track_partial_caller_supplied_workspace_overrides_auto_stamp() {
+    let server = MockServer::start().await;
+    let recorder = mount_path(&server, "POST", "/events/track_partial").await;
+    let client = fast_client_builder(&server)
+        .workspace(raindrop::contract::v1::workspace::LocalWorkspaceMetadata {
+            id: "ws_default".into(),
+            name: "Default".into(),
+            root: "/tmp/default".into(),
+        })
+        .build()
+        .expect("build");
+
+    let mut props = BTreeMap::new();
+    props.insert(
+        "workspace".into(),
+        json!({"id": "ws_caller", "name": "Caller", "root": "/tmp/caller"}),
+    );
+    client
+        .track_ai(AiEvent {
+            user_id: "u".into(),
+            input: "x".into(),
+            properties: props,
+            ..Default::default()
+        })
+        .await
+        .expect("track_ai");
+    client.close().await.expect("close");
+
+    let payload = recorder.requests()[0].json();
+    let ws = &payload["properties"]["workspace"];
+    assert_eq!(ws["id"], "ws_caller", "caller-supplied workspace MUST win");
+    assert_eq!(ws["name"], "Caller");
+}
+
 /// Repeated tool name across the same event creates separate spans with distinct `spanId`s
 /// and is preserved in the dashboard's `toolCalls[]` array (which dedupes by `span_id`, not
 /// by name). Real production data shows tools repeated 5–25 times within a single event

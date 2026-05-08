@@ -37,6 +37,10 @@ pub(crate) struct StickyEventData {
 }
 
 /// Wire payload for `events/track_partial`.
+///
+/// `properties` is a free-form JSON map (passthrough). The contract module
+/// reserves a `workspace` key inside `properties` for workspace identity
+/// stamping; see `auto_stamp_workspace_property`.
 #[derive(Debug, Default, Clone, Serialize)]
 pub(crate) struct TrackPartialPayload {
     pub event_id: String,
@@ -173,6 +177,11 @@ impl EventBuffer {
             }
         };
 
+        // Mirror to local Workshop daemon BEFORE the cloud call so a slow cloud
+        // round-trip doesn't delay the live UI. Both calls are independent —
+        // mirror failures are swallowed inside `mirror_to_workshop`.
+        client.mirror_to_workshop("events/track_partial", &payload);
+
         match client
             .transport
             .post_json("events/track_partial", &payload)
@@ -297,6 +306,23 @@ fn build_track_partial_payload(
 
     let mut properties = clone_map(&patch.properties);
     properties.insert("$context".to_string(), client.context_data.clone());
+
+    // Auto-stamp workspace identity from env (if configured) when the caller
+    // didn't supply one in `properties.workspace`. Mirrors the TS contract's
+    // `track_partial` workspace stamping. The full LocalWorkspaceMetadata
+    // object is serialized as a JSON object (id/name/root) — Workshop reads
+    // any of those fields to scope the dashboard view.
+    if let Some(ws) = client.workspace.as_ref() {
+        properties
+            .entry("workspace".to_string())
+            .or_insert_with(|| {
+                serde_json::json!({
+                    "id": ws.id,
+                    "name": ws.name,
+                    "root": ws.root,
+                })
+            });
+    }
 
     let attachments = patch.attachments.clone();
 

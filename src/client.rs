@@ -9,6 +9,8 @@ use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
 use crate::buffer::{EventBuffer, EventPatch};
+use crate::contract::v1::workshop_detection::{resolve_workshop_url, WorkshopUrlOptions};
+use crate::contract::v1::workspace::{read_workspace_metadata_from_env, LocalWorkspaceMetadata};
 use crate::error::{Error, Result};
 use crate::events::{AiEvent, BeginOptions, Event, FinishOptions, Interaction, PatchOptions};
 use crate::helpers::new_event_id;
@@ -34,6 +36,21 @@ pub(crate) struct ClientInner {
     pub(crate) trace_buffer: Arc<TraceBuffer>,
     pub(crate) closed: AtomicBool,
     pub(crate) flush_tasks: std::sync::Mutex<Vec<JoinHandle<()>>>,
+    /// Resolved at builder time via `resolve_workshop_url`. When `Some`, the SDK
+    /// fire-and-forget mirrors `track_partial` and OTLP exports to this base URL
+    /// so a locally running Workshop daemon sees telemetry without a round-trip
+    /// through the cloud. Mirror failures are swallowed; the cloud path is the
+    /// source of truth.
+    pub(crate) workshop_url: Option<String>,
+    /// Workspace identity auto-stamped onto `track_partial` `properties.workspace`
+    /// and OTLP `raindrop.workspace.*` attributes. Resolved from
+    /// `RAINDROP_WORKSPACE_{ID,NAME,ROOT}` env vars (see contract::v1::workspace).
+    pub(crate) workspace: Option<LocalWorkspaceMetadata>,
+    /// Plain reqwest client (no auth, short timeout) used for fire-and-forget
+    /// Workshop mirror posts. Decoupled from `transport` because the local
+    /// daemon doesn't take a write key and we don't want retries to mask
+    /// "daemon offline" — we just drop the mirror.
+    pub(crate) workshop_http: reqwest::Client,
 }
 
 impl std::fmt::Debug for ClientInner {
@@ -42,7 +59,56 @@ impl std::fmt::Debug for ClientInner {
             .field("enabled", &self.enabled)
             .field("debug", &self.debug)
             .field("service_name", &self.service_name)
+            .field("workshop_url", &self.workshop_url)
+            .field("workspace", &self.workspace.as_ref().map(|w| w.id.as_str()))
             .finish()
+    }
+}
+
+impl ClientInner {
+    /// Fire-and-forget POST to the local Workshop daemon. Pre-serializes `body`
+    /// on the caller's task so the spawned future doesn't need to capture the
+    /// generic; the spawned future just owns the raw bytes.
+    ///
+    /// All failures (serialization, build error, network error, non-2xx) are
+    /// swallowed: the cloud path in `transport` is the source of truth and a
+    /// missing / dead daemon must never affect production telemetry.
+    pub(crate) fn mirror_to_workshop<T: serde::Serialize>(&self, path: &str, body: &T) {
+        let workshop_url = match &self.workshop_url {
+            Some(u) => u.clone(),
+            None => return,
+        };
+        let payload = match serde_json::to_vec(body) {
+            Ok(b) => b,
+            Err(_) => return,
+        };
+        let url = format!("{}{}", workshop_url, path.strip_prefix('/').unwrap_or(path));
+        let http = self.workshop_http.clone();
+        let debug = self.debug;
+        tokio::spawn(async move {
+            let res = http
+                .post(&url)
+                .header("Content-Type", "application/json")
+                .header(
+                    crate::contract::v1::WIRE_VERSION_HEADER,
+                    crate::contract::v1::WIRE_VERSION,
+                )
+                .body(payload)
+                .send()
+                .await;
+            if debug {
+                match res {
+                    Ok(r) => {
+                        tracing::debug!(url = %url, status = r.status().as_u16(), "raindrop: workshop mirror sent")
+                    }
+                    Err(err) => {
+                        tracing::debug!(url = %url, error = %err, "raindrop: workshop mirror failed (swallowed)")
+                    }
+                }
+            } else {
+                let _ = res;
+            }
+        });
     }
 }
 
@@ -69,6 +135,9 @@ pub struct ClientBuilder {
     library_name: String,
     library_version: String,
     http_client: Option<reqwest::Client>,
+    enable_workshop: Option<bool>,
+    override_workshop_url: Option<String>,
+    workspace: Option<LocalWorkspaceMetadata>,
 }
 
 impl Default for ClientBuilder {
@@ -88,6 +157,9 @@ impl Default for ClientBuilder {
             library_name: crate::DEFAULT_LIBRARY_NAME.to_string(),
             library_version: crate::VERSION.to_string(),
             http_client: None,
+            enable_workshop: None,
+            override_workshop_url: None,
+            workspace: None,
         }
     }
 }
@@ -177,6 +249,32 @@ impl ClientBuilder {
         self
     }
 
+    /// Explicitly enable or disable the local Workshop mirror. `Some(false)`
+    /// disables mirroring even if `RAINDROP_LOCAL_DEBUGGER` is set. `Some(true)`
+    /// enables mirroring at the env-var URL or the default `http://localhost:5899/v1/`.
+    /// `None` (default) defers to env-var detection and the auto-detect heuristics
+    /// in [`crate::contract::v1::resolve_workshop_url`].
+    pub fn enable_workshop(mut self, enabled: bool) -> Self {
+        self.enable_workshop = Some(enabled);
+        self
+    }
+
+    /// Explicit Workshop base URL. Bypasses env vars and auto-detection. Useful
+    /// for tests and advanced setups where Workshop is exposed on a non-default
+    /// port. Implies workshop is enabled.
+    pub fn workshop_url(mut self, url: impl Into<String>) -> Self {
+        self.override_workshop_url = Some(url.into());
+        self
+    }
+
+    /// Override the workspace identity stamped onto every `track_partial`
+    /// payload and OTLP span. Defaults to reading
+    /// `RAINDROP_WORKSPACE_{ID,NAME,ROOT}` from the process env.
+    pub fn workspace(mut self, workspace: LocalWorkspaceMetadata) -> Self {
+        self.workspace = Some(workspace);
+        self
+    }
+
     /// Build the [`Client`].
     pub fn build(self) -> Result<Client> {
         let endpoint = format_endpoint(&self.endpoint);
@@ -217,6 +315,19 @@ impl ClientBuilder {
             }
         });
 
+        let workshop_url = resolve_workshop_url(WorkshopUrlOptions {
+            enable_workshop: self.enable_workshop,
+            override_workshop_url: self.override_workshop_url,
+        });
+        let workspace = self.workspace.or_else(read_workspace_metadata_from_env);
+
+        // Short-timeout, retry-free client for fire-and-forget Workshop mirror.
+        // We never want a slow / missing daemon to back-pressure the cloud path.
+        let workshop_http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .map_err(|e| Error::Config(format!("could not build workshop http client: {}", e)))?;
+
         let inner = Arc::new(ClientInner {
             transport,
             enabled,
@@ -228,6 +339,9 @@ impl ClientBuilder {
             trace_buffer,
             closed: AtomicBool::new(false),
             flush_tasks: std::sync::Mutex::new(Vec::new()),
+            workshop_url,
+            workspace,
+            workshop_http,
         });
 
         let client = Client { inner };
@@ -255,6 +369,20 @@ impl Client {
     /// Whether the client is closed.
     pub fn is_closed(&self) -> bool {
         self.inner.closed.load(Ordering::SeqCst)
+    }
+
+    /// Resolved Workshop mirror URL, if any. `None` when the SDK is not
+    /// mirroring telemetry to a local Workshop daemon.
+    pub fn workshop_url(&self) -> Option<&str> {
+        self.inner.workshop_url.as_deref()
+    }
+
+    /// Workspace identity stamped onto every `track_partial` payload and OTLP
+    /// span emitted by this client. Resolved either from
+    /// [`ClientBuilder::workspace`] or from the
+    /// `RAINDROP_WORKSPACE_{ID,NAME,ROOT}` env vars.
+    pub fn workspace_metadata(&self) -> Option<&LocalWorkspaceMetadata> {
+        self.inner.workspace.as_ref()
     }
 
     /// Track a non-AI event.

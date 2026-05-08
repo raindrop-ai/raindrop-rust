@@ -39,6 +39,7 @@
 
 mod buffer;
 mod client;
+pub mod contract;
 mod error;
 mod events;
 mod helpers;
