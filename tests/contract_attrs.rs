@@ -43,7 +43,8 @@ fn span_kind_serializes_to_canonical_wire_strings() {
     assert_eq!(RaindropSpanKind::Trace.as_wire_str(), "trace");
     assert_eq!(RaindropSpanKind::LlmCall.as_wire_str(), "llm_call");
     assert_eq!(RaindropSpanKind::ToolCall.as_wire_str(), "tool_call");
-    // Backwards-compat traceloop mapping for the dawn `mapSpanType` filter.
+    // Traceloop kind values (upstream-owned namespace), read by dawn's
+    // `mapSpanType` filter to classify the span.
     assert_eq!(RaindropSpanKind::AgentRoot.as_traceloop_str(), "workflow");
     assert_eq!(RaindropSpanKind::Trace.as_traceloop_str(), "workflow");
     assert_eq!(RaindropSpanKind::LlmCall.as_traceloop_str(), "llm");

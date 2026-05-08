@@ -48,8 +48,9 @@ impl RaindropSpanKind {
         }
     }
 
-    /// Legacy `traceloop.span.kind` value, emitted alongside the canonical kind
-    /// for backwards-compatibility with the dawn backend's `mapSpanType`.
+    /// Traceloop `traceloop.span.kind` value, emitted alongside the canonical
+    /// kind. The `dawn` ingestion kernel's `mapSpanType` filter reads this
+    /// upstream-owned attribute to classify the span.
     pub fn as_traceloop_str(self) -> &'static str {
         match self {
             RaindropSpanKind::AgentRoot => "workflow",
@@ -129,7 +130,10 @@ pub mod attr_keys {
     pub const PAYLOAD_ORIGINAL_BYTES: &str = "raindrop.payload.original_bytes";
 }
 
-/// Legacy `ai.telemetry.metadata.raindrop.*` keys (the AI SDK metadata path).
+/// Vercel AI SDK metadata namespace (`ai.telemetry.metadata.raindrop.*`).
+/// Upstream-owned convention; the `dawn` ingestion kernel's `hasAIOperation`
+/// filter reads these keys, so they are emitted on every Raindrop span
+/// alongside the canonical `raindrop.*` namespace.
 pub mod ai_sdk_metadata {
     pub const EVENT_ID: &str = "ai.telemetry.metadata.raindrop.eventId";
     pub const EVENT_NAME: &str = "ai.telemetry.metadata.raindrop.eventName";

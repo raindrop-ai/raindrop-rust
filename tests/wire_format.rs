@@ -1455,11 +1455,12 @@ async fn tool_span_emits_canonical_raindrop_span_kind_and_tool_name() {
     let name = span_attr(tool_span, "raindrop.tool.name").expect("raindrop.tool.name");
     assert_eq!(name["stringValue"], "lookup");
 
-    // Legacy keys still emitted for dawn.
-    let legacy_kind = span_attr(tool_span, "traceloop.span.kind").unwrap();
-    assert_eq!(legacy_kind["stringValue"], "tool");
-    let legacy_name = span_attr(tool_span, "traceloop.entity.name").unwrap();
-    assert_eq!(legacy_name["stringValue"], "lookup");
+    // Upstream-owned Traceloop OpenLLMetry keys still emitted alongside the
+    // canonical `raindrop.*` namespace (Workshop and dawn both read them).
+    let traceloop_kind = span_attr(tool_span, "traceloop.span.kind").unwrap();
+    assert_eq!(traceloop_kind["stringValue"], "tool");
+    let traceloop_name = span_attr(tool_span, "traceloop.entity.name").unwrap();
+    assert_eq!(traceloop_name["stringValue"], "lookup");
 }
 
 /// When the client is configured with workspace metadata, every OTLP span MUST
