@@ -1,0 +1,47 @@
+{
+  "resourceSpans": [
+    {
+      "resource": {
+        "attributes": [
+          { "key": "service.name", "value": { "stringValue": "dual-emission-example" } }
+        ]
+      },
+      "scopeSpans": [
+        {
+          "scope": { "name": "@raindrop-ai/ai-sdk", "version": "0.0.26" },
+          "spans": [
+            {
+              "traceId": "8351249bb0a5be11bd049b4a17a2bb64",
+              "spanId": "94df3ca0dc0ae7da",
+              "name": "search_docs",
+              "kind": 1,
+              "startTimeUnixNano": "1778181165000000000",
+              "endTimeUnixNano": "1778181166000000000",
+              "status": { "code": 1 },
+              "attributes": [
+                { "key": "raindrop.span.kind", "value": { "stringValue": "tool_call" } },
+                { "key": "raindrop.tool.name", "value": { "stringValue": "search_docs" } },
+                { "key": "raindrop.event.id", "value": { "stringValue": "evt_abc123" } },
+                { "key": "raindrop.event.name", "value": { "stringValue": "anthropic_chat" } },
+                { "key": "raindrop.user.id", "value": { "stringValue": "user_456" } },
+                { "key": "raindrop.convo.id", "value": { "stringValue": "conv_789" } },
+                { "key": "traceloop.span.kind", "value": { "stringValue": "tool" } },
+                { "key": "traceloop.entity.name", "value": { "stringValue": "search_docs" } },
+                { "key": "traceloop.association.properties.event_id", "value": { "stringValue": "evt_abc123" } },
+                { "key": "traceloop.association.properties.event_name", "value": { "stringValue": "anthropic_chat" } },
+                { "key": "traceloop.association.properties.user_id", "value": { "stringValue": "user_456" } },
+                { "key": "traceloop.association.properties.convo_id", "value": { "stringValue": "conv_789" } },
+                { "key": "ai.telemetry.metadata.raindrop.eventId", "value": { "stringValue": "evt_abc123" } },
+                { "key": "ai.telemetry.metadata.raindrop.eventName", "value": { "stringValue": "anthropic_chat" } },
+                { "key": "ai.telemetry.metadata.raindrop.userId", "value": { "stringValue": "user_456" } },
+                { "key": "ai.telemetry.metadata.raindrop.convoId", "value": { "stringValue": "conv_789" } },
+                { "key": "ai.toolCall.args", "value": { "stringValue": "{\"query\":\"compliance\"}" } },
+                { "key": "ai.toolCall.result", "value": { "stringValue": "[{\"id\":1,\"title\":\"Compliance Guide\"}]" } }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

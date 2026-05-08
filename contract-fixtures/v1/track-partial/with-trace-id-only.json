@@ -1,0 +1,10 @@
+{
+  "event": "trace_id_only",
+  "is_pending": false,
+  "properties": {
+    "trace_id": "8351249bb0a5be11bd049b4a17a2bb64"
+  },
+  "ai_data": {
+    "output": "Trace-only output (no event_id, just attach by trace_id)."
+  }
+}

@@ -1,0 +1,73 @@
+{
+  "resourceSpans": [
+    {
+      "resource": {
+        "attributes": [
+          { "key": "service.name", "value": { "stringValue": "anthropic-chat-example" } }
+        ]
+      },
+      "scopeSpans": [
+        {
+          "scope": { "name": "@raindrop-ai/ai-sdk", "version": "0.0.26" },
+          "spans": [
+            {
+              "traceId": "8351249bb0a5be11bd049b4a17a2bb64",
+              "spanId": "0102030405060708",
+              "name": "ai.streamText",
+              "kind": 1,
+              "startTimeUnixNano": "1778181160000000000",
+              "endTimeUnixNano": "1778181170000000000",
+              "status": { "code": 1 },
+              "attributes": [
+                { "key": "raindrop.span.kind", "value": { "stringValue": "agent_root" } },
+                { "key": "raindrop.event.id", "value": { "stringValue": "evt_abc123" } },
+                { "key": "raindrop.event.name", "value": { "stringValue": "anthropic_chat" } },
+                { "key": "raindrop.user.id", "value": { "stringValue": "user_456" } },
+                { "key": "raindrop.workspace.id", "value": { "stringValue": "ws_dawn" } },
+                { "key": "raindrop.workspace.name", "value": { "stringValue": "dawn" } },
+                { "key": "raindrop.workspace.root", "value": { "stringValue": "/Users/dev/dawn" } }
+              ]
+            },
+            {
+              "traceId": "8351249bb0a5be11bd049b4a17a2bb64",
+              "spanId": "b5e012f33a8d11cc",
+              "parentSpanId": "0102030405060708",
+              "name": "ai.streamText.doStream",
+              "kind": 1,
+              "startTimeUnixNano": "1778181161000000000",
+              "endTimeUnixNano": "1778181164000000000",
+              "status": { "code": 1 },
+              "attributes": [
+                { "key": "raindrop.span.kind", "value": { "stringValue": "llm_call" } },
+                { "key": "raindrop.event.id", "value": { "stringValue": "evt_abc123" } },
+                { "key": "ai.model.id", "value": { "stringValue": "claude-sonnet-4-6" } },
+                { "key": "ai.model.provider", "value": { "stringValue": "anthropic" } },
+                { "key": "ai.prompt", "value": { "stringValue": "{\"messages\":[{\"role\":\"user\",\"content\":\"Search for compliance docs.\"}]}" } },
+                { "key": "ai.result.text", "value": { "stringValue": "Looking up..." } },
+                { "key": "ai.usage.inputTokens", "value": { "intValue": "80" } },
+                { "key": "ai.usage.outputTokens", "value": { "intValue": "12" } }
+              ]
+            },
+            {
+              "traceId": "8351249bb0a5be11bd049b4a17a2bb64",
+              "spanId": "94df3ca0dc0ae7da",
+              "parentSpanId": "0102030405060708",
+              "name": "search_docs",
+              "kind": 1,
+              "startTimeUnixNano": "1778181165000000000",
+              "endTimeUnixNano": "1778181166000000000",
+              "status": { "code": 1 },
+              "attributes": [
+                { "key": "raindrop.span.kind", "value": { "stringValue": "tool_call" } },
+                { "key": "raindrop.tool.name", "value": { "stringValue": "search_docs" } },
+                { "key": "raindrop.event.id", "value": { "stringValue": "evt_abc123" } },
+                { "key": "ai.toolCall.args", "value": { "stringValue": "{\"query\":\"compliance\"}" } },
+                { "key": "ai.toolCall.result", "value": { "stringValue": "[{\"id\":1,\"title\":\"Compliance Guide\"}]" } }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

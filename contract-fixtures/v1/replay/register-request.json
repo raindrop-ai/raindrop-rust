@@ -1,0 +1,12 @@
+{
+  "workspace_id": "ws_dawn",
+  "event_name": "anthropic_chat",
+  "repo_path": "/Users/dev/dawn",
+  "url": "http://localhost:3001/replay",
+  "health_url": "http://localhost:3001/health",
+  "start_command": "pnpm replay-server",
+  "context_from_trace": {
+    "tenantId": "ai.telemetry.metadata.raindrop.properties.tenantId",
+    "userId": "raindrop.user.id"
+  }
+}

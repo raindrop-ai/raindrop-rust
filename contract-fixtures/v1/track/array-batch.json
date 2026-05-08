@@ -1,0 +1,26 @@
+[
+  {
+    "event_id": "evt_track_a",
+    "event": "anthropic_chat",
+    "user_id": "user_a",
+    "timestamp": "2026-05-07T19:00:01.000Z",
+    "is_pending": false,
+    "ai_data": {
+      "model": "claude-sonnet-4-6",
+      "input": "in_a",
+      "output": "out_a"
+    }
+  },
+  {
+    "event_id": "evt_track_b",
+    "event": "anthropic_chat",
+    "user_id": "user_b",
+    "timestamp": "2026-05-07T19:00:02.000Z",
+    "is_pending": false,
+    "ai_data": {
+      "model": "claude-sonnet-4-6",
+      "input": "in_b",
+      "output": "out_b"
+    }
+  }
+]

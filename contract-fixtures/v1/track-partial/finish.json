@@ -1,0 +1,12 @@
+{
+  "event_id": "evt_abc123",
+  "event": "anthropic_chat",
+  "is_pending": false,
+  "ai_data": {
+    "model": "claude-sonnet-4-6",
+    "output": "The rollout is high risk until compliance gates close."
+  },
+  "properties": {
+    "trace_id": "8351249bb0a5be11bd049b4a17a2bb64"
+  }
+}

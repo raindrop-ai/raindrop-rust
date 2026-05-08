@@ -1,0 +1,13 @@
+{
+  "event_id": "evt_abc123",
+  "event": "anthropic_chat",
+  "user_id": "user_456",
+  "timestamp": "2026-05-07T19:00:00.000Z",
+  "is_pending": false,
+  "ai_data": {
+    "model": "claude-sonnet-4-6",
+    "input": "Review account risk for tenant 42.",
+    "output": "Risk is HIGH until compliance gates close.",
+    "convo_id": "conv_789"
+  }
+}
