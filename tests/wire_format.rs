@@ -553,9 +553,9 @@ async fn plain_span_passes_has_ai_operation_filter_via_traceloop_event_id() {
     );
     assert_eq!(assoc_event_id["stringValue"], "evt_filter");
 
-    // Legacy fallback attribute should also still be present for backward compat
-    let legacy = span_attr(span_json, "ai.telemetry.metadata.raindrop.eventId").unwrap();
-    assert_eq!(legacy["stringValue"], "evt_filter");
+    // The Vercel AI SDK metadata namespace mirror should also be present.
+    let ai_sdk_md = span_attr(span_json, "ai.telemetry.metadata.raindrop.eventId").unwrap();
+    assert_eq!(ai_sdk_md["stringValue"], "evt_filter");
 }
 
 /// Spans started from an Interaction inherit user_id, convo_id, and event as
@@ -1386,15 +1386,16 @@ async fn parent_child_spans_share_trace_id_and_link_via_parent_span_id() {
 }
 
 // ────────────────────────────────────────────────────────────────────────────────────
-// Contract v1 canonical attributes — emitted alongside the legacy keys.
+// Contract v1 canonical attributes — emitted alongside the upstream-owned namespaces.
 // ────────────────────────────────────────────────────────────────────────────────────
 
 /// Plain spans with an `event_id` MUST emit the canonical `raindrop.event.id`
-/// attribute alongside the legacy `ai.telemetry.metadata.raindrop.eventId` and
-/// `traceloop.association.properties.event_id` attrs. Workshop's parser prefers
-/// the canonical key; dawn ingestion still reads the legacy keys.
+/// attribute alongside `ai.telemetry.metadata.raindrop.eventId` (Vercel AI SDK
+/// metadata namespace) and `traceloop.association.properties.event_id`
+/// (Traceloop OpenLLMetry namespace). Workshop's parser reads the canonical key
+/// preferentially; dawn ingestion continues to read the upstream namespaces.
 #[tokio::test]
-async fn span_emits_canonical_raindrop_event_id_alongside_legacy_keys() {
+async fn span_emits_canonical_raindrop_event_id_alongside_upstream_namespaces() {
     let server = MockServer::start().await;
     let trace_recorder = mount_path(&server, "POST", "/traces").await;
     let client = fast_client_builder(&server).build().expect("build");
@@ -1412,19 +1413,19 @@ async fn span_emits_canonical_raindrop_event_id_alongside_legacy_keys() {
     let span_json = &spans_of(&payload)[0];
 
     let canonical = span_attr(span_json, "raindrop.event.id")
-        .expect("raindrop.event.id MUST be emitted alongside legacy keys");
+        .expect("raindrop.event.id MUST be emitted alongside the upstream namespaces");
     assert_eq!(canonical["stringValue"], "evt_canon");
 
-    // Legacy keys must still be there (dawn ingestion reads them).
-    let legacy_ai = span_attr(span_json, "ai.telemetry.metadata.raindrop.eventId").unwrap();
-    assert_eq!(legacy_ai["stringValue"], "evt_canon");
-    let legacy_traceloop =
+    // Upstream-owned namespaces must still be there (dawn ingestion reads them).
+    let ai_sdk_md = span_attr(span_json, "ai.telemetry.metadata.raindrop.eventId").unwrap();
+    assert_eq!(ai_sdk_md["stringValue"], "evt_canon");
+    let traceloop_props =
         span_attr(span_json, "traceloop.association.properties.event_id").unwrap();
-    assert_eq!(legacy_traceloop["stringValue"], "evt_canon");
+    assert_eq!(traceloop_props["stringValue"], "evt_canon");
 }
 
 /// Tool spans get the canonical `raindrop.span.kind = tool_call` and
-/// `raindrop.tool.name` keys alongside the legacy traceloop keys.
+/// `raindrop.tool.name` keys alongside the upstream-owned Traceloop attributes.
 #[tokio::test]
 async fn tool_span_emits_canonical_raindrop_span_kind_and_tool_name() {
     let server = MockServer::start().await;

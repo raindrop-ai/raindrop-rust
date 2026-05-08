@@ -140,7 +140,9 @@ pub mod ai_sdk_metadata {
     pub const PROPERTIES: &str = "ai.telemetry.metadata.raindrop.properties";
 }
 
-/// Legacy `traceloop.*` keys consumed by the dawn backend.
+/// Traceloop OpenLLMetry attribute namespace (`traceloop.association.properties.*`).
+/// Upstream-owned convention; the `dawn` ingestion kernel reads these in
+/// addition to the canonical `raindrop.*` namespace.
 pub mod traceloop_props {
     pub const SPAN_KIND: &str = "traceloop.span.kind";
     pub const EVENT_ID: &str = "traceloop.association.properties.event_id";
@@ -151,7 +153,8 @@ pub mod traceloop_props {
 }
 
 /// Build the OTLP attribute set for a Raindrop-instrumented span, emitting
-/// **both** the new `raindrop.*` keys **and** the historical legacy keys.
+/// the canonical `raindrop.*` keys alongside the upstream-owned namespaces
+/// (Vercel AI SDK metadata + Traceloop association props).
 ///
 /// Mirrors `buildRaindropAttrs` in the TS contract. SDK call sites pass the
 /// resulting vec to whatever attribute builder they use (e.g. extending an
@@ -209,9 +212,9 @@ pub fn build_raindrop_attrs(meta: &RaindropMeta) -> Vec<Attribute> {
 }
 
 /// Build the **canonical-only** subset of attributes (just the `raindrop.*`
-/// keys, no legacy emissions). Used by call sites that already emit the
-/// legacy keys via a separate code path and only need the additive new
-/// namespace bolted on.
+/// keys, none of the upstream-owned namespaces). Used by call sites that
+/// already emit the AI-SDK and Traceloop attribute namespaces via a
+/// separate code path and only need the canonical layer bolted on.
 pub fn build_raindrop_canonical_attrs(meta: &RaindropMeta) -> Vec<Attribute> {
     let mut out: Vec<Attribute> = Vec::new();
     if let Some(kind) = meta.kind {
@@ -244,7 +247,9 @@ pub fn build_raindrop_canonical_attrs(meta: &RaindropMeta) -> Vec<Attribute> {
 }
 
 /// Read [`RaindropMeta`] from a flat OTLP-style attribute map, with the same
-/// canonical-then-legacy fallback ladder as the TS reader.
+/// canonical-then-upstream-namespace fallback ladder as the TS reader
+/// (`raindrop.*` first, then AI SDK metadata, then Traceloop association
+/// properties).
 pub fn read_raindrop_attrs(attrs: &HashMap<String, String>) -> RaindropMeta {
     let get = |k: &str| -> Option<String> {
         attrs

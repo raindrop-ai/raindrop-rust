@@ -51,7 +51,7 @@ fn span_kind_serializes_to_canonical_wire_strings() {
 }
 
 #[test]
-fn build_raindrop_attrs_emits_canonical_alongside_legacy_keys() {
+fn build_raindrop_attrs_emits_canonical_alongside_upstream_namespaces() {
     let meta = RaindropMeta {
         kind: Some(RaindropSpanKind::LlmCall),
         event_id: Some("evt_1".into()),
@@ -69,7 +69,7 @@ fn build_raindrop_attrs_emits_canonical_alongside_legacy_keys() {
     let attrs = build_raindrop_attrs(&meta);
     let pairs = key_value_pairs(&attrs);
 
-    // Span kind: canonical + legacy traceloop.
+    // Span kind: canonical + Traceloop mapping.
     assert!(pairs.contains(&(attr_keys::SPAN_KIND, "llm_call")));
     assert!(pairs.contains(&(traceloop_props::SPAN_KIND, "llm")));
 
@@ -89,7 +89,7 @@ fn build_raindrop_attrs_emits_canonical_alongside_legacy_keys() {
     assert!(pairs.contains(&(attr_keys::CONVO_ID, "c")));
     assert!(pairs.contains(&(traceloop_props::CONVO_ID, "c")));
 
-    // workspace canonical-only (no legacy mapping for workspace).
+    // workspace canonical-only (no upstream namespace mirror for workspace).
     assert!(pairs.contains(&(attr_keys::WORKSPACE_ID, "ws_1")));
     assert!(pairs.contains(&(attr_keys::WORKSPACE_NAME, "ws")));
     assert!(pairs.contains(&(attr_keys::WORKSPACE_ROOT, "/r")));
@@ -134,7 +134,7 @@ fn build_raindrop_canonical_attrs_emits_only_new_namespace() {
     for k in &keys {
         assert!(
             k.starts_with("raindrop."),
-            "canonical builder must NOT emit legacy keys, got {}",
+            "canonical builder must NOT emit upstream-namespace keys, got {}",
             k
         );
     }
@@ -161,7 +161,7 @@ fn read_raindrop_attrs_falls_back_to_ai_sdk_then_traceloop() {
     assert_eq!(
         meta.event_id.as_deref(),
         Some("ai_sdk"),
-        "ai-sdk legacy key wins over traceloop legacy key"
+        "ai-sdk metadata namespace wins over traceloop association properties"
     );
 
     attrs.remove(ai_sdk_metadata::EVENT_ID);

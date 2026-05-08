@@ -251,9 +251,10 @@ impl Span {
                         &inner.event_id,
                     )));
                 }
-                // Canonical contract-v1 attribute. Emitted ALONGSIDE the legacy
-                // keys above; Workshop's parser prefers this one. Production
-                // dawn ingestion still reads the legacy keys, so we emit both.
+                // Canonical contract-v1 attribute. Emitted alongside the
+                // upstream-owned `traceloop.association.properties.event_id`
+                // above; Workshop reads the canonical key preferentially while
+                // dawn ingestion continues to read the upstream namespace.
                 attributes.push(OtlpKeyValue::from(Attribute::string(
                     raindrop_attr_keys::EVENT_ID,
                     &inner.event_id,
@@ -437,10 +438,11 @@ impl Tracer {
 }
 
 /// Build the standard set of tool attributes (kind, name, input/output, duration, association
-/// properties). Emits both the legacy `traceloop.*` keys and the canonical
-/// contract-v1 `raindrop.span.kind = "tool_call"` + `raindrop.tool.name` keys
-/// so Workshop's parser sees the new namespace and dawn ingestion still passes
-/// the `hasAIOperation` filter via the legacy keys.
+/// properties). Emits the upstream-owned Traceloop attributes (`traceloop.*`)
+/// alongside the canonical contract-v1 `raindrop.span.kind = "tool_call"` +
+/// `raindrop.tool.name` keys so Workshop's parser reads the canonical
+/// namespace while dawn ingestion's `hasAIOperation` filter passes via the
+/// Traceloop keys.
 pub(crate) fn build_tool_attributes(
     name: &str,
     input: Option<&Value>,

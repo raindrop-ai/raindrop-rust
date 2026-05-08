@@ -12,7 +12,7 @@ fn returns_none_when_no_replay_attrs_present() {
 }
 
 #[test]
-fn prefers_canonical_attr_over_legacy() {
+fn prefers_canonical_attr_over_upstream_namespaces() {
     let mut attrs = HashMap::new();
     attrs.insert(attr_keys::REPLAY_RUN_ID.into(), "canonical".into());
     attrs.insert(ai_sdk_metadata::REPLAY_RUN_ID.into(), "ai_sdk".into());
@@ -85,6 +85,6 @@ fn empty_string_attribute_value_is_treated_as_missing() {
     assert_eq!(
         read_replay_run_id_from_attrs(&attrs).as_deref(),
         Some("ai_sdk"),
-        "empty canonical attribute should fall through to legacy keys"
+        "empty canonical attribute should fall through to the upstream namespace"
     );
 }
