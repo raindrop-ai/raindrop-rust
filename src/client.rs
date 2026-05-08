@@ -9,7 +9,9 @@ use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
 use crate::buffer::{EventBuffer, EventPatch};
-use crate::contract::v1::workshop_detection::{resolve_workshop_url, WorkshopUrlOptions};
+use crate::contract::v1::workshop_detection::{
+    resolve_workshop_url, sanitize_workshop_url_for_log, WorkshopUrlOptions,
+};
 use crate::contract::v1::workspace::{read_workspace_metadata_from_env, LocalWorkspaceMetadata};
 use crate::error::{Error, Result};
 use crate::events::{AiEvent, BeginOptions, Event, FinishOptions, Interaction, PatchOptions};
@@ -97,12 +99,27 @@ impl ClientInner {
                 .send()
                 .await;
             if debug {
+                // Strip userinfo (`user:pass@`) from the URL before logging so
+                // a `RAINDROP_LOCAL_DEBUGGER=http://user:secret@host/...` value
+                // never leaks into log shippers. Mirrors the python SDK's
+                // `_sanitize_url_for_log` parity test.
+                let safe_url = sanitize_workshop_url_for_log(&url);
                 match res {
                     Ok(r) => {
-                        tracing::debug!(url = %url, status = r.status().as_u16(), "raindrop: workshop mirror sent")
+                        tracing::debug!(url = %safe_url, status = r.status().as_u16(), "raindrop: workshop mirror sent")
                     }
                     Err(err) => {
-                        tracing::debug!(url = %url, error = %err, "raindrop: workshop mirror failed (swallowed)")
+                        // `reqwest::Error`'s `Display` includes the request URL
+                        // on connection errors, which would re-leak userinfo.
+                        // Re-render the error string with the userinfo-bearing
+                        // URL substring replaced by the sanitized one.
+                        let raw_err = err.to_string();
+                        let safe_err = if raw_err.contains(&url) {
+                            raw_err.replace(&url, &safe_url)
+                        } else {
+                            raw_err
+                        };
+                        tracing::debug!(url = %safe_url, error = %safe_err, "raindrop: workshop mirror failed (swallowed)")
                     }
                 }
             } else {

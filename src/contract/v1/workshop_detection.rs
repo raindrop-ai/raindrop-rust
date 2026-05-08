@@ -39,6 +39,48 @@ pub fn normalize_workshop_base_url(url: &str) -> String {
     }
 }
 
+/// Strip the `userinfo` component (`user:pass@`) from a URL before logging it.
+///
+/// Workshop URLs come from env vars (`RAINDROP_LOCAL_DEBUGGER` /
+/// `RAINDROP_WORKSHOP`) or the `Client::builder().workshop_url(...)` option, so
+/// they MAY include `http://user:pass@host/...` style credentials we don't
+/// want to leak into centralized logs even at debug level. Mirrors the
+/// `_sanitize_url_for_log` helper in the python SDK
+/// (`raindrop/analytics.py::_sanitize_url_for_log`).
+///
+/// Best-effort: on any unexpected shape returns the literal `"<workshop-url>"`
+/// rather than risk emitting userinfo. Output is `scheme://host[:port]/path`
+/// (query / fragment preserved).
+pub fn sanitize_workshop_url_for_log(url: &str) -> String {
+    const FALLBACK: &str = "<workshop-url>";
+
+    // Split scheme.
+    let (scheme, rest) = match url.split_once("://") {
+        Some(parts) => parts,
+        None => return FALLBACK.to_string(),
+    };
+    if scheme.is_empty() || rest.is_empty() {
+        return FALLBACK.to_string();
+    }
+
+    // Split authority from the rest of the URL at the first '/', '?', or '#'.
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, path_query_fragment) = rest.split_at(authority_end);
+
+    // Drop userinfo: keep only the part after the LAST '@' in the authority.
+    // (`user:p@ss@host` is malformed; preferring last-'@' matches RFC 3986
+    // §3.2.1 host parsing.)
+    let host_and_port = match authority.rsplit_once('@') {
+        Some((_userinfo, host)) => host,
+        None => authority,
+    };
+    if host_and_port.is_empty() {
+        return FALLBACK.to_string();
+    }
+
+    format!("{}://{}{}", scheme, host_and_port, path_query_fragment)
+}
+
 fn read_env_var(name: &str) -> Option<String> {
     match std::env::var(name) {
         Ok(v) if !v.is_empty() => Some(v),
@@ -130,4 +172,71 @@ pub fn resolve_workshop_url(opts: WorkshopUrlOptions) -> Option<String> {
         return Some(DEFAULT_WORKSHOP_URL.to_string());
     }
     None
+}
+
+#[cfg(test)]
+mod sanitize_tests {
+    use super::sanitize_workshop_url_for_log;
+
+    #[test]
+    fn strips_userinfo_with_password() {
+        assert_eq!(
+            sanitize_workshop_url_for_log("http://user:secret@workshop.local/v1/"),
+            "http://workshop.local/v1/"
+        );
+    }
+
+    #[test]
+    fn strips_userinfo_without_password() {
+        assert_eq!(
+            sanitize_workshop_url_for_log("https://token@host:8080/v1/"),
+            "https://host:8080/v1/"
+        );
+    }
+
+    #[test]
+    fn passes_through_url_without_userinfo() {
+        assert_eq!(
+            sanitize_workshop_url_for_log("http://localhost:5899/v1/"),
+            "http://localhost:5899/v1/"
+        );
+    }
+
+    #[test]
+    fn preserves_query_and_fragment() {
+        assert_eq!(
+            sanitize_workshop_url_for_log("http://u:p@h/path?a=1&b=2#frag"),
+            "http://h/path?a=1&b=2#frag"
+        );
+    }
+
+    #[test]
+    fn handles_at_in_path_after_authority() {
+        // `@` inside the path must not be treated as userinfo.
+        assert_eq!(
+            sanitize_workshop_url_for_log("http://h/path/with@symbol"),
+            "http://h/path/with@symbol"
+        );
+    }
+
+    #[test]
+    fn falls_back_on_missing_scheme() {
+        assert_eq!(
+            sanitize_workshop_url_for_log("user:pass@host/v1/"),
+            "<workshop-url>"
+        );
+    }
+
+    #[test]
+    fn falls_back_on_empty_authority() {
+        assert_eq!(sanitize_workshop_url_for_log("http://"), "<workshop-url>");
+    }
+
+    #[test]
+    fn falls_back_on_empty_host_after_userinfo() {
+        assert_eq!(
+            sanitize_workshop_url_for_log("http://user:pass@/path"),
+            "<workshop-url>"
+        );
+    }
 }

@@ -41,8 +41,8 @@ pub use live::{validate_live_event, LiveEvent, LiveEventType, LiveEventValidatio
 pub use replay::read_replay_run_id_from_attrs;
 pub use track::{TrackAiData, TrackAttachment, TrackBody, TrackEvent, TrackProperties};
 pub use workshop_detection::{
-    normalize_workshop_base_url, resolve_workshop_url, WorkshopUrlOptions, DEFAULT_WORKSHOP_URL,
-    LOCAL_DEBUGGER_ENV_VAR, WORKSHOP_ENV_VAR,
+    normalize_workshop_base_url, resolve_workshop_url, sanitize_workshop_url_for_log,
+    WorkshopUrlOptions, DEFAULT_WORKSHOP_URL, LOCAL_DEBUGGER_ENV_VAR, WORKSHOP_ENV_VAR,
 };
 pub use workspace::{
     read_workspace_metadata_from_env, LocalWorkspaceMetadata, WORKSPACE_ID_ENV_VAR,

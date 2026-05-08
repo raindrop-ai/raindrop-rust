@@ -241,6 +241,232 @@ impl wiremock::Respond for HeaderRecorder {
     }
 }
 
+/// Records every header on every request, used by the bearer-leak parity test.
+#[derive(Default, Clone)]
+struct AllHeadersRecorder {
+    requests: std::sync::Arc<std::sync::Mutex<Vec<std::collections::HashMap<String, String>>>>,
+}
+
+impl AllHeadersRecorder {
+    fn requests(&self) -> Vec<std::collections::HashMap<String, String>> {
+        self.requests.lock().unwrap().clone()
+    }
+    fn count(&self) -> usize {
+        self.requests.lock().unwrap().len()
+    }
+    async fn wait_for(&self, n: usize, timeout: Duration) {
+        let deadline = std::time::Instant::now() + timeout;
+        while self.count() < n && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+}
+
+impl wiremock::Respond for AllHeadersRecorder {
+    fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+        let mut map = std::collections::HashMap::new();
+        for (name, value) in request.headers.iter() {
+            if let Ok(v) = value.to_str() {
+                map.insert(name.as_str().to_ascii_lowercase(), v.to_string());
+            }
+        }
+        self.requests.lock().unwrap().push(map);
+        ResponseTemplate::new(204)
+    }
+}
+
+/// Parity with python-sdk `test_mirror_does_not_forward_cloud_bearer_token`:
+/// the local Workshop daemon mirror MUST NOT carry the cloud `write_key`.
+/// Mirror URLs are env- / option-driven and sit outside the cloud trust
+/// boundary; forwarding the bearer to a mirror host the user (or an attacker)
+/// controls is a credential-exfiltration vector.
+#[tokio::test]
+async fn workshop_mirror_does_not_forward_cloud_bearer_token() {
+    let cloud = MockServer::start().await;
+    let workshop = MockServer::start().await;
+
+    let cloud_headers = AllHeadersRecorder::default();
+    Mock::given(method("POST"))
+        .and(path("/events/track_partial"))
+        .respond_with(cloud_headers.clone())
+        .mount(&cloud)
+        .await;
+
+    let workshop_headers = AllHeadersRecorder::default();
+    Mock::given(method("POST"))
+        .and(path("/events/track_partial"))
+        .respond_with(workshop_headers.clone())
+        .mount(&workshop)
+        .await;
+
+    let client = build_client(&cloud, format!("{}/", workshop.uri()));
+    client
+        .track_ai(AiEvent {
+            user_id: "u".into(),
+            input: "x".into(),
+            output: "y".into(),
+            ..Default::default()
+        })
+        .await
+        .expect("track_ai");
+    client.close().await.expect("close");
+
+    workshop_headers.wait_for(1, Duration::from_secs(2)).await;
+    assert_eq!(cloud_headers.count(), 1, "cloud got the request");
+    assert_eq!(
+        workshop_headers.count(),
+        1,
+        "workshop got the mirrored request"
+    );
+
+    let cloud_req = &cloud_headers.requests()[0];
+    let workshop_req = &workshop_headers.requests()[0];
+
+    assert_eq!(
+        cloud_req.get("authorization").map(String::as_str),
+        Some("Bearer rk_test"),
+        "cloud path MUST carry the bearer write_key"
+    );
+    assert!(
+        !workshop_req.contains_key("authorization"),
+        "Workshop mirror MUST NOT carry the cloud bearer; got headers={workshop_req:?}",
+    );
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Userinfo log-sanitization parity test
+// (python-sdk: `test_mirror_failure_log_strips_url_userinfo`)
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Append-only log capture installed once as the global tracing default for
+/// this test binary. Every test in this file shares the buffer; tests assert
+/// against unique markers (e.g. a per-test secret string) to avoid coupling.
+#[derive(Clone, Default)]
+struct LogCapture {
+    buf: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+}
+
+impl LogCapture {
+    fn snapshot(&self) -> String {
+        String::from_utf8_lossy(&self.buf.lock().unwrap()).to_string()
+    }
+}
+
+struct LogWriter {
+    buf: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+}
+
+impl std::io::Write for LogWriter {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.buf.lock().unwrap().extend_from_slice(b);
+        Ok(b.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
+    type Writer = LogWriter;
+    fn make_writer(&'a self) -> Self::Writer {
+        LogWriter {
+            buf: self.buf.clone(),
+        }
+    }
+}
+
+static GLOBAL_LOG_CAPTURE: std::sync::OnceLock<LogCapture> = std::sync::OnceLock::new();
+
+fn ensure_log_capture() -> LogCapture {
+    GLOBAL_LOG_CAPTURE
+        .get_or_init(|| {
+            let capture = LogCapture::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(capture.clone())
+                .with_max_level(tracing::Level::DEBUG)
+                .with_ansi(false)
+                .with_target(false)
+                .finish();
+            // First-call wins; if some other test in this binary already
+            // installed a global subscriber the call returns Err and we still
+            // hand back the capture (the tests gracefully no-op on empty).
+            let _ = tracing::subscriber::set_global_default(subscriber);
+            capture
+        })
+        .clone()
+}
+
+#[tokio::test]
+async fn workshop_mirror_failure_log_strips_url_userinfo() {
+    let capture = ensure_log_capture();
+
+    // Snapshot the buffer length so we only assert on lines emitted from this
+    // test's fire-and-forget mirror task.
+    let baseline = capture.snapshot().len();
+
+    let cloud = MockServer::start().await;
+    let _cloud_recorder = mount_path(&cloud, "POST", "/events/track_partial").await;
+
+    // Use a port we know nothing is listening on so the mirror request fails
+    // and the failure-log path runs. The credentials we never want to see in
+    // logs are `mirror_user:mirror_secret_value_42`.
+    let workshop_url = "http://mirror_user:mirror_secret_value_42@127.0.0.1:1/v1/".to_string();
+
+    let client = raindrop::Client::builder()
+        .write_key("rk_test")
+        .endpoint(format!("{}/", cloud.uri()))
+        .partial_flush_interval(Duration::ZERO)
+        .trace_flush_interval(Duration::ZERO)
+        .base_delay(Duration::from_millis(1))
+        .jitter_fraction(0.0)
+        .debug(true)
+        .workshop_url(workshop_url)
+        .build()
+        .expect("build");
+
+    client
+        .track_ai(AiEvent {
+            user_id: "u".into(),
+            input: "x".into(),
+            output: "y".into(),
+            ..Default::default()
+        })
+        .await
+        .expect("track_ai must succeed even when workshop is unreachable");
+    client.close().await.expect("close");
+
+    // Give the spawned mirror task time to fail and emit its debug log.
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while std::time::Instant::now() < deadline {
+        let snap = capture.snapshot();
+        let new_lines = &snap[baseline.min(snap.len())..];
+        if new_lines.contains("workshop mirror") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let snap = capture.snapshot();
+    let new_lines = &snap[baseline.min(snap.len())..];
+
+    assert!(
+        new_lines.contains("workshop mirror"),
+        "expected a `workshop mirror` debug log line; captured (post-baseline) was: {new_lines:?}",
+    );
+    assert!(
+        !new_lines.contains("mirror_secret_value_42"),
+        "userinfo password leaked into debug logs: {new_lines:?}",
+    );
+    assert!(
+        !new_lines.contains("mirror_user:mirror_secret_value_42"),
+        "full userinfo leaked into debug logs: {new_lines:?}",
+    );
+    assert!(
+        !new_lines.contains("mirror_user@"),
+        "userinfo username leaked into debug logs: {new_lines:?}",
+    );
+}
+
 #[tokio::test]
 async fn workshop_mirror_carries_workspace_property_when_set() {
     let cloud = MockServer::start().await;
