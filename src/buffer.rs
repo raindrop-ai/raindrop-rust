@@ -180,6 +180,12 @@ impl EventBuffer {
         // Mirror to local Workshop daemon BEFORE the cloud call so a slow cloud
         // round-trip doesn't delay the live UI. Both calls are independent —
         // mirror failures are swallowed inside `mirror_to_workshop`.
+        //
+        // Retry semantics: when the cloud post fails the patch is restored and
+        // the next periodic tick (or explicit flush) will re-build a payload
+        // and re-mirror it, so Workshop sees one mirror per cloud attempt
+        // (mirror count = retries + 1). Workshop is expected to dedupe by
+        // `event_id`; the cloud path is the source of truth.
         client.mirror_to_workshop("events/track_partial", &payload);
 
         match client

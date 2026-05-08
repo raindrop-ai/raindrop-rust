@@ -35,7 +35,7 @@ pub fn normalize_workshop_base_url(url: &str) -> String {
     if url.ends_with('/') {
         url.to_string()
     } else {
-        format!("{}/", url)
+        format!("{url}/")
     }
 }
 
@@ -78,7 +78,7 @@ pub fn sanitize_workshop_url_for_log(url: &str) -> String {
         return FALLBACK.to_string();
     }
 
-    format!("{}://{}{}", scheme, host_and_port, path_query_fragment)
+    format!("{scheme}://{host_and_port}{path_query_fragment}")
 }
 
 fn read_env_var(name: &str) -> Option<String> {
@@ -113,6 +113,16 @@ fn read_workshop_env() -> Option<WorkshopEnv> {
     None
 }
 
+/// Heuristic: should the SDK auto-enable Workshop mirroring when no explicit
+/// signal (env var, builder flag) is given?
+///
+/// Triggers on `NODE_ENV=development`, `PYTHON_ENV=development`, or an
+/// interactive (TTY-attached) stdout. Mirrors the TS contract.
+///
+/// Worst-case false positive (e.g. a container with `tty: true` in production)
+/// produces a fire-and-forget connection-refused per flush interval against
+/// `http://localhost:5899/v1/`; it never affects the cloud telemetry path
+/// because mirror failures are swallowed inside `mirror_to_workshop`.
 fn should_auto_enable_workshop() -> bool {
     if read_env_var("NODE_ENV").as_deref() == Some("development") {
         return true;

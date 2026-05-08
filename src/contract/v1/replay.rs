@@ -2,12 +2,13 @@
 //!
 //! Mirror of `@raindrop-ai/core/contract/v1/replay.ts`. When Workshop replays
 //! a trace it generates a `replayRunId` and expects the user's agent to echo
-//! it back via one of three paths so Workshop can stitch the new OTLP trace
+//! it back via one of four paths so Workshop can stitch the new OTLP trace
 //! to the replay attempt:
 //!
 //!   1. canonical attribute  — `raindrop.replay.run_id`
 //!   2. AI-SDK metadata      — `ai.telemetry.metadata.raindrop.replayRunId`
-//!   3. JSON properties blob — `ai.telemetry.metadata.raindrop.properties`
+//!   3. Traceloop association — `traceloop.association.properties.replayRunId`
+//!   4. JSON properties blob — `ai.telemetry.metadata.raindrop.properties`
 //!      with `{"replayRunId": "..."}` (works for SDKs that only expose a
 //!      free-form properties blob)
 

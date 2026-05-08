@@ -70,6 +70,15 @@ impl RaindropSpanKind {
         }
     }
 
+    /// Parse a Traceloop span kind. The Traceloop namespace only has 3 kinds
+    /// (`workflow` / `llm` / `tool`), so this mapping is information-lossy on
+    /// the [`Trace`](Self::Trace) leg: both [`AgentRoot`](Self::AgentRoot) and
+    /// [`Trace`](Self::Trace) emit `"workflow"` via
+    /// [`as_traceloop_str`](Self::as_traceloop_str), and this reader collapses
+    /// `"workflow"` to [`AgentRoot`](Self::AgentRoot). Callers who need to
+    /// preserve the [`AgentRoot`](Self::AgentRoot)/[`Trace`](Self::Trace)
+    /// distinction must read the canonical
+    /// [`SPAN_KIND`](super::attr_keys::SPAN_KIND) attribute, which IS distinct.
     fn from_traceloop(s: &str) -> Option<Self> {
         match s {
             "llm" => Some(RaindropSpanKind::LlmCall),
