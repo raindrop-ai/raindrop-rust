@@ -1085,7 +1085,6 @@ name = "raindrop-ai"
 version = "0.0.2"
 dependencies = [
  "base64",
- "futures",
  "rand 0.8.6",
  "reqwest",
  "serde",
