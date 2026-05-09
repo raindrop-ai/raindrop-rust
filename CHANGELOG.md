@@ -27,6 +27,23 @@ add `CRATES_IO_TOKEN` to repo secrets, and `cargo publish` (or re-introduce
 release-plz at that point — it's overkill until then).
 -->
 
+## [0.0.3] - 2026-05-09
+
+Dependency cleanup. No consumer-facing API or feature-flag changes.
+
+### Changed
+
+- **Drop the `futures` umbrella dependency.** The crate previously pulled
+  `futures = "0.3"` (and its transitive `futures-channel`,
+  `futures-executor`, `futures-io`, `futures-macro`, `futures-sink`,
+  `futures-task` sub-crates) just for one `futures::future::BoxFuture`
+  type alias inside an internal sleep-hook signature in `src/http.rs`.
+  Inline the underlying
+  `Pin<Box<dyn Future<Output = ()> + Send + 'static>>` directly so
+  consumers no longer pull `futures` (and its sub-crates) for one alias.
+  No public-API change — the `SleepFn` alias is a private (module-local)
+  type used only by the test-injection hook.
+
 ## [0.0.2] - 2026-05-07
 
 Dependency upgrade: bump `reqwest` from `0.12` to `0.13`. No consumer-facing
@@ -74,6 +91,7 @@ Initial **beta** release. The wire contract against the Raindrop ingestion API i
 - No client-side PII redaction (Python's `set_redact_pii` and JS's `redactPii` have no Rust equivalent yet).
 - No local-debugger mirroring (no `RAINDROP_LOCAL_DEBUGGER` support).
 
-[Unreleased]: https://github.com/raindrop-ai/raindrop-rust/compare/v0.0.2...HEAD
+[Unreleased]: https://github.com/raindrop-ai/raindrop-rust/compare/v0.0.3...HEAD
+[0.0.3]: https://github.com/raindrop-ai/raindrop-rust/compare/v0.0.2...v0.0.3
 [0.0.2]: https://github.com/raindrop-ai/raindrop-rust/compare/v0.0.1...v0.0.2
 [0.0.1]: https://github.com/raindrop-ai/raindrop-rust/releases/tag/v0.0.1
