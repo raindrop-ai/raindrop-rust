@@ -1,3 +1,5 @@
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -28,7 +30,8 @@ pub(crate) struct TransportConfig {
 }
 
 /// Hooks for tests to override sleep / jitter without monkey-patching.
-type SleepFn = Arc<dyn Fn(Duration) -> futures::future::BoxFuture<'static, ()> + Send + Sync>;
+type SleepFn =
+    Arc<dyn Fn(Duration) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> + Send + Sync>;
 type RandFn = Arc<dyn Fn() -> f64 + Send + Sync>;
 
 #[derive(Clone)]

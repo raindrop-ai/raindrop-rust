@@ -12,7 +12,7 @@ The official Rust SDK for [Raindrop AI](https://raindrop.ai) — track AI events
 
 ```toml
 [dependencies]
-raindrop-ai = { git = "https://github.com/raindrop-ai/raindrop-rust", tag = "v0.0.1" }
+raindrop-ai = { git = "https://github.com/raindrop-ai/raindrop-rust", tag = "v0.0.3" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 serde_json = "1"
 ```
