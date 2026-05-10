@@ -43,6 +43,7 @@ mod error;
 mod events;
 mod helpers;
 mod http;
+mod local_debugger;
 mod otlp;
 mod signals;
 mod trace_buffer;
@@ -53,6 +54,10 @@ pub use client::{Client, ClientBuilder};
 pub use error::{Error, Result};
 pub use events::{
     AiEvent, Attachment, BeginOptions, Event, FinishOptions, Interaction, PatchOptions,
+};
+pub use local_debugger::{
+    resolve_local_workshop_url, LocalWorkshopUrlConfig, DEFAULT_LOCAL_WORKSHOP_URL,
+    LOCAL_DEBUGGER_ENV_VAR, WORKSHOP_ENV_VAR,
 };
 pub use otlp::{Attribute, AttributeValue, SpanStatusCode};
 pub use signals::{Signal, SignalKind};

@@ -166,7 +166,9 @@ async fn poll_events(
 }
 
 fn build_client(write_key: &str) -> Client {
-    let mut builder = Client::builder().write_key(write_key);
+    let mut builder = Client::builder()
+        .write_key(write_key)
+        .disable_local_workshop();
     if let Ok(endpoint) = env::var("RAINDROP_ENDPOINT") {
         builder = builder.endpoint(endpoint);
     }

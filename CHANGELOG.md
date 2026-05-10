@@ -4,6 +4,23 @@ All notable changes to this crate are documented here. Format follows [Keep a Ch
 
 ## [Unreleased]
 
+### Added
+
+- **Local Workshop mirroring (`local_workshop_url`).** New additive config slot
+  for fanning every cloud-bound POST out to a local Raindrop Workshop daemon
+  in addition to (not instead of) the cloud endpoint. Resolution precedence,
+  highest first: `.local_workshop_url(...)` builder call → `.disable_local_workshop()`
+  builder call (explicit opt-out) → `RAINDROP_LOCAL_DEBUGGER` env (URL) →
+  `RAINDROP_WORKSHOP` env (URL or boolean truthy/falsy: `1`/`true`/`yes`/`on`
+  enables the default `http://localhost:5899/v1/`; `0`/`false`/`no`/`off`
+  disables) → 100 ms TCP probe of `127.0.0.1:5899` → disabled. Local POSTs use
+  a 2 s timeout, no retries, errors only at `tracing::debug!` so a missing
+  daemon never bubbles up. Mirrors the Python and TS contract (`raindrop-js`
+  PR #52, Python SDK `raindrop/local_debugger.py`).
+- **No-cloud-without-key.** Empty `write_key` + a resolved `local_workshop_url`
+  ships to local only and skips the cloud entirely; the no-key + no-local case
+  remains a no-op.
+
 <!--
 Release process (no automation; everything is manual + reviewable):
 

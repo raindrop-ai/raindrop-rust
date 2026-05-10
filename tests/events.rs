@@ -379,6 +379,7 @@ async fn noop_client_without_write_key_makes_no_requests() {
 
     let client = raindrop::Client::builder()
         .endpoint(format!("{}/", server.uri()))
+        .disable_local_workshop()
         .build()
         .expect("build");
 
@@ -412,7 +413,10 @@ async fn begin_on_disabled_client_returns_safe_interaction() {
     let server = MockServer::start().await;
     let _ = server; // not used; we just need an arbitrary endpoint
 
-    let client = raindrop::Client::builder().build().expect("build");
+    let client = raindrop::Client::builder()
+        .disable_local_workshop()
+        .build()
+        .expect("build");
     let interaction = client
         .begin(BeginOptions {
             user_id: "user-123".into(),
