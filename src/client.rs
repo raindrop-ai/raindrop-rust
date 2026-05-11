@@ -278,7 +278,9 @@ impl Client {
         ClientBuilder::default()
     }
 
-    /// Returns true if the client is enabled (i.e. has a non-empty write key).
+    /// Returns true if the client has at least one resolved destination —
+    /// either a non-empty write key (cloud) or a resolved
+    /// `local_workshop_url` (local Workshop mirror), or both.
     pub fn is_enabled(&self) -> bool {
         self.inner.enabled
     }
