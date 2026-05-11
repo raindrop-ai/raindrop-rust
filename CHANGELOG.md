@@ -4,23 +4,6 @@ All notable changes to this crate are documented here. Format follows [Keep a Ch
 
 ## [Unreleased]
 
-### Added
-
-- **Local Workshop mirroring (`local_workshop_url`).** New additive config slot
-  for fanning every cloud-bound POST out to a local Raindrop Workshop daemon
-  in addition to (not instead of) the cloud endpoint. Resolution precedence,
-  highest first: `.local_workshop_url(...)` builder call → `.disable_local_workshop()`
-  builder call (explicit opt-out) → `RAINDROP_LOCAL_DEBUGGER` env (URL) →
-  `RAINDROP_WORKSHOP` env (URL or boolean truthy/falsy: `1`/`true`/`yes`/`on`
-  enables the default `http://localhost:5899/v1/`; `0`/`false`/`no`/`off`
-  disables) → 100 ms TCP probe of `127.0.0.1:5899` → disabled. Local POSTs use
-  a 2 s timeout, no retries, errors only at `tracing::debug!` so a missing
-  daemon never bubbles up. Mirrors the Python and TS contract (`raindrop-js`
-  PR #52, Python SDK `raindrop/local_debugger.py`).
-- **No-cloud-without-key.** Empty `write_key` + a resolved `local_workshop_url`
-  ships to local only and skips the cloud entirely; the no-key + no-local case
-  remains a no-op.
-
 <!--
 Release process (no automation; everything is manual + reviewable):
 
@@ -43,6 +26,25 @@ When ready to publish to crates.io: flip `publish = true` in `Cargo.toml`,
 add `CRATES_IO_TOKEN` to repo secrets, and `cargo publish` (or re-introduce
 release-plz at that point — it's overkill until then).
 -->
+
+## [0.0.4] - 2026-05-11
+
+### Added
+
+- **Local Workshop mirroring (`local_workshop_url`).** New additive config slot
+  for fanning every cloud-bound POST out to a local Raindrop Workshop daemon
+  in addition to (not instead of) the cloud endpoint. Resolution precedence,
+  highest first: `.local_workshop_url(...)` builder call → `.disable_local_workshop()`
+  builder call (explicit opt-out) → `RAINDROP_LOCAL_DEBUGGER` env (URL) →
+  `RAINDROP_WORKSHOP` env (URL or boolean truthy/falsy: `1`/`true`/`yes`/`on`
+  enables the default `http://localhost:5899/v1/`; `0`/`false`/`no`/`off`
+  disables) → 100 ms TCP probe of `127.0.0.1:5899` → disabled. Local POSTs use
+  a 2 s timeout, no retries, errors only at `tracing::debug!` so a missing
+  daemon never bubbles up. Mirrors the Python and TS contract (`raindrop-js`
+  PR #52, Python SDK `raindrop/local_debugger.py`).
+- **No-cloud-without-key.** Empty `write_key` + a resolved `local_workshop_url`
+  ships to local only and skips the cloud entirely; the no-key + no-local case
+  remains a no-op.
 
 ## [0.0.3] - 2026-05-09
 
@@ -108,7 +110,8 @@ Initial **beta** release. The wire contract against the Raindrop ingestion API i
 - No client-side PII redaction (Python's `set_redact_pii` and JS's `redactPii` have no Rust equivalent yet).
 - No local-debugger mirroring (no `RAINDROP_LOCAL_DEBUGGER` support).
 
-[Unreleased]: https://github.com/raindrop-ai/raindrop-rust/compare/v0.0.3...HEAD
+[Unreleased]: https://github.com/raindrop-ai/raindrop-rust/compare/v0.0.4...HEAD
+[0.0.4]: https://github.com/raindrop-ai/raindrop-rust/compare/v0.0.3...v0.0.4
 [0.0.3]: https://github.com/raindrop-ai/raindrop-rust/compare/v0.0.2...v0.0.3
 [0.0.2]: https://github.com/raindrop-ai/raindrop-rust/compare/v0.0.1...v0.0.2
 [0.0.1]: https://github.com/raindrop-ai/raindrop-rust/releases/tag/v0.0.1
