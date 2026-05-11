@@ -123,7 +123,10 @@ async fn span_clone_shares_state() {
 
 #[tokio::test]
 async fn signals_skip_when_disabled() {
-    let client = raindrop::Client::builder().build().expect("build");
+    let client = raindrop::Client::builder()
+        .disable_local_workshop()
+        .build()
+        .expect("build");
     client
         .track_signal(raindrop::Signal {
             name: "thumbs_up".into(),
@@ -169,6 +172,7 @@ async fn periodic_trace_flush_batches_spans() {
     let client = raindrop::Client::builder()
         .write_key("rk_test")
         .endpoint(format!("{}/", server.uri()))
+        .disable_local_workshop()
         .partial_flush_interval(Duration::ZERO)
         .trace_flush_interval(Duration::from_millis(20))
         .trace_max_batch_size(100)

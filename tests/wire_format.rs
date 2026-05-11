@@ -1025,9 +1025,10 @@ async fn patch_with_explicit_is_pending_false_flushes_immediately() {
 async fn disabled_client_skips_every_endpoint() {
     let server = MockServer::start().await;
     let recorder = mount_any_post(&server).await;
-    // No write_key → disabled
+    // No write_key + explicit `.disable_local_workshop()` → fully disabled
     let client = raindrop::Client::builder()
         .endpoint(format!("{}/", server.uri()))
+        .disable_local_workshop()
         .build()
         .expect("build disabled client");
 

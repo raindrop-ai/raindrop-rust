@@ -164,6 +164,7 @@ async fn auth_header_uses_bearer_write_key() {
     let client = raindrop::Client::builder()
         .write_key("rk_secret_test")
         .endpoint(format!("{}/", server.uri()))
+        .disable_local_workshop()
         .partial_flush_interval(Duration::ZERO)
         .trace_flush_interval(Duration::ZERO)
         .build()
@@ -188,6 +189,7 @@ async fn endpoint_normalization_appends_slash() {
     let client = raindrop::Client::builder()
         .write_key("rk_test")
         .endpoint(server.uri()) // no trailing slash
+        .disable_local_workshop()
         .partial_flush_interval(Duration::ZERO)
         .trace_flush_interval(Duration::ZERO)
         .build()

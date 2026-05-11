@@ -12,6 +12,7 @@ pub fn fast_client_builder(server: &MockServer) -> ClientBuilder {
     Client::builder()
         .write_key("rk_test")
         .endpoint(format!("{}/", server.uri()))
+        .disable_local_workshop()
         .partial_flush_interval(Duration::ZERO)
         .trace_flush_interval(Duration::ZERO)
         .base_delay(Duration::from_millis(1))
@@ -22,10 +23,12 @@ pub fn fast_client_builder(server: &MockServer) -> ClientBuilder {
 pub struct Captured {
     #[allow(dead_code)]
     pub path: String,
+    #[allow(dead_code)]
     pub body: Vec<u8>,
 }
 
 impl Captured {
+    #[allow(dead_code)]
     pub fn json(&self) -> Value {
         serde_json::from_slice(&self.body).expect("captured body is not valid json")
     }
@@ -48,6 +51,7 @@ impl Recorder {
         self
     }
 
+    #[allow(dead_code)]
     pub fn requests(&self) -> Vec<Captured> {
         self.bodies.lock().unwrap().clone()
     }

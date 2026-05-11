@@ -13,6 +13,7 @@ use crate::error::{Error, Result};
 use crate::events::{AiEvent, BeginOptions, Event, FinishOptions, Interaction, PatchOptions};
 use crate::helpers::new_event_id;
 use crate::http::{format_endpoint, RetryingHttpClient, TransportConfig};
+use crate::local_debugger::{resolve_local_workshop_url, LocalWorkshopUrlConfig};
 use crate::otlp::{create_span_ids, Attribute, OtlpKeyValue, OtlpSpan, OtlpStatus};
 use crate::signals::{track_signal, Signal};
 use crate::trace_buffer::TraceBuffer;
@@ -57,6 +58,8 @@ pub struct Client {
 pub struct ClientBuilder {
     write_key: String,
     endpoint: String,
+    local_workshop_url_config: LocalWorkshopUrlConfig,
+    auto_detect_local_workshop: bool,
     debug: bool,
     partial_flush_interval: Duration,
     trace_flush_interval: Duration,
@@ -76,6 +79,8 @@ impl Default for ClientBuilder {
         Self {
             write_key: String::new(),
             endpoint: crate::DEFAULT_ENDPOINT.to_string(),
+            local_workshop_url_config: LocalWorkshopUrlConfig::Inherit,
+            auto_detect_local_workshop: true,
             debug: false,
             partial_flush_interval: Duration::from_secs(1),
             trace_flush_interval: Duration::from_secs(1),
@@ -102,6 +107,26 @@ impl ClientBuilder {
     /// Set the ingestion endpoint. Defaults to [`DEFAULT_ENDPOINT`](crate::DEFAULT_ENDPOINT).
     pub fn endpoint(mut self, endpoint: impl Into<String>) -> Self {
         self.endpoint = endpoint.into();
+        self
+    }
+
+    /// Mirror every cloud-bound POST to a local Raindrop Workshop daemon at
+    /// `url` (in addition to — not instead of — the cloud endpoint). Forces
+    /// the URL even when env vars or the TCP probe would resolve differently.
+    /// Pass a fully qualified base URL such as `http://localhost:5899/v1/`;
+    /// a trailing `/` is appended if missing.
+    pub fn local_workshop_url(mut self, url: impl Into<String>) -> Self {
+        self.local_workshop_url_config = LocalWorkshopUrlConfig::Url(url.into());
+        self
+    }
+
+    /// Explicitly disable local Workshop mirroring, suppressing both the
+    /// `RAINDROP_LOCAL_DEBUGGER` / `RAINDROP_WORKSHOP` env vars and the
+    /// localhost TCP probe. Use when running tests or a packaged binary that
+    /// must never fan out to a developer-machine daemon.
+    pub fn disable_local_workshop(mut self) -> Self {
+        self.local_workshop_url_config = LocalWorkshopUrlConfig::Disabled;
+        self.auto_detect_local_workshop = false;
         self
     }
 
@@ -180,7 +205,12 @@ impl ClientBuilder {
     /// Build the [`Client`].
     pub fn build(self) -> Result<Client> {
         let endpoint = format_endpoint(&self.endpoint);
-        let enabled = !self.write_key.is_empty();
+        let local_workshop_url = resolve_local_workshop_url(
+            &self.local_workshop_url_config,
+            self.auto_detect_local_workshop,
+        );
+        let has_write_key = !self.write_key.is_empty();
+        let enabled = has_write_key || local_workshop_url.is_some();
 
         let http = match self.http_client {
             Some(c) => c,
@@ -194,6 +224,7 @@ impl ClientBuilder {
             TransportConfig {
                 base_url: endpoint,
                 write_key: self.write_key,
+                local_workshop_url,
                 max_attempts: self.max_attempts,
                 base_delay: self.base_delay,
                 jitter_fraction: self.jitter_fraction,
@@ -247,7 +278,9 @@ impl Client {
         ClientBuilder::default()
     }
 
-    /// Returns true if the client is enabled (i.e. has a non-empty write key).
+    /// Returns true if the client has at least one resolved destination —
+    /// either a non-empty write key (cloud) or a resolved
+    /// `local_workshop_url` (local Workshop mirror), or both.
     pub fn is_enabled(&self) -> bool {
         self.inner.enabled
     }
@@ -585,6 +618,9 @@ impl Client {
 
         let event_res = self.inner.event_buffer.clone().flush(&self.inner).await;
         let trace_res = self.inner.trace_buffer.clone().flush(&self.inner).await;
+        // Drain after the buffer flush so any mirror POSTs spawned from inside
+        // `flush_one` / `trace_buffer.flush` are observable to the caller.
+        self.inner.transport.await_pending_mirrors().await;
         match (event_res, trace_res) {
             (Ok(_), Ok(_)) => Ok(()),
             (Err(e), _) => Err(e),

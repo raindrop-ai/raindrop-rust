@@ -9,8 +9,13 @@ use reqwest::Client as ReqwestClient;
 use reqwest::StatusCode;
 use serde::Serialize;
 use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
 
 use crate::error::{Error, Result};
+
+/// Per-request timeout for fire-and-forget local Workshop mirror POSTs. Short
+/// because a missing daemon must not delay the cloud retry loop.
+const LOCAL_MIRROR_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Maximum payload size accepted by the ingestion gateway (1 MiB). Mirrors the JS SDK's
 /// `MAX_INGEST_SIZE_BYTES` and the Python SDK's `max_ingest_size_bytes`. Oversized payloads
@@ -23,6 +28,7 @@ pub(crate) const MAX_INGEST_SIZE_BYTES: usize = 1024 * 1024;
 pub(crate) struct TransportConfig {
     pub base_url: String,
     pub write_key: String,
+    pub local_workshop_url: Option<String>,
     pub max_attempts: u32,
     pub base_delay: Duration,
     pub jitter_fraction: f64,
@@ -40,6 +46,7 @@ pub(crate) struct RetryingHttpClient {
     http: ReqwestClient,
     sleep: Arc<Mutex<SleepFn>>,
     rand: Arc<Mutex<RandFn>>,
+    mirror_tasks: Arc<std::sync::Mutex<Vec<JoinHandle<()>>>>,
 }
 
 impl RetryingHttpClient {
@@ -51,6 +58,20 @@ impl RetryingHttpClient {
                 Box::pin(async move { tokio::time::sleep(d).await })
             }))),
             rand: Arc::new(Mutex::new(Arc::new(|| rand::thread_rng().gen::<f64>()))),
+            mirror_tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
+    }
+
+    /// Drain pending fire-and-forget local-mirror tasks. Used by `Client::flush`
+    /// so tests (and explicit-flush callers) observe the mirror POST landing
+    /// rather than racing against a background `tokio::spawn`.
+    pub(crate) async fn await_pending_mirrors(&self) {
+        let tasks: Vec<JoinHandle<()>> = {
+            let mut guard = self.mirror_tasks.lock().expect("mirror task lock poisoned");
+            std::mem::take(&mut *guard)
+        };
+        for task in tasks {
+            let _ = task.await;
         }
     }
 
@@ -59,11 +80,6 @@ impl RetryingHttpClient {
         path: &str,
         body: &T,
     ) -> Result<()> {
-        let url = format!(
-            "{}{}",
-            self.cfg.base_url,
-            path.strip_prefix('/').unwrap_or(path)
-        );
         let payload = serde_json::to_vec(body)?;
 
         // Drop oversized payloads on the floor to match the Python and JS SDKs
@@ -83,6 +99,20 @@ impl RetryingHttpClient {
             );
             return Ok(());
         }
+
+        if let Some(local_url) = &self.cfg.local_workshop_url {
+            self.spawn_local_mirror(local_url.clone(), path.to_string(), payload.clone());
+        }
+
+        if self.cfg.write_key.is_empty() {
+            return Ok(());
+        }
+
+        let url = format!(
+            "{}{}",
+            self.cfg.base_url,
+            path.strip_prefix('/').unwrap_or(path)
+        );
 
         let mut last_err: Option<Error> = None;
 
@@ -145,6 +175,40 @@ impl RetryingHttpClient {
         }
 
         Err(last_err.unwrap_or_else(|| Error::Http("unknown error".into())))
+    }
+
+    fn spawn_local_mirror(&self, base_url: String, path: String, payload: Vec<u8>) {
+        let http = self.http.clone();
+        let write_key = self.cfg.write_key.clone();
+        let debug = self.cfg.debug;
+        let task = tokio::spawn(async move {
+            let url = format!("{}{}", base_url, path.strip_prefix('/').unwrap_or(&path));
+            let mut req = http
+                .post(&url)
+                .header("Content-Type", "application/json")
+                .body(payload)
+                .timeout(LOCAL_MIRROR_TIMEOUT);
+            if !write_key.is_empty() {
+                req = req.header("Authorization", format!("Bearer {}", write_key));
+            }
+            if debug {
+                req = req.header("X-Raindrop-Sdk", "raindrop-rust");
+            }
+            match req.send().await {
+                Ok(resp) => {
+                    let status = resp.status();
+                    if !status.is_success() {
+                        tracing::debug!(%url, %status, "raindrop: local workshop mirror non-2xx");
+                    }
+                }
+                Err(err) => {
+                    tracing::debug!(%url, %err, "raindrop: local workshop mirror failed");
+                }
+            }
+        });
+        if let Ok(mut tasks) = self.mirror_tasks.lock() {
+            tasks.push(task);
+        }
     }
 
     async fn retry_delay(&self, retry_number: u32, previous: Option<&Error>) -> Duration {
