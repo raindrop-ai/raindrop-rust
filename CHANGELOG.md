@@ -4,6 +4,13 @@ All notable changes to this crate are documented here. Format follows [Keep a Ch
 
 ## [Unreleased]
 
+### Added
+
+- **LLM span helpers.** `Client::start_llm_span`, `Interaction::start_llm_span`,
+  `Tracer::start_llm_span`, `LlmSpan`, `LlmOptions`, and `LlmMessage` emit the
+  prompt, completion, model, provider, and token attributes that Dawn's trace
+  parser and span renderer understand.
+
 <!--
 Release process (no automation; everything is manual + reviewable):
 
