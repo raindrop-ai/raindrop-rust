@@ -483,6 +483,75 @@ async fn span_set_input_output_emits_raindrop_attributes() {
 }
 
 #[tokio::test]
+async fn tool_span_set_input_replaces_seeded_input_no_duplicates() {
+    // ToolOptions { input: Some(...) } seeds `raindrop.input` at construction.
+    // A subsequent ToolSpan::set_input must REPLACE that attribute, not append a
+    // duplicate (OTLP requires unique attribute keys per span).
+    let server = MockServer::start().await;
+    let trace_recorder = mount_path(&server, "POST", "/traces").await;
+
+    let client = fast_client_builder(&server).build().expect("build");
+    let interaction = client
+        .begin(BeginOptions {
+            event_id: "evt_tool_dedup".into(),
+            ..Default::default()
+        })
+        .await;
+
+    let tool = interaction.start_tool_span(
+        "weather",
+        ToolOptions {
+            input: Some(json!({ "location": "SF" })),
+            ..Default::default()
+        },
+    );
+    tool.set_input(&json!({ "location": "NYC" }));
+    tool.set_output(&json!({ "temp": 60 }));
+    tool.set_output(&json!({ "temp": 72 }));
+    tool.end();
+
+    interaction
+        .finish(Default::default())
+        .await
+        .expect("finish");
+    client.flush().await.expect("flush");
+    client.close().await.expect("close");
+
+    let payload = trace_recorder.requests()[0].json();
+    let spans = spans_of(&payload);
+    let attrs = spans[0]["attributes"].as_array().expect("attributes");
+
+    let input_count = attrs
+        .iter()
+        .filter(|a| a["key"] == "raindrop.input")
+        .count();
+    let output_count = attrs
+        .iter()
+        .filter(|a| a["key"] == "raindrop.output")
+        .count();
+    assert_eq!(
+        input_count, 1,
+        "raindrop.input should appear exactly once, not duplicated"
+    );
+    assert_eq!(
+        output_count, 1,
+        "raindrop.output should appear exactly once, not duplicated"
+    );
+
+    // The replacement value wins.
+    let input_attr = span_attr(&spans[0], "raindrop.input").expect("raindrop.input");
+    assert!(input_attr["stringValue"]
+        .as_str()
+        .unwrap_or("")
+        .contains("NYC"));
+    let output_attr = span_attr(&spans[0], "raindrop.output").expect("raindrop.output");
+    assert!(output_attr["stringValue"]
+        .as_str()
+        .unwrap_or("")
+        .contains("72"));
+}
+
+#[tokio::test]
 async fn span_set_input_output_stringifies_primitive_values() {
     let server = MockServer::start().await;
     let trace_recorder = mount_path(&server, "POST", "/traces").await;

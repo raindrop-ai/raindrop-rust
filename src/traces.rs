@@ -208,19 +208,30 @@ impl Span {
     /// The Raindrop backend reads this attribute first (ahead of any
     /// operation-kind-specific extraction like Vercel AI SDK or Traceloop tool
     /// spans) to populate the `input_payload` column. Works on any span kind,
-    /// not just tool spans.
+    /// not just tool spans. Replaces any previously-set `raindrop.input`
+    /// attribute (e.g. one seeded by [`ToolOptions::input`]) to keep OTLP
+    /// attribute keys unique.
     pub fn set_input(&self, input: &Value) {
-        self.set_attributes([Attribute::string("raindrop.input", stringify_value(input))]);
+        self.set_attributes_replacing(
+            &["raindrop.input"],
+            &[],
+            [Attribute::string("raindrop.input", stringify_value(input))],
+        );
     }
 
     /// Record the span's output payload as the canonical `raindrop.output` attribute.
     ///
-    /// See [`Span::set_input`] for the precedence rules.
+    /// See [`Span::set_input`] for the precedence rules. Replaces any
+    /// previously-set `raindrop.output` attribute.
     pub fn set_output(&self, output: &Value) {
-        self.set_attributes([Attribute::string(
-            "raindrop.output",
-            stringify_value(output),
-        )]);
+        self.set_attributes_replacing(
+            &["raindrop.output"],
+            &[],
+            [Attribute::string(
+                "raindrop.output",
+                stringify_value(output),
+            )],
+        );
     }
 
     fn set_attributes_replacing<I>(&self, exact_keys: &[&str], prefixes: &[&str], attrs: I)
