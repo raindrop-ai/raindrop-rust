@@ -152,7 +152,7 @@ async fn tool_helpers_ship_tool_shaped_spans() {
                 let evt_id_attr =
                     span_attr(span, "traceloop.association.properties.event_id").unwrap();
                 assert_eq!(evt_id_attr["stringValue"], "evt_tools");
-                let output_attr = span_attr(span, "traceloop.entity.output").unwrap();
+                let output_attr = span_attr(span, "raindrop.output").unwrap();
                 assert!(output_attr["stringValue"]
                     .as_str()
                     .unwrap_or("")
@@ -167,7 +167,7 @@ async fn tool_helpers_ship_tool_shaped_spans() {
             }
             "park_check" => {
                 found_park = true;
-                let output_attr = span_attr(span, "traceloop.entity.output").unwrap();
+                let output_attr = span_attr(span, "raindrop.output").unwrap();
                 assert!(output_attr["stringValue"]
                     .as_str()
                     .unwrap_or("")
@@ -437,6 +437,77 @@ async fn manual_span_set_attributes_after_end_is_safe() {
     // Calling set_attributes after end must not panic.
     span.set_attributes([Attribute::string("late", "noop")]);
     let _ = client.close().await;
+}
+
+#[tokio::test]
+async fn span_set_input_output_emits_raindrop_attributes() {
+    let server = MockServer::start().await;
+    let trace_recorder = mount_path(&server, "POST", "/traces").await;
+
+    let client = fast_client_builder(&server).build().expect("build");
+
+    let span = client.start_span(SpanOptions {
+        name: "workflow.step".into(),
+        event_id: "evt_io".into(),
+        operation_id: "ai.workflow".into(),
+        ..Default::default()
+    });
+    span.set_input(&json!({"query": "weather in SF"}));
+    span.set_output(&json!({"forecast": "sunny"}));
+    span.end();
+
+    client.flush().await.expect("flush");
+    client.close().await.expect("close");
+
+    let payload = trace_recorder.requests()[0].json();
+    let spans = spans_of(&payload);
+    let input_attr = span_attr(&spans[0], "raindrop.input").expect("raindrop.input");
+    assert!(input_attr["stringValue"]
+        .as_str()
+        .unwrap_or("")
+        .contains("weather in SF"));
+    let output_attr = span_attr(&spans[0], "raindrop.output").expect("raindrop.output");
+    assert!(output_attr["stringValue"]
+        .as_str()
+        .unwrap_or("")
+        .contains("sunny"));
+    // Plain spans do NOT emit traceloop.entity.* — those are only for the legacy tool-shape.
+    assert!(
+        span_attr(&spans[0], "traceloop.entity.input").is_none(),
+        "plain span should not emit traceloop.entity.input"
+    );
+    assert!(
+        span_attr(&spans[0], "traceloop.entity.output").is_none(),
+        "plain span should not emit traceloop.entity.output"
+    );
+}
+
+#[tokio::test]
+async fn span_set_input_output_stringifies_primitive_values() {
+    let server = MockServer::start().await;
+    let trace_recorder = mount_path(&server, "POST", "/traces").await;
+
+    let client = fast_client_builder(&server).build().expect("build");
+
+    let span = client.start_span(SpanOptions {
+        name: "primitive.io".into(),
+        event_id: "evt_prim".into(),
+        operation_id: "ai.workflow".into(),
+        ..Default::default()
+    });
+    span.set_input(&json!("hello"));
+    span.set_output(&json!(42));
+    span.end();
+
+    client.flush().await.expect("flush");
+    client.close().await.expect("close");
+
+    let payload = trace_recorder.requests()[0].json();
+    let spans = spans_of(&payload);
+    let input_attr = span_attr(&spans[0], "raindrop.input").expect("raindrop.input");
+    assert_eq!(input_attr["stringValue"], "hello");
+    let output_attr = span_attr(&spans[0], "raindrop.output").expect("raindrop.output");
+    assert_eq!(output_attr["stringValue"], "42");
 }
 
 #[tokio::test]

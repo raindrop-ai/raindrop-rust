@@ -72,6 +72,7 @@ trace tree by passing the parent span via `SpanOptions::parent`:
 
 ```rust
 use raindrop::{Attribute, SpanOptions};
+use serde_json::json;
 
 let parent = client.start_span(SpanOptions {
     name: "agent.run".into(),
@@ -93,6 +94,13 @@ child.set_attributes([
 // Or, for the canonical OpenTelemetry GenAI shape that the Raindrop backend's
 // `parseSpan.getInputAndOutputTokens` reads to populate per-event token totals:
 child.set_token_usage("gpt-4o", /* input */ 47, /* output */ 11);
+
+// Set the span's input/output payloads (renders in the Input/Output panes for
+// any span kind, not just tool spans). These write the canonical
+// `raindrop.input` / `raindrop.output` OTel attributes, which the backend
+// reads first, ahead of any operation-kind-specific extraction.
+child.set_input(&json!({ "prompt": "summarize this thread" }));
+child.set_output(&json!({ "summary": "..." }));
 child.end();
 
 // You can also end a span with an explicit time, e.g. when wrapping a call you've already made.

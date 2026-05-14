@@ -4,6 +4,29 @@ All notable changes to this crate are documented here. Format follows [Keep a Ch
 
 ## [Unreleased]
 
+### Added
+
+- **`Span::set_input(&Value)` / `Span::set_output(&Value)`.** Convenience
+  methods that write the canonical `raindrop.input` / `raindrop.output` OTel
+  attributes. The Raindrop backend reads these first (ahead of any
+  operation-kind-specific extraction like Vercel AI SDK or Traceloop tool
+  spans) so they always populate the `input_payload` / `output_payload`
+  columns regardless of span kind.
+
+### Changed
+
+- **`ToolSpan::set_input` / `ToolSpan::set_output` now delegate to
+  `Span::set_input` / `Span::set_output`** — they emit `raindrop.input` /
+  `raindrop.output` instead of `traceloop.entity.input` /
+  `traceloop.entity.output`. The `traceloop.span.kind=tool` and
+  `traceloop.entity.name` attributes still mark the span as a tool call for
+  the UI. Existing data populated under the old keys is unaffected, and the
+  backend continues to read the legacy keys as a fallback.
+- **`build_tool_attributes` (used by `ToolOptions.input` and
+  `TrackToolOptions.input/output`)** writes `raindrop.input` /
+  `raindrop.output` instead of the `traceloop.entity.*` equivalents, for the
+  same reasons as above.
+
 <!--
 Release process (no automation; everything is manual + reviewable):
 

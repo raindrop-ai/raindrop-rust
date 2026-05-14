@@ -702,9 +702,9 @@ async fn tool_span_emits_both_traceloop_and_ai_operation_id_attributes() {
     let tool_name = span_attr(tool_span, "traceloop.entity.name").expect("traceloop.entity.name");
     assert_eq!(tool_name["stringValue"], "weather");
 
-    // Input/output payloads use the traceloop entity attribute names
-    let input_attr =
-        span_attr(tool_span, "traceloop.entity.input").expect("traceloop.entity.input");
+    // Input/output payloads use the canonical raindrop.* attribute names; the backend prefers
+    // these over the legacy `traceloop.entity.input/output` fallback.
+    let input_attr = span_attr(tool_span, "raindrop.input").expect("raindrop.input");
     assert!(
         input_attr["stringValue"]
             .as_str()
@@ -712,8 +712,7 @@ async fn tool_span_emits_both_traceloop_and_ai_operation_id_attributes() {
             .contains("\"SF\""),
         "tool input should be JSON-stringified"
     );
-    let output_attr =
-        span_attr(tool_span, "traceloop.entity.output").expect("traceloop.entity.output");
+    let output_attr = span_attr(tool_span, "raindrop.output").expect("raindrop.output");
     assert!(output_attr["stringValue"]
         .as_str()
         .unwrap()

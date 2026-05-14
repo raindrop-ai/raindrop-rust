@@ -147,6 +147,26 @@ impl Span {
         }
     }
 
+    /// Record the span's input payload as the canonical `raindrop.input` attribute.
+    ///
+    /// The Raindrop backend reads this attribute first (ahead of any
+    /// operation-kind-specific extraction like Vercel AI SDK or Traceloop tool
+    /// spans) to populate the `input_payload` column. Works on any span kind,
+    /// not just tool spans.
+    pub fn set_input(&self, input: &Value) {
+        self.set_attributes([Attribute::string("raindrop.input", stringify_value(input))]);
+    }
+
+    /// Record the span's output payload as the canonical `raindrop.output` attribute.
+    ///
+    /// See [`Span::set_input`] for the precedence rules.
+    pub fn set_output(&self, output: &Value) {
+        self.set_attributes([Attribute::string(
+            "raindrop.output",
+            stringify_value(output),
+        )]);
+    }
+
     /// Mark the span as failed with the given message.
     pub fn set_error(&self, message: impl Into<String>) {
         if let Some(inner) = &self.inner {
@@ -276,8 +296,9 @@ impl Span {
     }
 }
 
-/// Tool-specific wrapper around [`Span`] that records `traceloop.entity.input/output/duration_ms`
-/// attributes on close.
+/// Tool-specific wrapper around [`Span`] that records `raindrop.input` / `raindrop.output`
+/// plus `traceloop.entity.duration_ms` on close, alongside the `traceloop.span.kind=tool` flag
+/// that marks the span as a tool call for the UI.
 #[derive(Debug, Clone)]
 pub struct ToolSpan {
     pub(crate) span: Span,
@@ -307,20 +328,14 @@ impl ToolSpan {
         &self.span
     }
 
-    /// Update the input.
+    /// Update the input. Delegates to [`Span::set_input`].
     pub fn set_input(&self, input: &Value) {
-        self.span.set_attributes([Attribute::string(
-            "traceloop.entity.input",
-            stringify_value(input),
-        )]);
+        self.span.set_input(input);
     }
 
-    /// Update the output.
+    /// Update the output. Delegates to [`Span::set_output`].
     pub fn set_output(&self, output: &Value) {
-        self.span.set_attributes([Attribute::string(
-            "traceloop.entity.output",
-            stringify_value(output),
-        )]);
+        self.span.set_output(output);
     }
 
     /// Mark the tool span as failed.
@@ -425,14 +440,11 @@ pub(crate) fn build_tool_attributes(
         Attribute::string("traceloop.entity.name", name),
     ];
     if let Some(input) = input {
-        attrs.push(Attribute::string(
-            "traceloop.entity.input",
-            stringify_value(input),
-        ));
+        attrs.push(Attribute::string("raindrop.input", stringify_value(input)));
     }
     if let Some(output) = output {
         attrs.push(Attribute::string(
-            "traceloop.entity.output",
+            "raindrop.output",
             stringify_value(output),
         ));
     }
@@ -484,7 +496,7 @@ pub(crate) fn tool_property_attributes(properties: &BTreeMap<String, Value>) -> 
 }
 
 /// Run a closure inside a tool span linked to an interaction. The closure's return value is
-/// JSON-serialized (best-effort) and recorded on the span as `traceloop.entity.output`.
+/// JSON-serialized (best-effort) and recorded on the span as `raindrop.output`.
 ///
 /// If the interaction's underlying client is disabled, the closure runs without instrumentation
 /// and the result is returned as-is.
