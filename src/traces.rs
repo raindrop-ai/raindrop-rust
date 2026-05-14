@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 
+use serde::Serialize;
 use serde_json::Value;
 use time::OffsetDateTime;
 
@@ -64,6 +65,61 @@ pub struct TrackToolOptions {
     /// Optional explicit duration. Used to derive missing start/end times and the
     /// `traceloop.entity.duration_ms` attribute.
     pub duration: Option<std::time::Duration>,
+}
+
+/// A chat message recorded on an LLM span.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LlmMessage {
+    pub role: String,
+    pub content: String,
+}
+
+impl LlmMessage {
+    pub fn new(role: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: role.into(),
+            content: content.into(),
+        }
+    }
+
+    pub fn system(content: impl Into<String>) -> Self {
+        Self::new("system", content)
+    }
+
+    pub fn user(content: impl Into<String>) -> Self {
+        Self::new("user", content)
+    }
+
+    pub fn assistant(content: impl Into<String>) -> Self {
+        Self::new("assistant", content)
+    }
+}
+
+/// Options for [`crate::events::Interaction::start_llm_span`].
+#[derive(Debug, Default, Clone)]
+pub struct LlmOptions {
+    /// Optional parent span.
+    pub parent: Option<Span>,
+    /// Association properties.
+    pub properties: BTreeMap<String, Value>,
+    /// Operation id. Defaults to `ai.generateText`.
+    pub operation_id: String,
+    /// Optional model name.
+    pub model: String,
+    /// Optional provider/system name.
+    pub provider: String,
+    /// Optional single user input.
+    pub input: Option<String>,
+    /// Optional chat-style prompt messages. Takes precedence over `input`.
+    pub messages: Vec<LlmMessage>,
+    /// Optional assistant output.
+    pub output: Option<String>,
+    /// Optional input token count. `0` omits the attribute.
+    pub input_tokens: i64,
+    /// Optional output token count. `0` omits the attribute.
+    pub output_tokens: i64,
+    /// Override start time.
+    pub start_time: Option<OffsetDateTime>,
 }
 
 /// Manually-managed span. Cheap to clone (internally an `Arc`); safe to call from multiple tasks.
@@ -167,6 +223,23 @@ impl Span {
         )]);
     }
 
+    fn set_attributes_replacing<I>(&self, exact_keys: &[&str], prefixes: &[&str], attrs: I)
+    where
+        I: IntoIterator<Item = Attribute>,
+    {
+        if let Some(inner) = &self.inner {
+            let mut state = inner.state.lock().expect("span lock poisoned");
+            if state.ended {
+                return;
+            }
+            state.attrs.retain(|attr| {
+                !exact_keys.iter().any(|key| attr.key == *key)
+                    && !prefixes.iter().any(|prefix| attr.key.starts_with(prefix))
+            });
+            state.attrs.extend(attrs);
+        }
+    }
+
     /// Mark the span as failed with the given message.
     pub fn set_error(&self, message: impl Into<String>) {
         if let Some(inner) = &self.inner {
@@ -195,19 +268,19 @@ impl Span {
     /// for this span — useful when the caller wants to set tokens on a manual span without
     /// claiming a model).
     pub fn set_token_usage(&self, model: impl AsRef<str>, input_tokens: i64, output_tokens: i64) {
-        let model = model.as_ref();
-        let mut attrs: Vec<Attribute> = Vec::with_capacity(3);
-        if !model.is_empty() {
-            attrs.push(Attribute::string("gen_ai.response.model", model));
-        }
-        if input_tokens > 0 {
-            attrs.push(Attribute::int("gen_ai.usage.input_tokens", input_tokens));
-        }
-        if output_tokens > 0 {
-            attrs.push(Attribute::int("gen_ai.usage.output_tokens", output_tokens));
-        }
+        let attrs = llm_token_usage_attributes(model, input_tokens, output_tokens);
         if !attrs.is_empty() {
-            self.set_attributes(attrs);
+            self.set_attributes_replacing(
+                &[
+                    "gen_ai.response.model",
+                    "gen_ai.usage.prompt_tokens",
+                    "gen_ai.usage.completion_tokens",
+                    "gen_ai.usage.input_tokens",
+                    "gen_ai.usage.output_tokens",
+                ],
+                &[],
+                attrs,
+            );
         }
     }
 
@@ -293,6 +366,125 @@ impl Span {
         };
 
         inner.client.enqueue_span(span);
+    }
+}
+
+/// LLM-specific wrapper around [`Span`] that records Dawn/frontend-compatible prompt,
+/// completion, model, provider, and token attributes.
+#[derive(Debug, Clone)]
+pub struct LlmSpan {
+    pub(crate) span: Span,
+}
+
+impl LlmSpan {
+    pub(crate) fn from_span(span: Span) -> Self {
+        Self { span }
+    }
+
+    /// Construct a no-op LLM span.
+    pub fn noop() -> Self {
+        Self { span: Span::noop() }
+    }
+
+    /// Returns true if this LLM span is backed by a no-op span.
+    pub fn is_noop(&self) -> bool {
+        self.span.is_noop()
+    }
+
+    /// Borrow the underlying [`Span`] for advanced usage.
+    pub fn span(&self) -> &Span {
+        &self.span
+    }
+
+    /// Record the LLM model using both OpenTelemetry GenAI and Raindrop keys.
+    pub fn set_model(&self, model: impl AsRef<str>) {
+        let model = model.as_ref();
+        if model.is_empty() {
+            return;
+        }
+        self.span.set_attributes_replacing(
+            &[
+                "ai.model.id",
+                "gen_ai.request.model",
+                "gen_ai.response.model",
+            ],
+            &[],
+            llm_model_attributes(model),
+        );
+    }
+
+    /// Record the LLM provider/system.
+    pub fn set_provider(&self, provider: impl AsRef<str>) {
+        let provider = provider.as_ref();
+        if provider.is_empty() {
+            return;
+        }
+        self.span.set_attributes_replacing(
+            &["ai.model.provider", "gen_ai.system"],
+            &[],
+            llm_provider_attributes(provider),
+        );
+    }
+
+    /// Record a single user input.
+    pub fn set_input(&self, input: impl Into<String>) {
+        self.span.set_attributes_replacing(
+            &["ai.prompt", "ai.prompt.messages"],
+            &["gen_ai.prompt."],
+            llm_input_attributes(input.into()),
+        );
+    }
+
+    /// Record chat-style prompt messages.
+    pub fn set_messages<I>(&self, messages: I)
+    where
+        I: IntoIterator<Item = LlmMessage>,
+    {
+        let messages: Vec<LlmMessage> = messages.into_iter().collect();
+        if messages.is_empty() {
+            return;
+        }
+        self.span.set_attributes_replacing(
+            &["ai.prompt", "ai.prompt.messages"],
+            &["gen_ai.prompt."],
+            llm_message_attributes(messages),
+        );
+    }
+
+    /// Record a single assistant output.
+    pub fn set_output(&self, output: impl Into<String>) {
+        self.span.set_attributes_replacing(
+            &["ai.response.text"],
+            &["gen_ai.completion."],
+            llm_output_attributes(output.into()),
+        );
+    }
+
+    /// Convenience helper for a plain text prompt/response pair.
+    pub fn set_io(&self, input: impl Into<String>, output: impl Into<String>) {
+        self.set_input(input);
+        self.set_output(output);
+    }
+
+    /// See [`Span::set_token_usage`]. Forwarded to the underlying span.
+    pub fn set_token_usage(&self, model: impl AsRef<str>, input_tokens: i64, output_tokens: i64) {
+        self.span
+            .set_token_usage(model, input_tokens, output_tokens)
+    }
+
+    /// Mark the LLM span as failed.
+    pub fn set_error(&self, message: impl Into<String>) {
+        self.span.set_error(message)
+    }
+
+    /// End the LLM span at the current time.
+    pub fn end(&self) {
+        self.span.end()
+    }
+
+    /// End the LLM span at a specific time.
+    pub fn end_at(&self, end_time: Option<OffsetDateTime>) {
+        self.span.end_at(end_time)
     }
 }
 
@@ -395,6 +587,17 @@ impl Tracer {
         }
     }
 
+    /// Start a manually-managed LLM span carrying this tracer's sticky properties.
+    pub fn start_llm_span(&self, name: impl Into<String>, mut opts: LlmOptions) -> LlmSpan {
+        match &self.client {
+            Some(client) => {
+                opts.properties = merge_maps(&self.properties, &opts.properties);
+                client.start_llm_span(name, opts, "")
+            }
+            None => LlmSpan::noop(),
+        }
+    }
+
     /// Run an async closure inside a manually-managed span.
     pub async fn with_span<F, Fut, T, E>(
         &self,
@@ -424,6 +627,99 @@ impl Tracer {
             client.track_tool_standalone(opts);
         }
     }
+}
+
+pub(crate) fn build_llm_attributes(opts: &LlmOptions) -> Vec<Attribute> {
+    let mut attrs = vec![Attribute::string("traceloop.span.kind", "llm")];
+    if !opts.model.is_empty() {
+        attrs.extend(llm_model_attributes(&opts.model));
+    }
+    if !opts.provider.is_empty() {
+        attrs.extend(llm_provider_attributes(&opts.provider));
+    }
+    if !opts.messages.is_empty() {
+        attrs.extend(llm_message_attributes(opts.messages.clone()));
+    } else if let Some(input) = &opts.input {
+        attrs.extend(llm_input_attributes(input.clone()));
+    }
+    if let Some(output) = &opts.output {
+        attrs.extend(llm_output_attributes(output.clone()));
+    }
+    attrs.extend(llm_token_usage_attributes(
+        "",
+        opts.input_tokens,
+        opts.output_tokens,
+    ));
+    attrs.extend(tool_property_attributes(&opts.properties));
+    attrs
+}
+
+fn llm_model_attributes(model: &str) -> Vec<Attribute> {
+    vec![
+        Attribute::string("ai.model.id", model),
+        Attribute::string("gen_ai.request.model", model),
+        Attribute::string("gen_ai.response.model", model),
+    ]
+}
+
+fn llm_provider_attributes(provider: &str) -> Vec<Attribute> {
+    vec![
+        Attribute::string("ai.model.provider", provider),
+        Attribute::string("gen_ai.system", provider),
+    ]
+}
+
+fn llm_input_attributes(input: String) -> Vec<Attribute> {
+    vec![
+        Attribute::string("ai.prompt", input.clone()),
+        Attribute::string("gen_ai.prompt.0.role", "user"),
+        Attribute::string("gen_ai.prompt.0.content", input),
+    ]
+}
+
+fn llm_message_attributes(messages: Vec<LlmMessage>) -> Vec<Attribute> {
+    let mut attrs = vec![Attribute::string(
+        "ai.prompt.messages",
+        serde_json::to_string(&messages).expect("serializing LLM messages cannot fail"),
+    )];
+    for (idx, message) in messages.into_iter().enumerate() {
+        attrs.push(Attribute::string(
+            format!("gen_ai.prompt.{}.role", idx),
+            message.role,
+        ));
+        attrs.push(Attribute::string(
+            format!("gen_ai.prompt.{}.content", idx),
+            message.content,
+        ));
+    }
+    attrs
+}
+
+fn llm_output_attributes(output: String) -> Vec<Attribute> {
+    vec![
+        Attribute::string("ai.response.text", output.clone()),
+        Attribute::string("gen_ai.completion.0.role", "assistant"),
+        Attribute::string("gen_ai.completion.0.content", output),
+    ]
+}
+
+fn llm_token_usage_attributes(
+    model: impl AsRef<str>,
+    input_tokens: i64,
+    output_tokens: i64,
+) -> Vec<Attribute> {
+    let model = model.as_ref();
+    let mut attrs: Vec<Attribute> = Vec::with_capacity(3);
+    if !model.is_empty() {
+        attrs.push(Attribute::string("gen_ai.response.model", model));
+    }
+    if input_tokens > 0 {
+        attrs.push(Attribute::int("gen_ai.usage.input_tokens", input_tokens));
+    }
+    if output_tokens > 0 {
+        attrs.push(Attribute::int("gen_ai.usage.output_tokens", output_tokens));
+    }
+    attrs
 }
 
 /// Build the standard set of tool attributes (kind, name, input/output, duration, association

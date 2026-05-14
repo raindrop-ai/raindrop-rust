@@ -4,7 +4,7 @@ The official Rust SDK for [Raindrop AI](https://raindrop.ai) — track AI events
 
 📖 **Full documentation:** [docs.raindrop.ai/sdk/rust](https://docs.raindrop.ai/sdk/rust). This README is the quick reference; the docs page is the canonical narrative tour.
 
-> **Beta.** The crate is `0.0.1`. The wire contract against the Raindrop ingestion API is stable and verified end-to-end against the live backend on every push, but the crate API may still change in minor ways before `0.1.0`. We recommend pinning the git revision in your `Cargo.toml` and reviewing the [Known Limitations](#known-limitations) before using it in production.
+> **Beta.** The crate is `0.0.5`. The wire contract against the Raindrop ingestion API is stable and verified end-to-end against the live backend on every push, but the crate API may still change in minor ways before `0.1.0`. We recommend pinning the git revision in your `Cargo.toml` and reviewing the [Known Limitations](#known-limitations) before using it in production.
 
 ## Installation
 
@@ -12,7 +12,7 @@ The official Rust SDK for [Raindrop AI](https://raindrop.ai) — track AI events
 
 ```toml
 [dependencies]
-raindrop-ai = { git = "https://github.com/raindrop-ai/raindrop-rust", tag = "v0.0.3" }
+raindrop-ai = { git = "https://github.com/raindrop-ai/raindrop-rust", tag = "v0.0.5" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 serde_json = "1"
 ```
@@ -71,8 +71,7 @@ Spans are first-class and **manual** — no callbacks required. You can build an
 trace tree by passing the parent span via `SpanOptions::parent`:
 
 ```rust
-use raindrop::{Attribute, SpanOptions};
-use serde_json::json;
+use raindrop::{LlmMessage, LlmOptions, SpanOptions};
 
 let parent = client.start_span(SpanOptions {
     name: "agent.run".into(),
@@ -80,31 +79,70 @@ let parent = client.start_span(SpanOptions {
     ..Default::default()
 });
 
-let child = client.start_span(SpanOptions {
-    name: "llm.call".into(),
-    event_id: "evt_123".into(),
-    parent: Some(parent.clone()),
-    ..Default::default()
-});
+let child = client.start_llm_span(
+    "llm.call",
+    LlmOptions {
+        parent: Some(parent.clone()),
+        model: "gpt-4o".into(),
+        messages: vec![LlmMessage::user("What is the capital of France?")],
+        ..Default::default()
+    },
+    "evt_123",
+);
 
-child.set_attributes([
-    Attribute::string("ai.model.id", "gpt-4o"),
-    Attribute::int("ai.usage.prompt_tokens", 10),
-]);
-// Or, for the canonical OpenTelemetry GenAI shape that the Raindrop backend's
-// `parseSpan.getInputAndOutputTokens` reads to populate per-event token totals:
+child.set_output("Paris");
 child.set_token_usage("gpt-4o", /* input */ 47, /* output */ 11);
-
-// Set the span's input/output payloads (renders in the Input/Output panes for
-// any span kind, not just tool spans). These write the canonical
-// `raindrop.input` / `raindrop.output` OTel attributes, which the backend
-// reads first, ahead of any operation-kind-specific extraction.
-child.set_input(&json!({ "prompt": "summarize this thread" }));
-child.set_output(&json!({ "summary": "..." }));
 child.end();
 
 // You can also end a span with an explicit time, e.g. when wrapping a call you've already made.
 parent.end();
+```
+
+To set arbitrary input/output payloads on a plain `Span` (for workflow steps, RAG retrieval,
+or any non-LLM/non-tool work that should still render in the Input/Output panes), use
+`set_input` / `set_output`. They write the canonical `raindrop.input` / `raindrop.output`
+OTel attributes, which the Raindrop backend reads first — ahead of any operation-kind-specific
+extraction — so they always populate the `input_payload` / `output_payload` columns:
+
+```rust
+use raindrop::SpanOptions;
+use serde_json::json;
+
+let span = client.start_span(SpanOptions {
+    name: "workflow.step".into(),
+    event_id: "evt_123".into(),
+    operation_id: "ai.workflow".into(),
+    ..Default::default()
+});
+span.set_input(&json!({ "query": "weather in SF" }));
+span.set_output(&json!({ "forecast": "sunny" }));
+span.end();
+```
+
+Use `LlmOptions::messages` when the provider call takes chat-style role/content messages.
+`LlmMessage::system`, `LlmMessage::user`, and `LlmMessage::assistant` cover the common roles;
+`LlmMessage::new(role, content)` handles provider-specific roles. If both `input` and `messages`
+are set, `messages` wins. The dashboard stores the last user message as the span `input_payload`
+and the full message array remains available to the frontend span renderer.
+
+```rust
+let llm = interaction.start_llm_span(
+    "anthropic.messages",
+    LlmOptions {
+        provider: "anthropic".into(),
+        model: "claude-sonnet-4-5".into(),
+        ..Default::default()
+    },
+);
+
+llm.set_messages([
+    LlmMessage::system("You answer using the provided tool result."),
+    LlmMessage::user("What is the weather in San Francisco?"),
+    LlmMessage::assistant("I will call get_weather."),
+    LlmMessage::user("The tool returned 67°F and windy."),
+]);
+llm.set_output("It is 67°F and windy in San Francisco.");
+llm.end();
 ```
 
 To attach a span to an in-flight interaction (so it inherits user/event/convo association
@@ -242,7 +280,7 @@ are exposed via the `SignalKind` re-export at the crate root.
 
 ## Span association properties (auto-propagated from interaction)
 
-Every span started via `interaction.start_span(...)` or `interaction.start_tool_span(...)`
+Every span started via `interaction.start_span(...)`, `interaction.start_llm_span(...)`, or `interaction.start_tool_span(...)`
 automatically inherits the interaction's `user_id`, `convo_id`, and `event` as
 `traceloop.association.properties.{user_id, convo_id, event}` attributes, so the dashboard
 groups the span under the same user, conversation, and event as the parent. User-supplied
@@ -301,9 +339,8 @@ either count or an empty `model` to omit the corresponding attribute.
 
 ## Known Limitations
 
-- **Nested Trace Spans:** The Rust SDK currently provides manual span instrumentation (`start_span`, `start_tool_span`). It does not yet automatically hook into Rust LLM frameworks (like `async-openai` or `langchain-rust`) to produce nested trace spans automatically. You must create spans manually.
+- **Nested Trace Spans:** The Rust SDK currently provides manual span instrumentation (`start_span`, `start_llm_span`, `start_tool_span`). It does not yet automatically hook into Rust LLM frameworks (like `async-openai` or `langchain-rust`) to produce nested trace spans automatically. You must create spans manually.
 - **PII Redaction:** Automatic PII redaction (which is available in the Python SDK via `set_redact_pii` and the JS SDK via `redactPii`) is not yet implemented in the Rust SDK. If your application logs PII into events, redact at the call site or upstream of `track_ai` / `track_event`.
-- **Local debugger mirroring (`RAINDROP_LOCAL_DEBUGGER`):** The JS and Python SDKs mirror traces and partial events to a local Workshop instance via `RAINDROP_LOCAL_DEBUGGER`. The Rust SDK currently ships only to the configured `endpoint`; mirroring to a local debugger is on the roadmap.
 - **Oversized payload guard:** Payloads larger than 1 MiB after JSON serialization are dropped client-side (matching the JS / Python SDKs' `MAX_INGEST_SIZE_BYTES` / `max_ingest_size_bytes`) to avoid 413s on the gateway. Each drop emits a `tracing::warn!` event so production callers can detect it without enabling `debug=true`.
 
 ## Configuration
@@ -324,6 +361,8 @@ either count or an empty `model` to omit the corresponding attribute.
 | `library_name`           | `raindrop-rust`               | `$context.library.name`                           |
 | `library_version`        | crate version                 | `$context.library.version`                        |
 | `http_client`            | new `reqwest::Client`         | Bring your own connection-pooled HTTP client      |
+| `local_workshop_url`     | auto-detected localhost       | Mirror cloud-bound posts to a local Workshop      |
+| `disable_local_workshop` | —                             | Disable env/probe-based local Workshop mirroring  |
 
 ## Architecture
 

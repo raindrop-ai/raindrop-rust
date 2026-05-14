@@ -18,8 +18,8 @@ use crate::otlp::{create_span_ids, Attribute, OtlpKeyValue, OtlpSpan, OtlpStatus
 use crate::signals::{track_signal, Signal};
 use crate::trace_buffer::TraceBuffer;
 use crate::traces::{
-    build_tool_attributes, tool_property_attributes, Span, SpanOptions, ToolOptions, ToolSpan,
-    Tracer, TrackToolOptions,
+    build_llm_attributes, build_tool_attributes, tool_property_attributes, LlmOptions, LlmSpan,
+    Span, SpanOptions, ToolOptions, ToolSpan, Tracer, TrackToolOptions,
 };
 use crate::users::{identify, User};
 
@@ -468,6 +468,42 @@ impl Client {
             opts.start_time.unwrap_or_else(OffsetDateTime::now_utc),
             attrs,
         )
+    }
+
+    /// Start an LLM span linked to an event id.
+    pub fn start_llm_span(
+        &self,
+        name: impl Into<String>,
+        opts: LlmOptions,
+        event_id: &str,
+    ) -> LlmSpan {
+        let name = name.into();
+        if !self.inner.enabled {
+            return LlmSpan::noop();
+        }
+        let start = opts.start_time.unwrap_or_else(OffsetDateTime::now_utc);
+        let mut opts = opts;
+        if !event_id.is_empty() {
+            opts.properties
+                .entry("event_id".to_string())
+                .or_insert_with(|| Value::String(event_id.to_string()));
+        }
+        let operation_id = if opts.operation_id.is_empty() {
+            "ai.generateText".to_string()
+        } else {
+            opts.operation_id.clone()
+        };
+        let attrs = build_llm_attributes(&opts);
+        let span_opts = SpanOptions {
+            name,
+            event_id: event_id.to_string(),
+            operation_id,
+            parent: opts.parent,
+            properties: BTreeMap::new(),
+            attributes: attrs,
+            start_time: Some(start),
+        };
+        LlmSpan::from_span(self.start_span(span_opts))
     }
 
     /// Start a tool span linked to an event id.

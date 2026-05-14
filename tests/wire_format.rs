@@ -20,8 +20,8 @@ use time::macros::datetime;
 use wiremock::MockServer;
 
 use raindrop::{
-    AiEvent, Attachment, Attribute, BeginOptions, Event, FinishOptions, PatchOptions, Signal,
-    SignalKind, SpanOptions, ToolOptions, TrackToolOptions, User,
+    AiEvent, Attachment, Attribute, BeginOptions, Event, FinishOptions, LlmMessage, LlmOptions,
+    PatchOptions, Signal, SignalKind, SpanOptions, ToolOptions, TrackToolOptions, User,
 };
 
 use crate::common::{fast_client_builder, mount_any_post, mount_path, span_attr, spans_of};
@@ -1266,6 +1266,45 @@ async fn span_set_token_usage_emits_gen_ai_attributes() {
     assert_eq!(output_tokens["intValue"], "11");
 }
 
+#[tokio::test]
+async fn span_set_token_usage_replaces_legacy_gen_ai_aliases() {
+    let server = MockServer::start().await;
+    let trace_recorder = mount_path(&server, "POST", "/traces").await;
+    let client = fast_client_builder(&server).build().expect("build");
+
+    let span = client.start_span(SpanOptions {
+        name: "llm_call".into(),
+        event_id: "evt".into(),
+        operation_id: "ai.generateText".into(),
+        attributes: vec![
+            Attribute::string("gen_ai.response.model", "old-model"),
+            Attribute::int("gen_ai.usage.prompt_tokens", 1),
+            Attribute::int("gen_ai.usage.completion_tokens", 2),
+        ],
+        ..Default::default()
+    });
+    span.set_token_usage("gpt-4o-mini", 47, 11);
+    span.end();
+    client.flush().await.expect("flush");
+    client.close().await.expect("close");
+
+    let span_json = recorder_first_span(&trace_recorder);
+    assert!(span_attr(&span_json, "gen_ai.usage.prompt_tokens").is_none());
+    assert!(span_attr(&span_json, "gen_ai.usage.completion_tokens").is_none());
+    assert_eq!(
+        span_attr(&span_json, "gen_ai.response.model").unwrap()["stringValue"],
+        "gpt-4o-mini"
+    );
+    assert_eq!(
+        span_attr(&span_json, "gen_ai.usage.input_tokens").unwrap()["intValue"],
+        "47"
+    );
+    assert_eq!(
+        span_attr(&span_json, "gen_ai.usage.output_tokens").unwrap()["intValue"],
+        "11"
+    );
+}
+
 /// `set_token_usage` with `0` for either count omits the corresponding attribute and (when
 /// `model` is empty) omits the `gen_ai.response.model` gate. This mirrors the Python SDK's
 /// `set_llm_span_io` semantics — only emit what the caller actually has.
@@ -1290,6 +1329,142 @@ async fn span_set_token_usage_omits_zero_and_empty_model() {
     assert!(span_attr(&span_json, "gen_ai.response.model").is_none());
     assert!(span_attr(&span_json, "gen_ai.usage.input_tokens").is_none());
     assert!(span_attr(&span_json, "gen_ai.usage.output_tokens").is_none());
+}
+
+/// LLM helpers emit the attributes Dawn's parser stores as input/output payloads
+/// and the frontend span renderer reads as chat messages.
+#[tokio::test]
+async fn span_llm_helpers_emit_backend_and_renderer_attributes() {
+    let server = MockServer::start().await;
+    let trace_recorder = mount_path(&server, "POST", "/traces").await;
+    let client = fast_client_builder(&server).build().expect("build");
+
+    let span = client.start_llm_span(
+        "llm_call",
+        LlmOptions {
+            provider: "openai".into(),
+            model: "gpt-4o-mini".into(),
+            ..Default::default()
+        },
+        "evt",
+    );
+    span.set_io("What is 2+2?", "The answer is 4.");
+    span.set_token_usage("gpt-4o-mini", 10, 5);
+    span.end();
+    client.flush().await.expect("flush");
+    client.close().await.expect("close");
+
+    let span_json = recorder_first_span(&trace_recorder);
+    assert_eq!(
+        span_attr(&span_json, "ai.operationId").unwrap()["stringValue"],
+        "ai.generateText"
+    );
+    assert_eq!(
+        span_attr(&span_json, "traceloop.span.kind").unwrap()["stringValue"],
+        "llm"
+    );
+    assert_eq!(
+        span_attr(&span_json, "ai.prompt").unwrap()["stringValue"],
+        "What is 2+2?"
+    );
+    assert_eq!(
+        span_attr(&span_json, "gen_ai.prompt.0.role").unwrap()["stringValue"],
+        "user"
+    );
+    assert_eq!(
+        span_attr(&span_json, "gen_ai.prompt.0.content").unwrap()["stringValue"],
+        "What is 2+2?"
+    );
+    assert_eq!(
+        span_attr(&span_json, "ai.response.text").unwrap()["stringValue"],
+        "The answer is 4."
+    );
+    assert_eq!(
+        span_attr(&span_json, "gen_ai.completion.0.role").unwrap()["stringValue"],
+        "assistant"
+    );
+    assert_eq!(
+        span_attr(&span_json, "gen_ai.completion.0.content").unwrap()["stringValue"],
+        "The answer is 4."
+    );
+    assert_eq!(
+        span_attr(&span_json, "gen_ai.request.model").unwrap()["stringValue"],
+        "gpt-4o-mini"
+    );
+    assert_eq!(
+        span_attr(&span_json, "gen_ai.response.model").unwrap()["stringValue"],
+        "gpt-4o-mini"
+    );
+    assert_eq!(
+        span_attr(&span_json, "gen_ai.system").unwrap()["stringValue"],
+        "openai"
+    );
+    assert_eq!(
+        span_attr(&span_json, "gen_ai.usage.input_tokens").unwrap()["intValue"],
+        "10"
+    );
+    assert_eq!(
+        span_attr(&span_json, "gen_ai.usage.output_tokens").unwrap()["intValue"],
+        "5"
+    );
+}
+
+#[tokio::test]
+async fn span_set_llm_messages_emits_prompt_message_array_and_indexed_attrs() {
+    let server = MockServer::start().await;
+    let trace_recorder = mount_path(&server, "POST", "/traces").await;
+    let client = fast_client_builder(&server).build().expect("build");
+
+    let span = client.start_llm_span(
+        "llm_call",
+        LlmOptions {
+            operation_id: "ai.streamText".into(),
+            input: Some("Original prompt".into()),
+            ..Default::default()
+        },
+        "evt",
+    );
+    span.set_messages([
+        LlmMessage::system("You are concise."),
+        LlmMessage::user("Summarize the ticket."),
+    ]);
+    span.set_output("Done.");
+    span.end();
+    client.flush().await.expect("flush");
+    client.close().await.expect("close");
+
+    let span_json = recorder_first_span(&trace_recorder);
+    assert_eq!(
+        span_attr(&span_json, "ai.operationId").unwrap()["stringValue"],
+        "ai.streamText",
+        "helper must preserve an explicit operation id"
+    );
+    let prompt_messages = span_attr(&span_json, "ai.prompt.messages").unwrap()["stringValue"]
+        .as_str()
+        .unwrap();
+    assert!(
+        span_attr(&span_json, "ai.prompt").is_none(),
+        "set_messages must replace the previous single-prompt attribute"
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(prompt_messages).unwrap(),
+        json!([
+            { "role": "system", "content": "You are concise." },
+            { "role": "user", "content": "Summarize the ticket." }
+        ])
+    );
+    assert_eq!(
+        span_attr(&span_json, "gen_ai.prompt.0.role").unwrap()["stringValue"],
+        "system"
+    );
+    assert_eq!(
+        span_attr(&span_json, "gen_ai.prompt.1.content").unwrap()["stringValue"],
+        "Summarize the ticket."
+    );
+    assert_eq!(
+        span_attr(&span_json, "gen_ai.completion.0.content").unwrap()["stringValue"],
+        "Done."
+    );
 }
 
 /// A child span shares its parent's `traceId` and references the parent via `parentSpanId`.

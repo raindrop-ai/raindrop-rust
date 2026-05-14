@@ -6,7 +6,9 @@ use time::OffsetDateTime;
 
 use crate::client::Client;
 use crate::error::Result;
-use crate::traces::{Span, SpanOptions, ToolOptions, ToolSpan, TrackToolOptions};
+use crate::traces::{
+    LlmOptions, LlmSpan, Span, SpanOptions, ToolOptions, ToolSpan, TrackToolOptions,
+};
 
 /// Attachment shape shared across event payloads. Mirrors the canonical
 /// `BaseAttachmentSchema` from `@raindrop-ai/schemas/ingest` and the Go SDK's `Attachment`
@@ -305,6 +307,18 @@ impl Interaction {
         match &self.client {
             Some(client) => client.start_tool_span(name, opts, &self.event_id),
             None => ToolSpan::noop(),
+        }
+    }
+
+    /// Start a manually-managed LLM span linked to this interaction's event id.
+    ///
+    /// As with [`start_span`](Self::start_span), the underlying span inherits the interaction's
+    /// `user_id` and `convo_id` association properties.
+    pub fn start_llm_span(&self, name: impl Into<String>, mut opts: LlmOptions) -> LlmSpan {
+        self.inject_association_properties(&mut opts.properties);
+        match &self.client {
+            Some(client) => client.start_llm_span(name, opts, &self.event_id),
+            None => LlmSpan::noop(),
         }
     }
 

@@ -27,6 +27,15 @@ All notable changes to this crate are documented here. Format follows [Keep a Ch
   `raindrop.output` instead of the `traceloop.entity.*` equivalents, for the
   same reasons as above.
 
+## [0.0.5] - 2026-05-14
+
+### Added
+
+- **LLM span helpers.** `Client::start_llm_span`, `Interaction::start_llm_span`,
+  `Tracer::start_llm_span`, `LlmSpan`, `LlmOptions`, and `LlmMessage` emit the
+  prompt, completion, model, provider, and token attributes that Dawn's trace
+  parser and span renderer understand.
+
 <!--
 Release process (no automation; everything is manual + reviewable):
 
@@ -133,7 +142,8 @@ Initial **beta** release. The wire contract against the Raindrop ingestion API i
 - No client-side PII redaction (Python's `set_redact_pii` and JS's `redactPii` have no Rust equivalent yet).
 - No local-debugger mirroring (no `RAINDROP_LOCAL_DEBUGGER` support).
 
-[Unreleased]: https://github.com/raindrop-ai/raindrop-rust/compare/v0.0.4...HEAD
+[Unreleased]: https://github.com/raindrop-ai/raindrop-rust/compare/v0.0.5...HEAD
+[0.0.5]: https://github.com/raindrop-ai/raindrop-rust/compare/v0.0.4...v0.0.5
 [0.0.4]: https://github.com/raindrop-ai/raindrop-rust/compare/v0.0.3...v0.0.4
 [0.0.3]: https://github.com/raindrop-ai/raindrop-rust/compare/v0.0.2...v0.0.3
 [0.0.2]: https://github.com/raindrop-ai/raindrop-rust/compare/v0.0.1...v0.0.2
