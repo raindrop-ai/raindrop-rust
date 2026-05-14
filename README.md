@@ -4,7 +4,7 @@ The official Rust SDK for [Raindrop AI](https://raindrop.ai) — track AI events
 
 📖 **Full documentation:** [docs.raindrop.ai/sdk/rust](https://docs.raindrop.ai/sdk/rust). This README is the quick reference; the docs page is the canonical narrative tour.
 
-> **Beta.** The crate is `0.0.4`. The wire contract against the Raindrop ingestion API is stable and verified end-to-end against the live backend on every push, but the crate API may still change in minor ways before `0.1.0`. We recommend pinning the git revision in your `Cargo.toml` and reviewing the [Known Limitations](#known-limitations) before using it in production.
+> **Beta.** The crate is `0.0.5`. The wire contract against the Raindrop ingestion API is stable and verified end-to-end against the live backend on every push, but the crate API may still change in minor ways before `0.1.0`. We recommend pinning the git revision in your `Cargo.toml` and reviewing the [Known Limitations](#known-limitations) before using it in production.
 
 ## Installation
 
@@ -12,7 +12,7 @@ The official Rust SDK for [Raindrop AI](https://raindrop.ai) — track AI events
 
 ```toml
 [dependencies]
-raindrop-ai = { git = "https://github.com/raindrop-ai/raindrop-rust", tag = "v0.0.4" }
+raindrop-ai = { git = "https://github.com/raindrop-ai/raindrop-rust", tag = "v0.0.5" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 serde_json = "1"
 ```
