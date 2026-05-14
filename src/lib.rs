@@ -62,7 +62,8 @@ pub use local_debugger::{
 pub use otlp::{Attribute, AttributeValue, SpanStatusCode};
 pub use signals::{Signal, SignalKind};
 pub use traces::{
-    with_tool, with_tool_async, Span, SpanOptions, ToolOptions, ToolSpan, Tracer, TrackToolOptions,
+    with_tool, with_tool_async, LlmMessage, LlmOptions, LlmSpan, Span, SpanOptions, ToolOptions,
+    ToolSpan, Tracer, TrackToolOptions,
 };
 pub use users::User;
 
