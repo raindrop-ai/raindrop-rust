@@ -22,8 +22,8 @@ use time::OffsetDateTime;
 use tokio::time::sleep;
 
 use raindrop::{
-    AiEvent, Attachment, Attribute, BeginOptions, Client, FinishOptions, Signal, SignalKind,
-    SpanOptions, ToolOptions, TrackToolOptions, User,
+    AiEvent, Attachment, Attribute, BeginOptions, Client, FinishOptions, LlmMessage, LlmOptions,
+    Signal, SignalKind, SpanOptions, ToolOptions, TrackToolOptions, User,
 };
 
 const DEFAULT_BACKEND_URL: &str = "https://backend.raindrop.ai";
@@ -1360,6 +1360,102 @@ async fn e2e_set_token_usage_helper_attributes_land_with_event() {
     .await
     .expect("event with output");
     assert_eq!(ev["aiData"]["model"].as_str().unwrap_or(""), "gpt-4o-mini");
+}
+
+/// **LLM span helpers populate trace payloads.** `start_llm_span` must produce a trace row that
+/// Dawn classifies as an LLM generation and whose input/output/model/provider/token fields are
+/// rendered from the helper's canonical attributes.
+#[tokio::test]
+async fn e2e_llm_span_helpers_populate_traces_list_payloads() {
+    let (write_key, dashboard_token) = match env_keys() {
+        Some(v) => v,
+        None => {
+            eprintln!("[e2e] skipping: set RAINDROP_WRITE_KEY and RAINDROP_DASHBOARD_TOKEN to run");
+            return;
+        }
+    };
+    let user_id = unique_user_id("llmspan");
+    let convo_id = format!("{}_convo", user_id);
+    let client = build_client(&write_key);
+    let interaction = client
+        .begin(BeginOptions {
+            user_id: user_id.clone(),
+            convo_id: convo_id.clone(),
+            event: "agent_run".to_string(),
+            input: "Run an LLM span helper".into(),
+            ..Default::default()
+        })
+        .await;
+
+    let llm = interaction.start_llm_span(
+        "llm.generate",
+        LlmOptions {
+            provider: "openai".into(),
+            model: "gpt-4o-mini".into(),
+            messages: vec![
+                LlmMessage::system("You answer with short arithmetic results."),
+                LlmMessage::user("What is 2+2?"),
+            ],
+            output: Some("The answer is four.".into()),
+            input_tokens: 11,
+            output_tokens: 3,
+            ..Default::default()
+        },
+    );
+    llm.end();
+
+    interaction
+        .finish(FinishOptions {
+            output: "The answer is four.".into(),
+            model: "gpt-4o-mini".into(),
+            ..Default::default()
+        })
+        .await
+        .expect("finish");
+    client.close().await.expect("close");
+
+    let ev = poll_event_until(
+        &dashboard_token,
+        &user_id,
+        |e| e["aiData"]["output"].as_str() == Some("The answer is four."),
+        E2E_POLL_TIMEOUT,
+    )
+    .await
+    .expect("event with output");
+    let event_id_for_traces = ev["id"]
+        .as_str()
+        .map(String::from)
+        .unwrap_or_else(|| interaction.event_id().to_string());
+
+    let spans = poll_traces_for_event(
+        &dashboard_token,
+        &event_id_for_traces,
+        1,
+        E2E_DERIVED_POLL_TIMEOUT,
+    )
+    .await
+    .expect("llm trace span");
+    let llm_span = spans
+        .iter()
+        .find(|s| s["span_name"].as_str() == Some("llm.generate"))
+        .unwrap_or_else(|| panic!("llm.generate span missing among {:?}", spans));
+
+    assert_eq!(
+        llm_span["span_type"].as_str().unwrap_or(""),
+        "LLM_GENERATION"
+    );
+    assert_eq!(
+        llm_span["input_payload"].as_str().unwrap_or(""),
+        "What is 2+2?"
+    );
+    assert_eq!(
+        llm_span["output_payload"].as_str().unwrap_or(""),
+        "The answer is four."
+    );
+    assert_eq!(llm_span["model"].as_str().unwrap_or(""), "gpt-4o-mini");
+    assert_eq!(llm_span["provider"].as_str().unwrap_or(""), "openai");
+    assert_eq!(numeric_property(&llm_span["input_tokens"]), 11.0);
+    assert_eq!(numeric_property(&llm_span["output_tokens"]), 3.0);
 }
 
 // NOTE: There is intentionally no `e2e_signal_sentiment_round_trips_to_dashboard` test.

@@ -1,4 +1,4 @@
-use raindrop::{Attribute, Client, SpanOptions};
+use raindrop::{Attribute, Client, LlmMessage, LlmOptions, SpanOptions};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -13,17 +13,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     agent_run.set_attributes([Attribute::string("agent.kind", "planning")]);
 
-    let llm_call = client.start_span(SpanOptions {
-        name: "llm.call".into(),
-        event_id: "evt_demo".into(),
-        parent: Some(agent_run.clone()),
-        ..Default::default()
-    });
-    llm_call.set_attributes([
-        Attribute::string("ai.model.id", "gpt-4o"),
-        Attribute::int("ai.usage.prompt_tokens", 10),
-        Attribute::int("ai.usage.completion_tokens", 5),
-    ]);
+    let llm_call = client.start_llm_span(
+        "llm.call",
+        LlmOptions {
+            parent: Some(agent_run.clone()),
+            model: "gpt-4o".into(),
+            messages: vec![LlmMessage::user("Draft a plan for the user.")],
+            ..Default::default()
+        },
+        "evt_demo",
+    );
+    llm_call.set_output("Here is a short plan.");
+    llm_call.set_token_usage("gpt-4o", 10, 5);
     llm_call.end();
 
     let retrieval = client.start_span(SpanOptions {
