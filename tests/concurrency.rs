@@ -152,6 +152,9 @@ async fn json_property_values_pass_through_unchanged() {
         .track_ai(AiEvent {
             event_id: "evt_props".into(),
             user_id: "user-1".into(),
+            event: "chat".into(),
+            input: "hi".into(),
+            output: "hello".into(),
             properties: props,
             ..Default::default()
         })

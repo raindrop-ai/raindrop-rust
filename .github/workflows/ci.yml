@@ -48,6 +48,7 @@ jobs:
           cargo test --all-features --doc --verbose
           cargo test --all-features \
             --test concurrency \
+            --test empty_events_repro \
             --test events \
             --test traces \
             --test transport \

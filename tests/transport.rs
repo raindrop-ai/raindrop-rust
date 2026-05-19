@@ -43,6 +43,8 @@ async fn retry_on_retryable_statuses() {
         .track_ai(AiEvent {
             event_id: "evt_retry".into(),
             user_id: "user-123".into(),
+            input: "hi".into(),
+            output: "hello".into(),
             ..Default::default()
         })
         .await
@@ -75,6 +77,8 @@ async fn fails_fast_on_non_retryable_4xx() {
         .track_ai(AiEvent {
             event_id: "evt_400".into(),
             user_id: "user-123".into(),
+            input: "hi".into(),
+            output: "hello".into(),
             ..Default::default()
         })
         .await;
