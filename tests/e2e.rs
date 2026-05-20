@@ -1792,3 +1792,170 @@ async fn e2e_traces_list_returns_correct_span_tree() {
         "search"
     );
 }
+
+/// **Drop-policy regression test.** Verifies the fix introduced in v0.0.6 against the real
+/// Raindrop backend: a finalized `track_ai` with empty `input` and `output` (the chisel-style
+/// production failure mode — wrapper populating only `model`, `convo_id`, and token-usage
+/// `properties`) MUST be dropped client-side and never reach the dashboard.
+///
+/// We send two events for the same `user_id`:
+///   1. The chisel-style empty-text event — must be dropped by `should_drop_empty_ai_event`.
+///   2. A control event with populated `input`/`output` — proves the ingestion pipeline is
+///      alive and our `user_id` surfaces correctly.
+///
+/// After the control lands, we wait an extra settling window so a regressed (un-dropped)
+/// chisel-style event would have time to appear, then assert that exactly ONE event is
+/// visible for this `user_id`. If the SDK drop policy were ever removed or weakened, this
+/// test would observe two events and fail.
+#[tokio::test]
+async fn e2e_chisel_style_empty_text_event_does_not_land_in_dashboard() {
+    let (write_key, dashboard_token) = match env_keys() {
+        Some(v) => v,
+        None => {
+            eprintln!("[e2e] skipping: set RAINDROP_WRITE_KEY and RAINDROP_DASHBOARD_TOKEN to run");
+            return;
+        }
+    };
+
+    let user_id = unique_user_id("chisel_drop");
+    let convo_id = format!("{}_convo", user_id);
+    let client = build_client(&write_key);
+
+    let mut empty_props = BTreeMap::new();
+    empty_props.insert("total_input_tokens".to_string(), json!(123));
+    empty_props.insert("output_tokens".to_string(), json!(45));
+    empty_props.insert("total_time_ms".to_string(), json!(789));
+
+    let chisel_event_id = format!("{}_chisel_evt", user_id);
+    let control_event_id = format!("{}_control_evt", user_id);
+
+    client
+        .track_ai(AiEvent {
+            event_id: chisel_event_id.clone(),
+            user_id: user_id.clone(),
+            event: "ai_generation".to_string(),
+            input: String::new(),
+            output: String::new(),
+            model: "swe-1-6-slow".to_string(),
+            convo_id: convo_id.clone(),
+            properties: empty_props,
+            ..Default::default()
+        })
+        .await
+        .expect("track_ai chisel (expected to be dropped client-side)");
+
+    client
+        .track_ai(AiEvent {
+            event_id: control_event_id.clone(),
+            user_id: user_id.clone(),
+            event: "ai_generation".to_string(),
+            input: "control input".to_string(),
+            output: "control output".to_string(),
+            model: "gpt-4o".to_string(),
+            convo_id: convo_id.clone(),
+            ..Default::default()
+        })
+        .await
+        .expect("track_ai control");
+
+    client.close().await.expect("close");
+
+    let _ = poll_events(&dashboard_token, &user_id, 1, E2E_POLL_TIMEOUT)
+        .await
+        .expect("control event must land — if this times out the issue is the ingest pipeline, not the SDK drop policy");
+
+    // The chisel-style event was sent through `track_ai` BEFORE the control on the same
+    // client. If the drop were regressed and the empty event were shipped, both events
+    // would hit the ingest API within milliseconds of each other and would surface on the
+    // dashboard within the same window. We give the pipeline a generous settling buffer to
+    // make sure a regressed empty event has every chance to appear before we conclude it
+    // was dropped.
+    sleep(Duration::from_secs(45)).await;
+
+    let final_events = query_dashboard(&dashboard_token, 50)
+        .await
+        .expect("final dashboard query");
+    let matched: Vec<&Value> = final_events
+        .iter()
+        .filter(|e| e["userId"].as_str() == Some(&user_id))
+        .collect();
+    assert_eq!(
+        matched.len(),
+        1,
+        "SDK drop-policy regression: expected exactly ONE event for user {} (the control), got {}. \
+         If the chisel-style empty-text event is among these, `should_drop_empty_ai_event` is no \
+         longer firing. Events: {:?}",
+        user_id,
+        matched.len(),
+        matched
+    );
+    let ev = matched[0];
+    // The dashboard's `events.list` returns the caller-supplied `event_id` as the `id` field
+    // (also mirrored to `customEventId`). It does NOT expose a camelCase `eventId` key.
+    let surviving_id = ev["id"].as_str().unwrap_or_default();
+    assert_eq!(
+        surviving_id, control_event_id,
+        "surviving event must be the control (event_id {}), not the chisel drop (event_id {})",
+        control_event_id, chisel_event_id
+    );
+    assert_eq!(
+        ev["aiData"]["input"].as_str().unwrap_or_default(),
+        "control input"
+    );
+    assert_eq!(
+        ev["aiData"]["output"].as_str().unwrap_or_default(),
+        "control output"
+    );
+}
+
+/// **Drop-policy escape hatch.** A finalized `track_ai` with populated `input` but empty
+/// `output` is the canonical "errored generation" shape (we captured the prompt but the
+/// model failed mid-stream). The drop gate intentionally does NOT fire on this shape — only
+/// payloads with BOTH `input` and `output` empty get dropped — so the event must still
+/// land on the dashboard with an empty `aiData.output`.
+///
+/// This complements the integration test `errored_generation_with_input_only_still_ships`
+/// in `tests/empty_events_repro.rs` by verifying that the dashboard correctly renders the
+/// resulting row rather than rejecting it at ingest.
+#[tokio::test]
+async fn e2e_errored_generation_with_input_only_lands_in_dashboard() {
+    let (write_key, dashboard_token) = match env_keys() {
+        Some(v) => v,
+        None => {
+            eprintln!("[e2e] skipping: set RAINDROP_WRITE_KEY and RAINDROP_DASHBOARD_TOKEN to run");
+            return;
+        }
+    };
+
+    let user_id = unique_user_id("errored_input_only");
+    let client = build_client(&write_key);
+
+    client
+        .track_ai(AiEvent {
+            user_id: user_id.clone(),
+            event: "ai_generation".to_string(),
+            input: "Tell me a joke".to_string(),
+            output: String::new(),
+            model: "gpt-4o".to_string(),
+            ..Default::default()
+        })
+        .await
+        .expect("track_ai errored");
+
+    client.close().await.expect("close");
+
+    let events = poll_events(&dashboard_token, &user_id, 1, E2E_POLL_TIMEOUT)
+        .await
+        .expect("dashboard verification");
+    let ev = events
+        .iter()
+        .find(|e| e["aiData"]["input"].as_str().unwrap_or("") == "Tell me a joke")
+        .unwrap_or_else(|| panic!("errored event not found among {:?}", events));
+    let output = ev["aiData"]["output"].as_str().unwrap_or_default();
+    assert!(
+        output.is_empty(),
+        "aiData.output must be empty (input-only errored generation), got {:?}",
+        output
+    );
+    assert_eq!(ev["aiData"]["model"].as_str().unwrap_or_default(), "gpt-4o");
+}

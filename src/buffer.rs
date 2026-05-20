@@ -173,6 +173,22 @@ impl EventBuffer {
             }
         };
 
+        if should_drop_empty_ai_event(&payload) {
+            tracing::warn!(
+                event_id,
+                event_name = %payload.event,
+                has_ai_data = payload.ai_data.is_some(),
+                "raindrop: dropping finalized track_partial with empty ai_input and ai_output. \
+                 Populate input/output via BeginOptions/FinishOptions/AiEvent, or record errored \
+                 generations via `LlmSpan::set_error`."
+            );
+            let mut state = self.state.lock().await;
+            if !state.buffers.contains_key(event_id) {
+                state.sticky.remove(event_id);
+            }
+            return Ok(());
+        }
+
         match client
             .transport
             .post_json("events/track_partial", &payload)
@@ -325,5 +341,47 @@ fn build_track_partial_payload(
             convo_id,
         });
     }
+
     Some(payload)
+}
+
+/// Whether to silently drop a built payload because it would be a phantom
+/// finalized AI event with no prompt or response text. These are the events
+/// that show up in the dashboard with empty `ai_input` / `ai_output` and
+/// confuse users.
+///
+/// We only drop *finalized* (`is_pending=false`) payloads so that legitimate
+/// in-flight interactions (pending patches that will be completed by a later
+/// `finish` / `patch` call) still ship. Pending intermediates can have empty
+/// text and that is expected.
+///
+/// Two shapes get dropped:
+///   * `ai_data` is attached but both `input` and `output` are empty AND
+///     there are no attachments — the wrapper recorded model / convo_id /
+///     token usage but never the prompt or response. To record an errored
+///     generation instead, attach an `LlmSpan` and call `set_error(...)`
+///     on it; Dawn will associate the error span with this event by
+///     `event_id`.
+///   * No `ai_data` was attached, the event name resolved to
+///     `ai_generation`, and there are no attachments. The gate cannot tell
+///     whether the caller passed an empty `event` (and it defaulted) or
+///     explicitly passed `event: "ai_generation"` — in both cases an
+///     empty-bodied `ai_generation` event is the bug we're guarding against,
+///     so both get dropped.
+///
+/// Attachment-only events (image upload with no text) always ship, even
+/// when `ai_data` was attached because the caller set `model` or `convo_id`
+/// — attachments are real payload regardless of whether the AI text fields
+/// are populated.
+fn should_drop_empty_ai_event(payload: &TrackPartialPayload) -> bool {
+    if payload.is_pending {
+        return false;
+    }
+    if !payload.attachments.is_empty() {
+        return false;
+    }
+    match &payload.ai_data {
+        Some(data) => data.input.is_empty() && data.output.is_empty(),
+        None => payload.event == crate::DEFAULT_EVENT_NAME,
+    }
 }

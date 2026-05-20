@@ -4,6 +4,31 @@ All notable changes to this crate are documented here. Format follows [Keep a Ch
 
 ## [Unreleased]
 
+## [0.0.6] - 2026-05-19
+
+### Fixed
+
+- **Drop phantom `ai_generation` events with empty `ai_input` and `ai_output`.**
+  Finalized `track_partial` payloads (`is_pending=false`) that would have
+  shipped to the backend with both `ai_input` and `ai_output` empty are now
+  dropped at the buffer level with a single `tracing::warn!`. This catches
+  wrapper authors that record `model` / `convo_id` / token-usage `properties`
+  but never populate the prompt or response text, which previously surfaced
+  in the dashboard as rows of empty `ai_generation` events. The drop is
+  observable only via the warning log — there is no wire change and no
+  public API change.
+
+  Legitimate adjacent shapes are unaffected:
+  * non-AI `track_event` calls with an explicit event name still ship,
+  * attachment-only events with no AI text still ship (image upload events),
+  * errored generations that ship the prompt as `input` (only `output` empty)
+    still ship — the wrapper should attach an `LlmSpan` and call
+    `set_error(...)` on it to carry the error detail; Dawn associates the
+    error span with the event row by `event_id` via the `error_spans`
+    extension, mirroring the JS SDK's `liveInteraction.setError` path,
+  * pending intermediates (`is_pending=true`) still ship — the caller may
+    follow up with a `finish` that populates the missing text fields.
+
 ## [0.0.5] - 2026-05-14
 
 ### Added
@@ -119,7 +144,8 @@ Initial **beta** release. The wire contract against the Raindrop ingestion API i
 - No client-side PII redaction (Python's `set_redact_pii` and JS's `redactPii` have no Rust equivalent yet).
 - No local-debugger mirroring (no `RAINDROP_LOCAL_DEBUGGER` support).
 
-[Unreleased]: https://github.com/raindrop-ai/raindrop-rust/compare/v0.0.5...HEAD
+[Unreleased]: https://github.com/raindrop-ai/raindrop-rust/compare/v0.0.6...HEAD
+[0.0.6]: https://github.com/raindrop-ai/raindrop-rust/compare/v0.0.5...v0.0.6
 [0.0.5]: https://github.com/raindrop-ai/raindrop-rust/compare/v0.0.4...v0.0.5
 [0.0.4]: https://github.com/raindrop-ai/raindrop-rust/compare/v0.0.3...v0.0.4
 [0.0.3]: https://github.com/raindrop-ai/raindrop-rust/compare/v0.0.2...v0.0.3
