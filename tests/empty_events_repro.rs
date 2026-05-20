@@ -10,12 +10,11 @@
 mod common;
 
 use std::collections::BTreeMap;
-use std::time::Duration;
 
 use serde_json::json;
 use wiremock::MockServer;
 
-use raindrop::{AiEvent, BeginOptions, Event, FinishOptions, PatchOptions};
+use raindrop::{AiEvent, Attachment, BeginOptions, Event, FinishOptions, PatchOptions};
 
 use crate::common::{fast_client_builder, mount_path};
 
@@ -179,6 +178,49 @@ async fn non_ai_track_event_with_custom_name_still_ships() {
     assert!(payload.get("ai_data").is_none() || payload["ai_data"].is_null());
 }
 
+/// Attachment-only event: image upload with no text fields. Even though
+/// `event_name` resolves to the default `ai_generation` and `ai_data` is
+/// `None` (no text fields populated), the payload is not phantom — the
+/// attachment is real content. Must still ship.
+#[tokio::test]
+async fn attachment_only_event_with_default_name_still_ships() {
+    let server = MockServer::start().await;
+    let recorder = mount_path(&server, "POST", "/events/track_partial").await;
+
+    let client = fast_client_builder(&server).build().expect("build client");
+
+    client
+        .track_event(Event {
+            event_id: "evt_attach".into(),
+            user_id: "user-attach".into(),
+            event: String::new(),
+            attachments: vec![Attachment {
+                kind: "image".into(),
+                role: "input".into(),
+                value: "https://example.com/cat.png".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        })
+        .await
+        .expect("track_event");
+
+    let _ = client.close().await;
+
+    let requests = recorder.requests();
+    assert_eq!(
+        requests.len(),
+        1,
+        "attachment-only event must still ship even with default event name"
+    );
+    let payload = requests[0].json();
+    assert_eq!(payload["attachments"][0]["type"], "image");
+    assert_eq!(
+        payload["attachments"][0]["value"],
+        "https://example.com/cat.png"
+    );
+}
+
 /// A wrapper that captures the prompt but the model returned an empty
 /// response (e.g. errored mid-stream). With `input` populated and `output`
 /// empty, this is a legitimate "errored generation" shape and must still
@@ -213,18 +255,16 @@ async fn errored_generation_with_input_only_still_ships() {
     assert_eq!(payload["is_pending"], false);
 }
 
-/// In-flight `begin()` whose periodic flush ships an `is_pending=true` patch
-/// must NOT be dropped, even when the patch only has metadata. Pending
-/// intermediates may legitimately have no output yet.
+/// In-flight `begin()` whose flush ships an `is_pending=true` patch must NOT
+/// be dropped, even when the patch only has metadata. Pending intermediates
+/// may legitimately have no output yet. We force the flush via `close()`
+/// rather than wall-clock sleeps so the test is deterministic on slow CI.
 #[tokio::test]
 async fn pending_begin_with_input_is_not_dropped() {
     let server = MockServer::start().await;
     let recorder = mount_path(&server, "POST", "/events/track_partial").await;
 
-    let client = fast_client_builder(&server)
-        .partial_flush_interval(Duration::from_millis(10))
-        .build()
-        .expect("build client");
+    let client = fast_client_builder(&server).build().expect("build client");
 
     let _interaction = client
         .begin(BeginOptions {
@@ -237,9 +277,6 @@ async fn pending_begin_with_input_is_not_dropped() {
         })
         .await;
 
-    // Let the periodic ticker flush the pending begin patch.
-    tokio::time::sleep(Duration::from_millis(120)).await;
-
     let _ = client.close().await;
 
     let requests = recorder.requests();
@@ -250,19 +287,17 @@ async fn pending_begin_with_input_is_not_dropped() {
 }
 
 /// `client.patch(...)` with only a `user_id` produces a pending phantom event
-/// via the periodic flush. is_pending=true, so it is NOT dropped — the user
-/// may follow up with a `finish` that finalizes the event. (Dropping pending
+/// at flush time. is_pending=true, so it is NOT dropped — the user may
+/// follow up with a `finish` that finalizes the event. (Dropping pending
 /// phantoms here would break legitimate `patch`-then-`finish` flows that
-/// pass `user_id` first and the prompt later.)
+/// pass `user_id` first and the prompt later.) We force the flush via
+/// `close()` so the test is deterministic on slow CI.
 #[tokio::test]
 async fn patch_only_user_id_still_ships_as_pending() {
     let server = MockServer::start().await;
     let recorder = mount_path(&server, "POST", "/events/track_partial").await;
 
-    let client = fast_client_builder(&server)
-        .partial_flush_interval(Duration::from_millis(10))
-        .build()
-        .expect("build client");
+    let client = fast_client_builder(&server).build().expect("build client");
 
     client
         .patch(
@@ -274,8 +309,6 @@ async fn patch_only_user_id_still_ships_as_pending() {
         )
         .await
         .expect("patch");
-
-    tokio::time::sleep(Duration::from_millis(120)).await;
 
     let _ = client.close().await;
 

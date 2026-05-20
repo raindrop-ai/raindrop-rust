@@ -361,16 +361,20 @@ fn build_track_partial_payload(
 ///     or response. To record an errored generation instead, attach an
 ///     `LlmSpan` and call `set_error(...)` on it; Dawn will associate the
 ///     error span with this event by `event_id`.
-///   * `ai_data` was not attached at all and the event name was never set by
-///     the caller (so it defaulted to `ai_generation`). This is the classic
-///     "forgot the event name" footgun in `track_event` / `track_ai` /
-///     `begin`.
+///   * No `ai_data` was attached, the event name resolved to
+///     `ai_generation`, and there are no attachments. The gate cannot tell
+///     whether the caller passed an empty `event` (and it defaulted) or
+///     explicitly passed `event: "ai_generation"` — in both cases an
+///     empty-bodied `ai_generation` event is the bug we're guarding against,
+///     so both get dropped. Attachment-only events (image upload with no
+///     text) still ship because attachments are payload, even when the AI
+///     text fields are not.
 fn should_drop_empty_ai_event(payload: &TrackPartialPayload) -> bool {
     if payload.is_pending {
         return false;
     }
     match &payload.ai_data {
         Some(data) => data.input.is_empty() && data.output.is_empty(),
-        None => payload.event == crate::DEFAULT_EVENT_NAME,
+        None => payload.event == crate::DEFAULT_EVENT_NAME && payload.attachments.is_empty(),
     }
 }

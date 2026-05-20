@@ -91,6 +91,7 @@ jobs:
           cargo test --no-default-features --features ${{ matrix.features }} --doc
           cargo test --no-default-features --features ${{ matrix.features }} \
             --test concurrency \
+            --test empty_events_repro \
             --test events \
             --test traces \
             --test transport \
