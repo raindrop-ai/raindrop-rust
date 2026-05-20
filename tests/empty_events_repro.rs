@@ -221,6 +221,65 @@ async fn attachment_only_event_with_default_name_still_ships() {
     );
 }
 
+/// Attachment-only event where the caller ALSO set `model` (or `convo_id`),
+/// causing `build_track_partial_payload` to attach `ai_data`. The drop gate
+/// hits the `Some(data)` branch with empty `input`/`output`, but the
+/// payload carries a real attachment so it must still ship. This is the
+/// canonical "vision" or "image generation" shape: the model is named
+/// (`gpt-4o`, `dall-e-3`, ...) but the prompt/response are represented as
+/// attachments rather than text.
+///
+/// Regression for the Bugbot finding on 341f2c0: prior to the fix, the
+/// `Some(data)` branch dropped any payload with empty text regardless of
+/// attachments, silently discarding image-only AI events despite the
+/// CHANGELOG claim that "attachment-only events with no AI text still ship".
+#[tokio::test]
+async fn attachment_only_ai_event_with_model_set_still_ships() {
+    let server = MockServer::start().await;
+    let recorder = mount_path(&server, "POST", "/events/track_partial").await;
+
+    let client = fast_client_builder(&server).build().expect("build client");
+
+    client
+        .track_ai(AiEvent {
+            event_id: "evt_vision".into(),
+            user_id: "user-vision".into(),
+            event: "ai_generation".into(),
+            input: String::new(),
+            output: String::new(),
+            model: "gpt-4o".into(),
+            convo_id: "conv-vision".into(),
+            attachments: vec![Attachment {
+                kind: "image".into(),
+                role: "input".into(),
+                value: "https://example.com/screenshot.png".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        })
+        .await
+        .expect("track_ai");
+
+    let _ = client.close().await;
+
+    let requests = recorder.requests();
+    assert_eq!(
+        requests.len(),
+        1,
+        "vision/image-only AI event must ship even though ai_data is attached \
+         (model+convo_id set) and input/output are both empty — attachments are payload"
+    );
+    let payload = requests[0].json();
+    assert_eq!(payload["ai_data"]["model"], "gpt-4o");
+    assert_eq!(payload["ai_data"]["convo_id"], "conv-vision");
+    assert_eq!(payload["attachments"][0]["type"], "image");
+    assert_eq!(
+        payload["attachments"][0]["value"],
+        "https://example.com/screenshot.png"
+    );
+    assert_eq!(payload["is_pending"], false);
+}
+
 /// A wrapper that captures the prompt but the model returned an empty
 /// response (e.g. errored mid-stream). With `input` populated and `output`
 /// empty, this is a legitimate "errored generation" shape and must still

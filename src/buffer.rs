@@ -356,25 +356,32 @@ fn build_track_partial_payload(
 /// text and that is expected.
 ///
 /// Two shapes get dropped:
-///   * `ai_data` is attached but both `input` and `output` are empty — the
-///     wrapper recorded model / convo_id / token usage but never the prompt
-///     or response. To record an errored generation instead, attach an
-///     `LlmSpan` and call `set_error(...)` on it; Dawn will associate the
-///     error span with this event by `event_id`.
+///   * `ai_data` is attached but both `input` and `output` are empty AND
+///     there are no attachments — the wrapper recorded model / convo_id /
+///     token usage but never the prompt or response. To record an errored
+///     generation instead, attach an `LlmSpan` and call `set_error(...)`
+///     on it; Dawn will associate the error span with this event by
+///     `event_id`.
 ///   * No `ai_data` was attached, the event name resolved to
 ///     `ai_generation`, and there are no attachments. The gate cannot tell
 ///     whether the caller passed an empty `event` (and it defaulted) or
 ///     explicitly passed `event: "ai_generation"` — in both cases an
 ///     empty-bodied `ai_generation` event is the bug we're guarding against,
-///     so both get dropped. Attachment-only events (image upload with no
-///     text) still ship because attachments are payload, even when the AI
-///     text fields are not.
+///     so both get dropped.
+///
+/// Attachment-only events (image upload with no text) always ship, even
+/// when `ai_data` was attached because the caller set `model` or `convo_id`
+/// — attachments are real payload regardless of whether the AI text fields
+/// are populated.
 fn should_drop_empty_ai_event(payload: &TrackPartialPayload) -> bool {
     if payload.is_pending {
         return false;
     }
+    if !payload.attachments.is_empty() {
+        return false;
+    }
     match &payload.ai_data {
         Some(data) => data.input.is_empty() && data.output.is_empty(),
-        None => payload.event == crate::DEFAULT_EVENT_NAME && payload.attachments.is_empty(),
+        None => payload.event == crate::DEFAULT_EVENT_NAME,
     }
 }
