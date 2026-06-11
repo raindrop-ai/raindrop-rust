@@ -360,7 +360,7 @@ process exit.
 | `max_attempts`           | `3`                           | HTTP retries (1 = no retries)                     |
 | `base_delay`             | `1s`                          | Backoff base (exponential, ±20% jitter)           |
 | `jitter_fraction`        | `0.2`                         | Backoff jitter fraction (0.0–1.0)                 |
-| `request_timeout`        | `10s`                         | Per-attempt bound on every cloud POST             |
+| `request_timeout`        | `30s`                         | Per-attempt bound on every cloud POST             |
 | `close_timeout`          | `10s`                         | Overall `close()` deadline. `0` disables          |
 | `max_text_field_chars`   | `1_000_000`                   | Per-field cap on AI text content                  |
 | `service_name`           | `raindrop.rust-sdk`           | OTLP `resource.service.name`                      |

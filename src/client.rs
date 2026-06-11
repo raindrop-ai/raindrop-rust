@@ -223,7 +223,7 @@ impl ClientBuilder {
     }
 
     /// Per-attempt bound applied to EVERY cloud POST, from connect through
-    /// response body (default 10s). Applied at the request level, so it holds
+    /// response body (default 30s). Applied at the request level, so it holds
     /// even for a caller-injected `http_client` built without timeouts; note
     /// that per-request timeouts override the injected client's own
     /// `ClientBuilder::timeout`, so set this knob to match if you need a

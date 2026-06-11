@@ -15,7 +15,7 @@ grow its memory without bound, or flood its logs.
 - **Text fields are capped BEFORE serialization.** AI input/output, tool span
   I/O, LLM span content, and association property values are truncated up
   front with a `...[truncated by raindrop]` marker that fits **within** the
-  cap (default 100,000 chars; new `ClientBuilder::max_text_field_chars`; a
+  cap (default 1,000,000 chars; new `ClientBuilder::max_text_field_chars`; a
   stricter `OTEL_SPAN_ATTRIBUTE_VALUE_LENGTH_LIMIT` is honored at build
   time). Structured payloads serialize through an output-budgeted writer that
   aborts when the budget is exhausted, so the cost of an oversized payload is
@@ -30,7 +30,7 @@ grow its memory without bound, or flood its logs.
   (non-zero) flush intervals blocked until `close()`. Tickers now live in a
   dedicated slot awaited only during `close()`.
 - **Every cloud POST is bounded.** A per-request timeout (new
-  `ClientBuilder::request_timeout`, default 10s) applies even when a
+  `ClientBuilder::request_timeout`, default 30s) applies even when a
   caller-injected `http_client` was built without timeouts; the SDK-built
   client also sets a 5s connect timeout.
 - **`close()` runs under a hard deadline.** New `ClientBuilder::close_timeout`
