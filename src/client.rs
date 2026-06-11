@@ -23,6 +23,25 @@ use crate::traces::{
 };
 use crate::users::{identify, User};
 
+/// Default per-field character cap for AI text content (input/output, tool
+/// span I/O, LLM span content). Mirrors the python-sdk's
+/// `max_text_field_chars` default.
+pub(crate) const DEFAULT_MAX_TEXT_FIELD_CHARS: usize = 1_000_000;
+
+/// Default per-attempt bound for every cloud POST (connect through body).
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Default connect-phase bound for the SDK-built `reqwest::Client`.
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Default overall deadline for `close()` (python-sdk shutdown parity: a dead
+/// or slow network must never wedge the host process's exit).
+const DEFAULT_CLOSE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Default cap on distinct buffered event ids (matches the trace buffer's
+/// `trace_max_queue_size` default).
+const DEFAULT_EVENT_MAX_QUEUE_SIZE: usize = 5000;
+
 /// Shared inner state for the client.
 pub(crate) struct ClientInner {
     pub(crate) transport: RetryingHttpClient,
@@ -33,8 +52,15 @@ pub(crate) struct ClientInner {
     pub(crate) context_data: Value,
     pub(crate) event_buffer: Arc<EventBuffer>,
     pub(crate) trace_buffer: Arc<TraceBuffer>,
+    pub(crate) max_text_field_chars: usize,
+    pub(crate) close_timeout: Duration,
     pub(crate) closed: AtomicBool,
+    /// One-shot fire-and-forget tasks (span enqueues). Drained by `flush()`.
     pub(crate) flush_tasks: std::sync::Mutex<Vec<JoinHandle<()>>>,
+    /// Long-running periodic flusher tasks. They only complete after their
+    /// buffer's stop notify fires, so they MUST NOT live in `flush_tasks`:
+    /// awaiting them from `flush()` would block until `close()`.
+    pub(crate) periodic_tasks: std::sync::Mutex<Vec<JoinHandle<()>>>,
 }
 
 impl std::fmt::Debug for ClientInner {
@@ -65,9 +91,13 @@ pub struct ClientBuilder {
     trace_flush_interval: Duration,
     trace_max_batch_size: usize,
     trace_max_queue_size: usize,
+    event_max_queue_size: usize,
     max_attempts: u32,
     base_delay: Duration,
     jitter_fraction: f64,
+    request_timeout: Duration,
+    close_timeout: Duration,
+    max_text_field_chars: usize,
     service_name: String,
     library_name: String,
     library_version: String,
@@ -86,9 +116,13 @@ impl Default for ClientBuilder {
             trace_flush_interval: Duration::from_secs(1),
             trace_max_batch_size: 50,
             trace_max_queue_size: 5000,
+            event_max_queue_size: DEFAULT_EVENT_MAX_QUEUE_SIZE,
             max_attempts: 3,
             base_delay: Duration::from_secs(1),
             jitter_fraction: 0.2,
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            close_timeout: DEFAULT_CLOSE_TIMEOUT,
+            max_text_field_chars: DEFAULT_MAX_TEXT_FIELD_CHARS,
             service_name: crate::DEFAULT_SERVICE_NAME.to_string(),
             library_name: crate::DEFAULT_LIBRARY_NAME.to_string(),
             library_version: crate::VERSION.to_string(),
@@ -160,6 +194,16 @@ impl ClientBuilder {
         self
     }
 
+    /// Maximum number of distinct event ids buffered at once (default 5000).
+    /// When the network is down (patches are restored for retry) or
+    /// interactions are abandoned, the buffer stops growing at this bound and
+    /// new events are dropped with a rate-limited warning instead of growing
+    /// host memory without limit.
+    pub fn event_max_queue_size(mut self, size: usize) -> Self {
+        self.event_max_queue_size = size.max(1);
+        self
+    }
+
     /// Number of HTTP attempts (default 3). Set to 1 to disable retries.
     pub fn max_attempts(mut self, max_attempts: u32) -> Self {
         self.max_attempts = max_attempts.max(1);
@@ -175,6 +219,44 @@ impl ClientBuilder {
     /// Jitter fraction applied to retry delays (0.0–1.0). Default 0.2.
     pub fn jitter_fraction(mut self, fraction: f64) -> Self {
         self.jitter_fraction = fraction.clamp(0.0, 1.0);
+        self
+    }
+
+    /// Per-attempt bound applied to EVERY cloud POST, from connect through
+    /// response body (default 10s). Applied at the request level, so it holds
+    /// even for a caller-injected `http_client` built without timeouts; note
+    /// that per-request timeouts override the injected client's own
+    /// `ClientBuilder::timeout`, so set this knob to match if you need a
+    /// stricter bound.
+    pub fn request_timeout(mut self, timeout: Duration) -> Self {
+        self.request_timeout = timeout;
+        self
+    }
+
+    /// Overall deadline for [`Client::close`] (default 10s): stop signals,
+    /// in-flight task draining, and the final flush all share this budget, so
+    /// a dead or slow network can never wedge the host process's shutdown.
+    /// Payloads that don't make it out before the deadline are dropped with a
+    /// warning. `Duration::ZERO` disables the deadline.
+    pub fn close_timeout(mut self, timeout: Duration) -> Self {
+        self.close_timeout = timeout;
+        self
+    }
+
+    /// Per-field character cap applied to AI input/output and serialized
+    /// tool/LLM span content BEFORE buffering or serialization, so oversized
+    /// payloads cost the cap — not the payload — on the calling task, and
+    /// land truncated (marker `...[truncated by raindrop]`, included within
+    /// the cap) instead of being silently dropped at the 1 MiB ingest limit.
+    /// Defaults to 1,000,000. A stricter `OTEL_SPAN_ATTRIBUTE_VALUE_LENGTH_LIMIT`
+    /// env var (read once at build time) is also honored. Values of 0 are
+    /// ignored.
+    pub fn max_text_field_chars(mut self, limit: usize) -> Self {
+        if limit > 0 {
+            self.max_text_field_chars = limit;
+        } else {
+            tracing::warn!("raindrop: max_text_field_chars(0) ignored; must be > 0");
+        }
         self
     }
 
@@ -196,7 +278,10 @@ impl ClientBuilder {
         self
     }
 
-    /// Inject a custom `reqwest::Client`. Defaults to a fresh client with sane timeouts.
+    /// Inject a custom `reqwest::Client`. Defaults to a fresh client with sane
+    /// timeouts. Note the SDK additionally applies [`Self::request_timeout`]
+    /// per request, so even a client built without timeouts cannot hang a
+    /// flush indefinitely.
     pub fn http_client(mut self, client: reqwest::Client) -> Self {
         self.http_client = Some(client);
         self
@@ -215,7 +300,8 @@ impl ClientBuilder {
         let http = match self.http_client {
             Some(c) => c,
             None => reqwest::Client::builder()
-                .timeout(Duration::from_secs(10))
+                .timeout(DEFAULT_REQUEST_TIMEOUT)
+                .connect_timeout(DEFAULT_CONNECT_TIMEOUT)
                 .build()
                 .map_err(|e| Error::Config(format!("could not build http client: {}", e)))?,
         };
@@ -228,12 +314,16 @@ impl ClientBuilder {
                 max_attempts: self.max_attempts,
                 base_delay: self.base_delay,
                 jitter_fraction: self.jitter_fraction,
+                request_timeout: self.request_timeout,
                 debug: self.debug,
             },
             http,
         );
 
-        let event_buffer = Arc::new(EventBuffer::new(self.partial_flush_interval));
+        let event_buffer = Arc::new(EventBuffer::new(
+            self.partial_flush_interval,
+            self.event_max_queue_size,
+        ));
         let trace_buffer = Arc::new(TraceBuffer::new(
             self.trace_flush_interval,
             self.trace_max_batch_size,
@@ -257,8 +347,11 @@ impl ClientBuilder {
             context_data,
             event_buffer,
             trace_buffer,
+            max_text_field_chars: effective_text_field_limit(self.max_text_field_chars),
+            close_timeout: self.close_timeout,
             closed: AtomicBool::new(false),
             flush_tasks: std::sync::Mutex::new(Vec::new()),
+            periodic_tasks: std::sync::Mutex::new(Vec::new()),
         });
 
         let client = Client { inner };
@@ -288,6 +381,11 @@ impl Client {
     /// Whether the client is closed.
     pub fn is_closed(&self) -> bool {
         self.inner.closed.load(Ordering::SeqCst)
+    }
+
+    /// Effective per-field character cap for AI text content.
+    pub(crate) fn max_text_field_chars(&self) -> usize {
+        self.inner.max_text_field_chars
     }
 
     /// Track a non-AI event.
@@ -459,7 +557,10 @@ impl Client {
         if !opts.operation_id.is_empty() {
             attrs.push(Attribute::string("ai.operationId", &opts.operation_id));
         }
-        attrs.extend(tool_property_attributes(&opts.properties));
+        attrs.extend(tool_property_attributes(
+            &opts.properties,
+            self.inner.max_text_field_chars,
+        ));
         Span::new(
             self.clone(),
             ids,
@@ -493,7 +594,7 @@ impl Client {
         } else {
             opts.operation_id.clone()
         };
-        let attrs = build_llm_attributes(&opts);
+        let attrs = build_llm_attributes(&opts, self.inner.max_text_field_chars);
         let span_opts = SpanOptions {
             name,
             event_id: event_id.to_string(),
@@ -524,7 +625,14 @@ impl Client {
                 .entry("event_id".to_string())
                 .or_insert_with(|| Value::String(event_id.to_string()));
         }
-        let attrs = build_tool_attributes(&name, opts.input.as_ref(), None, None, &properties);
+        let attrs = build_tool_attributes(
+            &name,
+            opts.input.as_ref(),
+            None,
+            None,
+            &properties,
+            self.inner.max_text_field_chars,
+        );
         let span_opts = SpanOptions {
             name,
             event_id: event_id.to_string(),
@@ -557,6 +665,7 @@ impl Client {
             opts.output.as_ref(),
             opts.duration,
             &opts.properties,
+            self.inner.max_text_field_chars,
         );
         let parent_ids = opts.parent.as_ref().and_then(|p| p.ids());
         let ids = create_span_ids(parent_ids.as_ref());
@@ -609,6 +718,10 @@ impl Client {
             buffer.enqueue(inner, span).await;
         });
         if let Ok(mut tasks) = self.inner.flush_tasks.lock() {
+            // Prune completed handles so an app that emits spans steadily but
+            // never calls flush() doesn't accumulate one JoinHandle per span
+            // forever.
+            tasks.retain(|t| !t.is_finished());
             tasks.push(task);
         }
     }
@@ -665,7 +778,10 @@ impl Client {
     }
 
     /// Close the client. Cancels periodic timers, awaits any in-flight tasks, and force-flushes
-    /// remaining buffers.
+    /// remaining buffers — all under the [`ClientBuilder::close_timeout`]
+    /// deadline (default 10s), so a dead or slow network can never wedge the
+    /// host process's shutdown. Payloads that don't make it out before the
+    /// deadline are dropped with a warning and `Ok(())` is returned.
     pub async fn close(&self) -> Result<()> {
         if self.inner.closed.swap(true, Ordering::SeqCst) {
             return Ok(());
@@ -675,7 +791,46 @@ impl Client {
         }
         self.inner.event_buffer.stop();
         self.inner.trace_buffer.stop();
-        self.flush().await
+
+        let deadline = self.inner.close_timeout;
+        if deadline.is_zero() {
+            self.drain_periodic_tasks().await;
+            return self.flush().await;
+        }
+        match tokio::time::timeout(deadline, async {
+            self.drain_periodic_tasks().await;
+            self.flush().await
+        })
+        .await
+        {
+            Ok(res) => res,
+            Err(_) => {
+                tracing::warn!(
+                    timeout_secs = deadline.as_secs_f64(),
+                    "raindrop: close() deadline exceeded; dropping remaining buffered telemetry \
+                     so process shutdown is not blocked"
+                );
+                Ok(())
+            }
+        }
+    }
+
+    /// Await the periodic flusher tasks. Called after the buffers' stop
+    /// notifies fire, so the tickers exit on their next select; a task
+    /// mid-flush finishes its in-flight cycle first (bounded by `close()`'s
+    /// deadline).
+    async fn drain_periodic_tasks(&self) {
+        let tasks: Vec<JoinHandle<()>> = {
+            let mut guard = self
+                .inner
+                .periodic_tasks
+                .lock()
+                .expect("periodic task lock poisoned");
+            std::mem::take(&mut *guard)
+        };
+        for task in tasks {
+            let _ = task.await;
+        }
     }
 
     fn start_periodic_flushers(&self) {
@@ -686,6 +841,10 @@ impl Client {
         let event_interval = event_buffer.flush_every();
         let trace_interval = trace_buffer.flush_every();
 
+        // Periodic tickers run until their stop notify fires at close(); they
+        // must live in `periodic_tasks`, NOT `flush_tasks` — flush() awaits
+        // every flush_tasks handle, so a never-ending ticker there would make
+        // any explicit flush() call block until close().
         if event_interval > Duration::ZERO {
             let stop = event_buffer.stop_notify();
             let inner_event = inner.clone();
@@ -700,7 +859,7 @@ impl Client {
                 })
                 .await;
             });
-            if let Ok(mut tasks) = self.inner.flush_tasks.lock() {
+            if let Ok(mut tasks) = self.inner.periodic_tasks.lock() {
                 tasks.push(task);
             }
         }
@@ -719,10 +878,23 @@ impl Client {
                 })
                 .await;
             });
-            if let Ok(mut tasks) = self.inner.flush_tasks.lock() {
+            if let Ok(mut tasks) = self.inner.periodic_tasks.lock() {
                 tasks.push(task);
             }
         }
+    }
+}
+
+/// Character budget for one serialized text field: the configured cap, with a
+/// stricter `OTEL_SPAN_ATTRIBUTE_VALUE_LENGTH_LIMIT` env var also honored
+/// (python-sdk `_effective_field_limit` parity). Read once at build time.
+fn effective_text_field_limit(configured: usize) -> usize {
+    match std::env::var("OTEL_SPAN_ATTRIBUTE_VALUE_LENGTH_LIMIT") {
+        Ok(raw) => match raw.trim().parse::<usize>() {
+            Ok(env_limit) if env_limit > 0 => configured.min(env_limit),
+            _ => configured,
+        },
+        Err(_) => configured,
     }
 }
 
@@ -759,5 +931,87 @@ where
                 run().await;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const OTEL_LIMIT_VAR: &str = "OTEL_SPAN_ATTRIBUTE_VALUE_LENGTH_LIMIT";
+
+    #[test]
+    fn otel_env_limit_applies_only_when_stricter() {
+        // This is the only test in the lib suite touching this env var, so no
+        // cross-test lock is needed (RAINDROP_* vars have their own).
+        std::env::remove_var(OTEL_LIMIT_VAR);
+        assert_eq!(effective_text_field_limit(1_000), 1_000);
+
+        std::env::set_var(OTEL_LIMIT_VAR, "50");
+        assert_eq!(effective_text_field_limit(1_000), 50);
+
+        std::env::set_var(OTEL_LIMIT_VAR, "999999");
+        assert_eq!(effective_text_field_limit(1_000), 1_000);
+
+        std::env::set_var(OTEL_LIMIT_VAR, "not-a-number");
+        assert_eq!(effective_text_field_limit(1_000), 1_000);
+
+        std::env::set_var(OTEL_LIMIT_VAR, "0");
+        assert_eq!(effective_text_field_limit(1_000), 1_000);
+
+        std::env::remove_var(OTEL_LIMIT_VAR);
+    }
+
+    #[tokio::test]
+    async fn enqueue_span_prunes_completed_task_handles() {
+        // No flush is ever called: pre-fix, every enqueued span leaked its
+        // JoinHandle into flush_tasks until an explicit flush()/close().
+        let client = Client::builder()
+            .write_key("rk_test")
+            .disable_local_workshop()
+            .partial_flush_interval(Duration::ZERO)
+            .trace_flush_interval(Duration::ZERO)
+            // Keep enqueues from triggering a batch flush (no server here).
+            .trace_max_batch_size(100_000)
+            .build()
+            .expect("build");
+
+        for i in 0..200 {
+            let span = client.start_span(crate::traces::SpanOptions {
+                name: format!("s{i}"),
+                event_id: "evt".into(),
+                operation_id: "ai.toolCall".into(),
+                ..Default::default()
+            });
+            span.end();
+        }
+
+        // Wait until the spawned enqueue tasks have completed.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let all_done = {
+                let tasks = client.inner.flush_tasks.lock().unwrap();
+                tasks.iter().all(|t| t.is_finished())
+            };
+            if all_done || std::time::Instant::now() > deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // The next enqueue prunes all completed handles.
+        let span = client.start_span(crate::traces::SpanOptions {
+            name: "final".into(),
+            event_id: "evt".into(),
+            operation_id: "ai.toolCall".into(),
+            ..Default::default()
+        });
+        span.end();
+
+        let retained = client.inner.flush_tasks.lock().unwrap().len();
+        assert!(
+            retained <= 2,
+            "completed task handles must be pruned on push; retained {retained} of 201"
+        );
     }
 }

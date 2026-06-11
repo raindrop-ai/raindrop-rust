@@ -50,6 +50,7 @@ jobs:
             --test concurrency \
             --test empty_events_repro \
             --test events \
+            --test hardening \
             --test traces \
             --test transport \
             --test wire_format \
@@ -93,6 +94,7 @@ jobs:
             --test concurrency \
             --test empty_events_repro \
             --test events \
+            --test hardening \
             --test traces \
             --test transport \
             --test wire_format

@@ -1902,17 +1902,51 @@ async fn manual_span_with_workflow_or_task_kind_attribute_survives_filter() {
     assert_eq!(kind["stringValue"], "task");
 }
 
-/// Oversized payloads (> 1 MiB) are dropped client-side before the HTTP request is fired,
-/// matching the JS and Python SDKs' `MAX_INGEST_SIZE_BYTES` / `max_ingest_size_bytes`
-/// behavior. This prevents 413 storms on the gateway and protects host applications from
-/// runaway memory when a caller accidentally streams a giant prompt.
+/// With the default text-field cap, a giant prompt no longer trips the 1 MiB
+/// ingest limit at all: it is truncated up front (cost proportional to the
+/// cap) and the event SHIPS, instead of being serialized in full and then
+/// silently dropped.
 #[tokio::test]
-async fn oversized_track_ai_payload_is_dropped_client_side() {
+async fn oversized_track_ai_payload_ships_truncated_under_default_cap() {
     let server = MockServer::start().await;
     let recorder = mount_path(&server, "POST", "/events/track_partial").await;
     let client = fast_client_builder(&server).build().expect("build");
 
-    // Build a payload that comfortably exceeds 1 MiB after JSON serialization.
+    let huge_input: String = "x".repeat(2 * 1024 * 1024);
+    client
+        .track_ai(AiEvent {
+            user_id: "u".into(),
+            input: huge_input,
+            output: "y".into(),
+            ..Default::default()
+        })
+        .await
+        .expect("track_ai must NOT error on oversized payload");
+    client.close().await.expect("close");
+
+    assert_eq!(recorder.count(), 1, "capped payload must ship");
+    let payload = recorder.requests()[0].json();
+    let input = payload["ai_data"]["input"].as_str().unwrap();
+    // Mirrors DEFAULT_MAX_TEXT_FIELD_CHARS (pub(crate), not importable here).
+    assert_eq!(input.chars().count(), 1_000_000, "default cap applied");
+    assert!(input.ends_with("...[truncated by raindrop]"));
+}
+
+/// Payloads that exceed 1 MiB even after field caps (here: a deliberately
+/// raised cap) are still dropped client-side before the HTTP request fires,
+/// matching the JS and Python SDKs' `MAX_INGEST_SIZE_BYTES` /
+/// `max_ingest_size_bytes` second line of defense. This prevents 413 storms
+/// on the gateway.
+#[tokio::test]
+async fn oversized_track_ai_payload_is_dropped_client_side() {
+    let server = MockServer::start().await;
+    let recorder = mount_path(&server, "POST", "/events/track_partial").await;
+    let client = fast_client_builder(&server)
+        .max_text_field_chars(3 * 1024 * 1024)
+        .build()
+        .expect("build");
+
+    // Exceeds 1 MiB after JSON serialization despite the (raised) field cap.
     let huge_input: String = "x".repeat(2 * 1024 * 1024);
     client
         .track_ai(AiEvent {

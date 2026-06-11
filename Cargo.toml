@@ -1,6 +1,6 @@
 [package]
 name = "raindrop-ai"
-version = "0.0.6"
+version = "0.0.7"
 edition = "2021"
 rust-version = "1.88"
 description = "Raindrop AI observability SDK for Rust (Beta) — track AI events, signals, and OTLP-style traces."
@@ -45,5 +45,8 @@ tokio = { version = "1.36", features = ["full", "test-util"] }
 time = { version = "0.3", features = ["macros"] }
 wiremock = "0.6"
 serde_json = "1.0"
+# Integration tests are separate crates, so the lib's `tracing` dependency is
+# not visible to them; re-declare it for scoped-subscriber log assertions.
+tracing = { version = "0.1", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 urlencoding = "2.1.3"

@@ -10,7 +10,7 @@ use tokio::sync::{Mutex, Notify};
 use crate::client::ClientInner;
 use crate::error::Result;
 use crate::events::Attachment;
-use crate::helpers::{clone_map, iso8601_timestamp, merge_attachments};
+use crate::helpers::{clone_map, iso8601_timestamp, merge_attachments, truncate_text_in_place};
 
 /// In-flight patch state for a single event id.
 #[derive(Debug, Default, Clone)]
@@ -62,10 +62,15 @@ pub(crate) struct AiDataPayload {
     pub convo_id: String,
 }
 
-/// Per-event-id buffer with sticky state and timer-driven flushing.
+/// Per-event-id buffer with sticky state and timer-driven flushing. Both maps
+/// are bounded by `max_queue_size`: under sustained send failures (patches
+/// are restored for retry) or abandoned interactions, the buffer must apply
+/// backpressure — dropping new events with a rate-limited warning — instead
+/// of growing host memory without limit.
 pub(crate) struct EventBuffer {
     state: Mutex<EventBufferState>,
     flush_every: Duration,
+    max_queue_size: usize,
     /// Notified when the buffer is told to stop (used by the periodic ticker).
     stop_notify: Arc<Notify>,
 }
@@ -80,15 +85,17 @@ impl std::fmt::Debug for EventBuffer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EventBuffer")
             .field("flush_every", &self.flush_every)
+            .field("max_queue_size", &self.max_queue_size)
             .finish()
     }
 }
 
 impl EventBuffer {
-    pub(crate) fn new(flush_every: Duration) -> Self {
+    pub(crate) fn new(flush_every: Duration, max_queue_size: usize) -> Self {
         Self {
             state: Mutex::new(EventBufferState::default()),
             flush_every,
+            max_queue_size: max_queue_size.max(1),
             stop_notify: Arc::new(Notify::new()),
         }
     }
@@ -109,9 +116,32 @@ impl EventBuffer {
         event_id: &str,
         patch: EventPatch,
     ) -> Result<()> {
+        let mut patch = patch;
+        // Cap AI text fields at the single choke point every track_event /
+        // track_ai / begin / patch / finish call funnels through, BEFORE the
+        // payload is buffered or serialized: an oversized input/output costs
+        // O(cap) here and ships truncated instead of being dropped wholesale
+        // at the 1 MiB ingest limit after paying full serialization cost.
+        truncate_text_in_place(&mut patch.input, client.max_text_field_chars);
+        truncate_text_in_place(&mut patch.output, client.max_text_field_chars);
         let flush_now;
         {
             let mut state = self.state.lock().await;
+            // Bounded buffer: NEW event ids are dropped once the cap is hit
+            // (patches to already-buffered ids merge in place and don't grow
+            // the map). Without this, a network outage — every flush failure
+            // restores its patch — would grow these maps without limit.
+            if !state.buffers.contains_key(event_id) && state.buffers.len() >= self.max_queue_size {
+                if crate::helpers::should_log_rate_limited("event_buffer_full") {
+                    tracing::warn!(
+                        event_id,
+                        max = self.max_queue_size,
+                        "raindrop: event buffer is full; discarding event \
+                         (logged at most once per 30s)"
+                    );
+                }
+                return Ok(());
+            }
             let existing = state.buffers.remove(event_id).unwrap_or_default();
             let sticky = state.sticky.get(event_id).cloned().unwrap_or_default();
 
@@ -124,6 +154,13 @@ impl EventBuffer {
             flush_now = matches!(merged.is_pending, Some(false));
             state.buffers.insert(event_id.to_string(), merged);
             state.sticky.insert(event_id.to_string(), new_sticky);
+            // Sticky context can outlive its buffer entry (pending events
+            // flushed but not yet finalized), so it gets its own bound;
+            // evicting oldest-key context degrades a later finish to the
+            // missing-user_id skip path instead of leaking memory.
+            while state.sticky.len() > self.max_queue_size {
+                state.sticky.pop_first();
+            }
         }
 
         if flush_now {
@@ -174,14 +211,19 @@ impl EventBuffer {
         };
 
         if should_drop_empty_ai_event(&payload) {
-            tracing::warn!(
-                event_id,
-                event_name = %payload.event,
-                has_ai_data = payload.ai_data.is_some(),
-                "raindrop: dropping finalized track_partial with empty ai_input and ai_output. \
-                 Populate input/output via BeginOptions/FinishOptions/AiEvent, or record errored \
-                 generations via `LlmSpan::set_error`."
-            );
+            // Rate-limited: a wrapper bug emitting empty events on every turn
+            // must not flood the host's logs with one warning per event.
+            if crate::helpers::should_log_rate_limited("empty_ai_event_dropped") {
+                tracing::warn!(
+                    event_id,
+                    event_name = %payload.event,
+                    has_ai_data = payload.ai_data.is_some(),
+                    "raindrop: dropping finalized track_partial with empty ai_input and ai_output \
+                     (logged at most once per 30s). Populate input/output via \
+                     BeginOptions/FinishOptions/AiEvent, or record errored generations via \
+                     `LlmSpan::set_error`."
+                );
+            }
             let mut state = self.state.lock().await;
             if !state.buffers.contains_key(event_id) {
                 state.sticky.remove(event_id);
@@ -213,6 +255,20 @@ impl EventBuffer {
 
     async fn restore(self: &Arc<Self>, event_id: &str, patch: EventPatch) {
         let mut state = self.state.lock().await;
+        // The cap applies to restores too: under a sustained outage every
+        // failed send funnels back here, and honest backpressure (drop +
+        // rate-limited warn) beats unbounded memory growth.
+        if !state.buffers.contains_key(event_id) && state.buffers.len() >= self.max_queue_size {
+            if crate::helpers::should_log_rate_limited("event_buffer_full") {
+                tracing::warn!(
+                    event_id,
+                    max = self.max_queue_size,
+                    "raindrop: event buffer is full; discarding unsent event \
+                     (logged at most once per 30s)"
+                );
+            }
+            return;
+        }
         let current = state.buffers.remove(event_id).unwrap_or_default();
         state
             .buffers

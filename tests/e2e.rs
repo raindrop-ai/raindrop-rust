@@ -808,8 +808,8 @@ async fn e2e_complex_agent_trajectory_with_subagents_tools_retry_failure_and_slo
     interaction.track_tool(TrackToolOptions {
         name: "warehouse_scan_slow".into(),
         parent: Some(researcher.clone()),
-        input: Some(json!({"customer_id": "cust_123", "query": "recent incidents"})),
-        output: Some(json!({"incidents": 3, "oldest_age_hours": 36})),
+        input: Some(json!({"customer_id": "cust_123", "query": "recent anomalies"})),
+        output: Some(json!({"anomalies": 3, "oldest_age_hours": 36})),
         start_time: Some(at(2_200)),
         end_time: Some(at(3_550)),
         properties: slow_props,
@@ -1958,4 +1958,210 @@ async fn e2e_errored_generation_with_input_only_lands_in_dashboard() {
         output
     );
     assert_eq!(ev["aiData"]["model"].as_str().unwrap_or_default(), "gpt-4o");
+}
+
+// ======================================================================
+// Hardening e2e (mirrors python-sdk 0.0.51 / PR #16 e2e suite)
+// ======================================================================
+
+/// **Large payloads land truncated instead of being dropped.** Pre-0.0.7, a
+/// multi-MB output was serialized in full and then silently dropped at the
+/// 1 MiB ingest guard — the worst data-loss mode: the caller paid the
+/// serialization cost AND lost the event. Now the output is capped
+/// up front and the event must land on the real dashboard, truncated, marker
+/// within the cap. Also asserts the caller-side buffering cost stays bounded
+/// (`begin` with a multi-MB input buffers without any network round trip and
+/// must be O(cap), not O(payload)).
+#[tokio::test]
+async fn e2e_large_output_event_lands_truncated() {
+    let (write_key, dashboard_token) = match env_keys() {
+        Some(v) => v,
+        None => {
+            eprintln!("[e2e] skipping: set RAINDROP_WRITE_KEY and RAINDROP_DASHBOARD_TOKEN to run");
+            return;
+        }
+    };
+
+    let user_id = unique_user_id("bigout");
+    let client = build_client(&write_key);
+
+    // ~2.2 MB output; the default cap is 100_000 chars.
+    let big_output = "All work and no play makes Jack a dull boy. ".repeat(50_000);
+    let big_input = "x".repeat(5_000_000);
+
+    let started = std::time::Instant::now();
+    let interaction = client
+        .begin(BeginOptions {
+            user_id: user_id.clone(),
+            event: "ai_generation".to_string(),
+            input: big_input, // 5 MB: buffered (pending), no inline POST
+            ..Default::default()
+        })
+        .await;
+    let begin_elapsed = started.elapsed();
+    assert!(
+        begin_elapsed < Duration::from_millis(250),
+        "begin() with a 5MB input spent {begin_elapsed:?} on the caller; \
+         capping must be O(cap), not O(payload)"
+    );
+
+    interaction
+        .finish(FinishOptions {
+            output: big_output,
+            ..Default::default()
+        })
+        .await
+        .expect("finish ships the truncated event");
+    client.close().await.expect("close");
+
+    let events = poll_events(&dashboard_token, &user_id, 1, E2E_POLL_TIMEOUT)
+        .await
+        .expect("dashboard verification");
+    let ev = &events[0];
+    let output = ev["aiData"]["output"].as_str().unwrap_or_default();
+    assert!(!output.is_empty(), "event landed without output: {ev:?}");
+    assert!(
+        output.chars().count() <= 100_000,
+        "output not truncated within the default cap: {} chars",
+        output.chars().count()
+    );
+    assert!(
+        output.ends_with("...[truncated by raindrop]"),
+        "missing truncation marker, tail: {:?}",
+        &output[output.len().saturating_sub(60)..]
+    );
+    assert!(output.starts_with("All work and no play"));
+    let input = ev["aiData"]["input"].as_str().unwrap_or_default();
+    assert!(
+        input.chars().count() <= 100_000,
+        "input not truncated within the default cap"
+    );
+}
+
+/// **Multi-MB tool payloads ship a bounded span that lands.** Tool payloads
+/// shaped like order timelines or transcripts (multi-MB structured rows)
+/// used to be serialized in full on the hot path; now `track_tool`
+/// serialization is budget-bounded and the event + tool call must still
+/// reach the dashboard.
+#[tokio::test]
+async fn e2e_huge_tool_payload_ships_bounded_and_lands() {
+    let (write_key, dashboard_token) = match env_keys() {
+        Some(v) => v,
+        None => {
+            eprintln!("[e2e] skipping: set RAINDROP_WRITE_KEY and RAINDROP_DASHBOARD_TOKEN to run");
+            return;
+        }
+    };
+
+    let user_id = unique_user_id("bigtool");
+    let client = build_client(&write_key);
+    let interaction = client
+        .begin(BeginOptions {
+            user_id: user_id.clone(),
+            event: "agent_run".to_string(),
+            input: "tool probe".to_string(),
+            ..Default::default()
+        })
+        .await;
+
+    // ~4.5 MB structured tool output.
+    let rows: Vec<String> = (0..20_000)
+        .map(|_| format!("order-timeline-entry {}", "z".repeat(200)))
+        .collect();
+    let started = std::time::Instant::now();
+    interaction.track_tool(TrackToolOptions {
+        name: "fetch_order_timeline".to_string(),
+        input: Some(json!({"q": "probe"})),
+        output: Some(json!({ "rows": rows })),
+        duration: Some(Duration::from_millis(42)),
+        ..Default::default()
+    });
+    let track_elapsed = started.elapsed();
+    assert!(
+        track_elapsed < Duration::from_millis(500),
+        "track_tool() spent {track_elapsed:?} on the caller for a ~4.5MB payload; \
+         serialization must be budget-bounded"
+    );
+
+    interaction
+        .finish(FinishOptions {
+            output: "done".to_string(),
+            ..Default::default()
+        })
+        .await
+        .expect("finish");
+    client.close().await.expect("close");
+
+    // The event must land, and the derived toolCalls join must surface the
+    // bounded tool span (proving the trace pipeline accepted it).
+    let ev = poll_event_until(
+        &dashboard_token,
+        &user_id,
+        |ev| {
+            ev["toolCalls"]
+                .as_array()
+                .map(|calls| {
+                    calls
+                        .iter()
+                        .any(|c| c.to_string().contains("fetch_order_timeline"))
+                })
+                .unwrap_or(false)
+        },
+        E2E_DERIVED_POLL_TIMEOUT,
+    )
+    .await
+    .expect("tool call did not surface on the dashboard event");
+    let tool_blob = ev["toolCalls"].to_string();
+    assert!(
+        tool_blob.len() < 300_000,
+        "tool call payload not bounded on the dashboard: {} bytes",
+        tool_blob.len()
+    );
+}
+
+/// **Process exit is bounded against a real black-hole network.** Ships
+/// events at a non-routable address (RFC 5737 TEST-NET) — real sockets, real
+/// connect attempts, no mocks — and asserts `close()` honors its 10s default
+/// deadline instead of multiplying connect timeouts across retries and
+/// buffered events (the wedged-shutdown failure mode). Requires no
+/// dashboard token (nothing can land), but stays env-gated like the rest of
+/// the e2e suite so routine CI runtime is unaffected.
+#[tokio::test]
+async fn e2e_close_bounded_with_unreachable_api() {
+    if env_keys().is_none() {
+        eprintln!("[e2e] skipping: set RAINDROP_WRITE_KEY and RAINDROP_DASHBOARD_TOKEN to run");
+        return;
+    }
+
+    let client = Client::builder()
+        .write_key("e2e-blackhole-key")
+        .endpoint("http://192.0.2.1:9/v1/")
+        .disable_local_workshop()
+        .partial_flush_interval(Duration::ZERO)
+        .trace_flush_interval(Duration::ZERO)
+        .build()
+        .expect("build");
+
+    for i in 0..5 {
+        let _ = client
+            .begin(BeginOptions {
+                user_id: format!("shutdown_probe_{i}"),
+                event: "ai_generation".to_string(),
+                input: "x".to_string(),
+                ..Default::default()
+            })
+            .await;
+    }
+
+    let started = std::time::Instant::now();
+    client
+        .close()
+        .await
+        .expect("close returns Ok at the deadline");
+    let elapsed = started.elapsed();
+    // Default close_timeout is 10s; allow scheduling slack (python parity: <15s).
+    assert!(
+        elapsed < Duration::from_secs(15),
+        "close() took {elapsed:?} against a black-hole network"
+    );
 }

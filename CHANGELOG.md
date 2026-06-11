@@ -4,6 +4,49 @@ All notable changes to this crate are documented here. Format follows [Keep a Ch
 
 ## [Unreleased]
 
+## [0.0.7] - 2026-06-11
+
+Hardening release from the cross-SDK parity audit (mirrors python-sdk
+`0.0.51`): telemetry must never stall the host's hot path, wedge its shutdown,
+grow its memory without bound, or flood its logs.
+
+### Fixed
+
+- **Text fields are capped BEFORE serialization.** AI input/output, tool span
+  I/O, LLM span content, and association property values are truncated up
+  front with a `...[truncated by raindrop]` marker that fits **within** the
+  cap (default 100,000 chars; new `ClientBuilder::max_text_field_chars`; a
+  stricter `OTEL_SPAN_ATTRIBUTE_VALUE_LENGTH_LIMIT` is honored at build
+  time). Structured payloads serialize through an output-budgeted writer that
+  aborts when the budget is exhausted, so the cost of an oversized payload is
+  proportional to the cap — not the payload — on the calling task. Oversized
+  events now land truncated instead of being serialized in full and then
+  silently dropped at the 1 MiB ingest limit. `with_tool` /
+  `with_tool_async` no longer materialize an unbounded `serde_json::Value`
+  of the result.
+- **`flush()` no longer hangs on clients with periodic flushing enabled.**
+  The never-ending periodic ticker tasks lived in the same task list that
+  `flush()` drains and awaits, so any explicit `flush()` with default
+  (non-zero) flush intervals blocked until `close()`. Tickers now live in a
+  dedicated slot awaited only during `close()`.
+- **Every cloud POST is bounded.** A per-request timeout (new
+  `ClientBuilder::request_timeout`, default 10s) applies even when a
+  caller-injected `http_client` was built without timeouts; the SDK-built
+  client also sets a 5s connect timeout.
+- **`close()` runs under a hard deadline.** New `ClientBuilder::close_timeout`
+  (default 10s): stop signals, in-flight task draining, and the final flush
+  share the budget; at the deadline remaining telemetry is dropped with a
+  warning instead of wedging process exit on a dead or slow network.
+- **Bounded memory under backpressure.** Completed fire-and-forget task
+  handles (span enqueues, local-mirror POSTs) are pruned as new ones are
+  spawned instead of accumulating until an explicit `flush()`. The event
+  buffer's patch and sticky-context maps are bounded by new
+  `ClientBuilder::event_max_queue_size` (default 5000): at capacity, new
+  event ids are dropped with a rate-limited warning.
+- **Failure logs are rate-limited.** Oversized-payload drops, empty-AI-event
+  drops, and event-buffer overflow each log at most once per 30s per family
+  instead of once per event.
+
 ## [0.0.6] - 2026-05-19
 
 ### Fixed
@@ -144,7 +187,8 @@ Initial **beta** release. The wire contract against the Raindrop ingestion API i
 - No client-side PII redaction (Python's `set_redact_pii` and JS's `redactPii` have no Rust equivalent yet).
 - No local-debugger mirroring (no `RAINDROP_LOCAL_DEBUGGER` support).
 
-[Unreleased]: https://github.com/raindrop-ai/raindrop-rust/compare/v0.0.6...HEAD
+[Unreleased]: https://github.com/raindrop-ai/raindrop-rust/compare/v0.0.7...HEAD
+[0.0.7]: https://github.com/raindrop-ai/raindrop-rust/compare/v0.0.6...v0.0.7
 [0.0.6]: https://github.com/raindrop-ai/raindrop-rust/compare/v0.0.5...v0.0.6
 [0.0.5]: https://github.com/raindrop-ai/raindrop-rust/compare/v0.0.4...v0.0.5
 [0.0.4]: https://github.com/raindrop-ai/raindrop-rust/compare/v0.0.3...v0.0.4

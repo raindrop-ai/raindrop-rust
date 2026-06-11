@@ -32,6 +32,10 @@ pub(crate) struct TransportConfig {
     pub max_attempts: u32,
     pub base_delay: Duration,
     pub jitter_fraction: f64,
+    /// Per-attempt bound applied to every cloud POST (connect through body),
+    /// independent of how the underlying `reqwest::Client` was built — so a
+    /// caller-injected client without timeouts can never hang a flush.
+    pub request_timeout: Duration,
     pub debug: bool,
 }
 
@@ -87,16 +91,20 @@ impl RetryingHttpClient {
         // The ingestion gateway enforces a similar cap and would return 413 otherwise.
         // Returning `Ok(())` here keeps SDK calls non-fatal — losing one payload is
         // strictly better than blocking the host application on a serialization disaster.
-        // The warning is unconditional (NOT gated on `debug`) so production callers
-        // without verbose logging still get a single line per drop and can detect
-        // accidental oversize streams.
+        // The warning is NOT gated on `debug` so production callers without verbose
+        // logging can still detect accidental oversize streams — but it is
+        // rate-limited so a sustained stream of oversized events can't flood the
+        // host's log output with one line per drop.
         if payload.len() > MAX_INGEST_SIZE_BYTES {
-            tracing::warn!(
-                path,
-                bytes = payload.len(),
-                max = MAX_INGEST_SIZE_BYTES,
-                "raindrop: dropping oversized payload (> 1 MiB)"
-            );
+            if crate::helpers::should_log_rate_limited("oversized_payload_dropped") {
+                tracing::warn!(
+                    path,
+                    bytes = payload.len(),
+                    max = MAX_INGEST_SIZE_BYTES,
+                    "raindrop: dropping oversized payload (> 1 MiB); \
+                     further drops are logged at most once per 30s"
+                );
+            }
             return Ok(());
         }
 
@@ -133,6 +141,10 @@ impl RetryingHttpClient {
                 .post(&url)
                 .header("Authorization", format!("Bearer {}", self.cfg.write_key))
                 .header("Content-Type", "application/json")
+                // Telemetry must never wedge the host: bound every attempt
+                // even when the reqwest client itself has no timeout
+                // configured (e.g. caller-injected via `http_client`).
+                .timeout(self.cfg.request_timeout)
                 .body(payload.clone());
 
             if self.cfg.debug {
@@ -207,6 +219,9 @@ impl RetryingHttpClient {
             }
         });
         if let Ok(mut tasks) = self.mirror_tasks.lock() {
+            // Prune completed handles so an app that never calls flush()
+            // doesn't accumulate one JoinHandle per mirrored POST forever.
+            tasks.retain(|t| !t.is_finished());
             tasks.push(task);
         }
     }
