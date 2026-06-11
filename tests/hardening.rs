@@ -577,6 +577,64 @@ async fn event_buffer_drops_new_events_at_capacity() {
     );
 }
 
+#[tokio::test]
+async fn finish_ships_even_after_sticky_context_eviction() {
+    let server = MockServer::start().await;
+    let recorder = mount_path(&server, "POST", "/events/track_partial").await;
+    let client = fast_client_builder(&server)
+        .event_max_queue_size(2)
+        .build()
+        .expect("build");
+
+    // "aaa" sorts first, so the sticky bound evicts it once newer ids arrive.
+    let interaction = client
+        .begin(BeginOptions {
+            event_id: "aaa_evicted".into(),
+            user_id: "user-evicted".into(),
+            input: "hello".into(),
+            ..Default::default()
+        })
+        .await;
+    // Ship the pending patch so only the sticky entry still knows the user.
+    client.flush().await.expect("flush pending");
+
+    // Two newer interactions push the sticky map past its bound of 2.
+    for id in ["bbb_filler", "ccc_filler"] {
+        let _ = client
+            .begin(BeginOptions {
+                event_id: id.into(),
+                user_id: "user-filler".into(),
+                input: "filler".into(),
+                ..Default::default()
+            })
+            .await;
+    }
+    // Drain the fillers' pending patches so the buffer has room again;
+    // only the sticky eviction of "aaa_evicted" remains in effect.
+    client.flush().await.expect("flush fillers");
+
+    // The interaction carries its own context, so finishing must still ship
+    // instead of restoring forever on the missing-user_id path.
+    interaction
+        .finish(FinishOptions {
+            output: "done".into(),
+            ..Default::default()
+        })
+        .await
+        .expect("finish");
+    client.flush().await.expect("flush final");
+    let _ = client.close().await;
+
+    let final_patch = recorder
+        .requests()
+        .iter()
+        .map(|r| r.json())
+        .find(|p| p["event_id"] == "aaa_evicted" && p["is_pending"] == false)
+        .expect("evicted interaction's finish must still ship");
+    assert_eq!(final_patch["user_id"], "user-evicted");
+    assert_eq!(final_patch["ai_data"]["output"], "done");
+}
+
 // ======================================================================
 // Class D: failure logs are rate-limited
 // ======================================================================

@@ -521,10 +521,29 @@ impl Client {
 
     /// Finalize an interaction directly (rarely used; prefer [`Interaction::finish`]).
     pub async fn finish(&self, event_id: &str, opts: FinishOptions) -> Result<()> {
+        self.finish_with_context(event_id, opts, "", "", "").await
+    }
+
+    /// Finalize with the interaction's captured association context. Carrying
+    /// `user_id`/`convo_id`/`event` in the final patch keeps a `finish()`
+    /// shippable even when the sticky-context entry for this event id was
+    /// evicted under the queue bound; otherwise the patch would restore
+    /// forever on the missing-user_id path and occupy a buffer slot.
+    pub(crate) async fn finish_with_context(
+        &self,
+        event_id: &str,
+        opts: FinishOptions,
+        user_id: &str,
+        convo_id: &str,
+        event_name: &str,
+    ) -> Result<()> {
         if !self.inner.enabled {
             return Ok(());
         }
         let patch = EventPatch {
+            event_name: event_name.to_string(),
+            user_id: user_id.to_string(),
+            convo_id: convo_id.to_string(),
             output: opts.output,
             model: opts.model,
             properties: opts.properties,
