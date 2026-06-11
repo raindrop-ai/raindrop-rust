@@ -1969,9 +1969,12 @@ async fn e2e_errored_generation_with_input_only_lands_in_dashboard() {
 /// 1 MiB ingest guard — the worst data-loss mode: the caller paid the
 /// serialization cost AND lost the event. Now the output is capped
 /// up front and the event must land on the real dashboard, truncated, marker
-/// within the cap. Also asserts the caller-side buffering cost stays bounded
-/// (`begin` with a multi-MB input buffers without any network round trip and
-/// must be O(cap), not O(payload)).
+/// within the cap. The cap is pinned to 100,000 chars here so the test
+/// proves the truncation mechanism end-to-end without depending on the
+/// library default; default-cap behavior is covered by the wire_format
+/// suite against a mock server. Also asserts the caller-side buffering cost
+/// stays bounded (`begin` with a multi-MB input buffers without any network
+/// round trip and must be O(cap), not O(payload)).
 #[tokio::test]
 async fn e2e_large_output_event_lands_truncated() {
     let (write_key, dashboard_token) = match env_keys() {
@@ -1983,9 +1986,16 @@ async fn e2e_large_output_event_lands_truncated() {
     };
 
     let user_id = unique_user_id("bigout");
-    let client = build_client(&write_key);
+    let mut builder = Client::builder()
+        .write_key(&write_key)
+        .disable_local_workshop()
+        .max_text_field_chars(100_000);
+    if let Ok(endpoint) = env::var("RAINDROP_ENDPOINT") {
+        builder = builder.endpoint(endpoint);
+    }
+    let client = builder.build().expect("build client");
 
-    // ~2.2 MB output; the default cap is 100_000 chars.
+    // ~2.2 MB output against the pinned 100_000-char cap.
     let big_output = "All work and no play makes Jack a dull boy. ".repeat(50_000);
     let big_input = "x".repeat(5_000_000);
 
@@ -2022,7 +2032,7 @@ async fn e2e_large_output_event_lands_truncated() {
     assert!(!output.is_empty(), "event landed without output: {ev:?}");
     assert!(
         output.chars().count() <= 100_000,
-        "output not truncated within the default cap: {} chars",
+        "output not truncated within the configured cap: {} chars",
         output.chars().count()
     );
     assert!(
@@ -2034,7 +2044,7 @@ async fn e2e_large_output_event_lands_truncated() {
     let input = ev["aiData"]["input"].as_str().unwrap_or_default();
     assert!(
         input.chars().count() <= 100_000,
-        "input not truncated within the default cap"
+        "input not truncated within the configured cap"
     );
 }
 
