@@ -7,7 +7,10 @@ use serde_json::Value;
 use time::OffsetDateTime;
 
 use crate::client::Client;
-use crate::helpers::{merge_maps, stringify_value, unix_nanos_string};
+use crate::helpers::{
+    capped_string, merge_maps, stringify_serialize_bounded, stringify_value_bounded,
+    to_string_bounded, truncate_text_in_place, unix_nanos_string,
+};
 use crate::otlp::{Attribute, OtlpKeyValue, OtlpSpan, OtlpStatus, SpanIds, SpanStatusCode};
 
 /// Options for [`Client::start_span`].
@@ -187,6 +190,15 @@ impl Span {
 
     pub(crate) fn ids(&self) -> Option<SpanIds> {
         self.inner.as_ref().map(|i| i.ids.clone())
+    }
+
+    /// Effective per-field character cap of the owning client (default for
+    /// no-op spans, which never serialize anything anyway).
+    pub(crate) fn text_limit(&self) -> usize {
+        self.inner
+            .as_ref()
+            .map(|i| i.client.max_text_field_chars())
+            .unwrap_or(crate::client::DEFAULT_MAX_TEXT_FIELD_CHARS)
     }
 
     /// Append attributes to the span. Safe to call after `end()` (no-op).
@@ -406,16 +418,19 @@ impl LlmSpan {
         );
     }
 
-    /// Record a single user input.
+    /// Record a single user input. Content longer than the client's
+    /// `max_text_field_chars` is truncated before serialization.
     pub fn set_input(&self, input: impl Into<String>) {
+        let limit = self.span.text_limit();
         self.span.set_attributes_replacing(
             &["ai.prompt", "ai.prompt.messages"],
             &["gen_ai.prompt."],
-            llm_input_attributes(input.into()),
+            llm_input_attributes(input.into(), limit),
         );
     }
 
-    /// Record chat-style prompt messages.
+    /// Record chat-style prompt messages. Message content longer than the
+    /// client's `max_text_field_chars` is truncated before serialization.
     pub fn set_messages<I>(&self, messages: I)
     where
         I: IntoIterator<Item = LlmMessage>,
@@ -424,19 +439,22 @@ impl LlmSpan {
         if messages.is_empty() {
             return;
         }
+        let limit = self.span.text_limit();
         self.span.set_attributes_replacing(
             &["ai.prompt", "ai.prompt.messages"],
             &["gen_ai.prompt."],
-            llm_message_attributes(messages),
+            llm_message_attributes(messages, limit),
         );
     }
 
-    /// Record a single assistant output.
+    /// Record a single assistant output. Content longer than the client's
+    /// `max_text_field_chars` is truncated before serialization.
     pub fn set_output(&self, output: impl Into<String>) {
+        let limit = self.span.text_limit();
         self.span.set_attributes_replacing(
             &["ai.response.text"],
             &["gen_ai.completion."],
-            llm_output_attributes(output.into()),
+            llm_output_attributes(output.into(), limit),
         );
     }
 
@@ -499,20 +517,37 @@ impl ToolSpan {
         &self.span
     }
 
-    /// Update the input.
+    /// Update the input. Serialization is bounded by the client's
+    /// `max_text_field_chars`, so multi-MB payloads cost the cap, not the
+    /// payload.
     pub fn set_input(&self, input: &Value) {
         self.span.set_attributes([Attribute::string(
             "traceloop.entity.input",
-            stringify_value(input),
+            stringify_value_bounded(input, self.span.text_limit()),
         )]);
     }
 
-    /// Update the output.
+    /// Update the output. Serialization is bounded by the client's
+    /// `max_text_field_chars`, so multi-MB payloads cost the cap, not the
+    /// payload.
     pub fn set_output(&self, output: &Value) {
         self.span.set_attributes([Attribute::string(
             "traceloop.entity.output",
-            stringify_value(output),
+            stringify_value_bounded(output, self.span.text_limit()),
         )]);
+    }
+
+    /// Serialize any `Serialize` result directly onto the span's output
+    /// attribute under the text budget — without materializing an unbounded
+    /// `serde_json::Value` first. Unserializable values are skipped.
+    pub(crate) fn record_output_bounded<T: ?Sized + serde::Serialize>(&self, value: &T) {
+        if self.span.is_noop() {
+            return;
+        }
+        if let Some(text) = stringify_serialize_bounded(value, self.span.text_limit()) {
+            self.span
+                .set_attributes([Attribute::string("traceloop.entity.output", text)]);
+        }
     }
 
     /// Mark the tool span as failed.
@@ -614,7 +649,7 @@ impl Tracer {
     }
 }
 
-pub(crate) fn build_llm_attributes(opts: &LlmOptions) -> Vec<Attribute> {
+pub(crate) fn build_llm_attributes(opts: &LlmOptions, limit: usize) -> Vec<Attribute> {
     let mut attrs = vec![Attribute::string("traceloop.span.kind", "llm")];
     if !opts.model.is_empty() {
         attrs.extend(llm_model_attributes(&opts.model));
@@ -623,19 +658,26 @@ pub(crate) fn build_llm_attributes(opts: &LlmOptions) -> Vec<Attribute> {
         attrs.extend(llm_provider_attributes(&opts.provider));
     }
     if !opts.messages.is_empty() {
-        attrs.extend(llm_message_attributes(opts.messages.clone()));
+        // Cap during the clone so a multi-MB message body is never copied at
+        // full size just to be truncated afterwards.
+        let capped: Vec<LlmMessage> = opts
+            .messages
+            .iter()
+            .map(|m| LlmMessage::new(m.role.clone(), capped_string(&m.content, limit)))
+            .collect();
+        attrs.extend(llm_message_attributes(capped, limit));
     } else if let Some(input) = &opts.input {
-        attrs.extend(llm_input_attributes(input.clone()));
+        attrs.extend(llm_input_attributes(capped_string(input, limit), limit));
     }
     if let Some(output) = &opts.output {
-        attrs.extend(llm_output_attributes(output.clone()));
+        attrs.extend(llm_output_attributes(capped_string(output, limit), limit));
     }
     attrs.extend(llm_token_usage_attributes(
         "",
         opts.input_tokens,
         opts.output_tokens,
     ));
-    attrs.extend(tool_property_attributes(&opts.properties));
+    attrs.extend(tool_property_attributes(&opts.properties, limit));
     attrs
 }
 
@@ -654,7 +696,8 @@ fn llm_provider_attributes(provider: &str) -> Vec<Attribute> {
     ]
 }
 
-fn llm_input_attributes(input: String) -> Vec<Attribute> {
+fn llm_input_attributes(mut input: String, limit: usize) -> Vec<Attribute> {
+    truncate_text_in_place(&mut input, limit);
     vec![
         Attribute::string("ai.prompt", input.clone()),
         Attribute::string("gen_ai.prompt.0.role", "user"),
@@ -662,11 +705,16 @@ fn llm_input_attributes(input: String) -> Vec<Attribute> {
     ]
 }
 
-fn llm_message_attributes(messages: Vec<LlmMessage>) -> Vec<Attribute> {
-    let mut attrs = vec![Attribute::string(
-        "ai.prompt.messages",
-        serde_json::to_string(&messages).expect("serializing LLM messages cannot fail"),
-    )];
+fn llm_message_attributes(mut messages: Vec<LlmMessage>, limit: usize) -> Vec<Attribute> {
+    for message in &mut messages {
+        truncate_text_in_place(&mut message.content, limit);
+    }
+    // Aggregate JSON blob is bounded too: capped per-message content keeps the
+    // serialization cost proportional to what we ship, and the budget stops a
+    // long message LIST from exceeding the limit.
+    let messages_json =
+        to_string_bounded(&messages, limit).expect("serializing LLM messages cannot fail");
+    let mut attrs = vec![Attribute::string("ai.prompt.messages", messages_json)];
     for (idx, message) in messages.into_iter().enumerate() {
         attrs.push(Attribute::string(
             format!("gen_ai.prompt.{}.role", idx),
@@ -680,7 +728,8 @@ fn llm_message_attributes(messages: Vec<LlmMessage>) -> Vec<Attribute> {
     attrs
 }
 
-fn llm_output_attributes(output: String) -> Vec<Attribute> {
+fn llm_output_attributes(mut output: String, limit: usize) -> Vec<Attribute> {
+    truncate_text_in_place(&mut output, limit);
     vec![
         Attribute::string("ai.response.text", output.clone()),
         Attribute::string("gen_ai.completion.0.role", "assistant"),
@@ -708,13 +757,15 @@ fn llm_token_usage_attributes(
 }
 
 /// Build the standard set of tool attributes (kind, name, input/output, duration, association
-/// properties).
+/// properties). Tool I/O serialization is bounded by `limit` so multi-MB payloads cost the cap
+/// — not the payload — on the calling task.
 pub(crate) fn build_tool_attributes(
     name: &str,
     input: Option<&Value>,
     output: Option<&Value>,
     duration: Option<std::time::Duration>,
     properties: &BTreeMap<String, Value>,
+    limit: usize,
 ) -> Vec<Attribute> {
     let mut attrs = vec![
         Attribute::string("traceloop.span.kind", "tool"),
@@ -723,13 +774,13 @@ pub(crate) fn build_tool_attributes(
     if let Some(input) = input {
         attrs.push(Attribute::string(
             "traceloop.entity.input",
-            stringify_value(input),
+            stringify_value_bounded(input, limit),
         ));
     }
     if let Some(output) = output {
         attrs.push(Attribute::string(
             "traceloop.entity.output",
-            stringify_value(output),
+            stringify_value_bounded(output, limit),
         ));
     }
     if let Some(d) = duration {
@@ -738,12 +789,16 @@ pub(crate) fn build_tool_attributes(
             d.as_millis() as i64,
         ));
     }
-    attrs.extend(tool_property_attributes(properties));
+    attrs.extend(tool_property_attributes(properties, limit));
     attrs
 }
 
-/// Convert a property map into `traceloop.association.properties.*` attributes.
-pub(crate) fn tool_property_attributes(properties: &BTreeMap<String, Value>) -> Vec<Attribute> {
+/// Convert a property map into `traceloop.association.properties.*` attributes. String and
+/// JSON-serialized values are capped at `limit` characters.
+pub(crate) fn tool_property_attributes(
+    properties: &BTreeMap<String, Value>,
+    limit: usize,
+) -> Vec<Attribute> {
     let mut out = Vec::new();
     for (key, value) in properties {
         if key.is_empty() || matches!(value, Value::Null) {
@@ -751,7 +806,7 @@ pub(crate) fn tool_property_attributes(properties: &BTreeMap<String, Value>) -> 
         }
         let attr_key = format!("traceloop.association.properties.{}", key);
         let attr = match value {
-            Value::String(s) => Attribute::string(attr_key, s),
+            Value::String(s) => Attribute::string(attr_key, capped_string(s, limit)),
             Value::Bool(b) => Attribute::bool(attr_key, *b),
             Value::Number(n) => {
                 if let Some(i) = n.as_i64() {
@@ -772,7 +827,7 @@ pub(crate) fn tool_property_attributes(properties: &BTreeMap<String, Value>) -> 
                     .collect();
                 Attribute::string_array(attr_key, strings)
             }
-            other => Attribute::from_json(attr_key, other),
+            other => Attribute::string(attr_key, stringify_value_bounded(other, limit)),
         };
         out.push(attr);
     }
@@ -802,9 +857,8 @@ where
     let tool_span = interaction.start_tool_span(name, opts);
     match fn_() {
         Ok(result) => {
-            if let Ok(value) = serde_json::to_value(&result) {
-                tool_span.set_output(&value);
-            }
+            // Bounded: serializes at most the text cap, never the full result.
+            tool_span.record_output_bounded(&result);
             tool_span.end();
             Ok(result)
         }
@@ -836,9 +890,8 @@ where
     let tool_span = interaction.start_tool_span(name, opts);
     match fn_().await {
         Ok(result) => {
-            if let Ok(value) = serde_json::to_value(&result) {
-                tool_span.set_output(&value);
-            }
+            // Bounded: serializes at most the text cap, never the full result.
+            tool_span.record_output_bounded(&result);
             tool_span.end();
             Ok(result)
         }

@@ -316,11 +316,34 @@ OpenTelemetry GenAI semantic-convention attributes (`gen_ai.response.model`,
 correctly populates per-span and per-event token totals on the dashboard. Pass `0` for
 either count or an empty `model` to omit the corresponding attribute.
 
+## Payload size limits
+
+As of `0.0.7`, text fields (AI input/output, tool span I/O, LLM span content)
+are capped at **1,000,000 characters per field by default** and truncated with a
+`...[truncated by raindrop]` marker (the marker fits within the cap). The cap
+is enforced before (or during) serialization, so oversized payloads cost the
+cap — not the payload — on your calling task, and large events now land
+truncated instead of being silently dropped at the 1 MiB ingest limit. Tune it
+via:
+
+```rust
+let client = raindrop::Client::builder()
+    .write_key("rk_...")
+    .max_text_field_chars(250_000)
+    .build()?;
+```
+
+A stricter `OTEL_SPAN_ATTRIBUTE_VALUE_LENGTH_LIMIT` env var (read once at
+build time) is also honored. All outbound HTTP carries finite per-request
+timeouts (even with a caller-injected `http_client`), and `close()` runs under
+a 10s deadline (`close_timeout`) so a dead network can never wedge your
+process exit.
+
 ## Known Limitations
 
 - **Nested Trace Spans:** The Rust SDK currently provides manual span instrumentation (`start_span`, `start_llm_span`, `start_tool_span`). It does not yet automatically hook into Rust LLM frameworks (like `async-openai` or `langchain-rust`) to produce nested trace spans automatically. You must create spans manually.
 - **PII Redaction:** Automatic PII redaction (which is available in the Python SDK via `set_redact_pii` and the JS SDK via `redactPii`) is not yet implemented in the Rust SDK. If your application logs PII into events, redact at the call site or upstream of `track_ai` / `track_event`.
-- **Oversized payload guard:** Payloads larger than 1 MiB after JSON serialization are dropped client-side (matching the JS / Python SDKs' `MAX_INGEST_SIZE_BYTES` / `max_ingest_size_bytes`) to avoid 413s on the gateway. Each drop emits a `tracing::warn!` event so production callers can detect it without enabling `debug=true`.
+- **Oversized payload guard:** Payloads larger than 1 MiB after JSON serialization are dropped client-side (matching the JS / Python SDKs' `MAX_INGEST_SIZE_BYTES` / `max_ingest_size_bytes`) to avoid 413s on the gateway. With the default text-field caps this only triggers for oversized non-text content (e.g. huge property maps or attachments). Each drop emits a rate-limited `tracing::warn!` event so production callers can detect it without enabling `debug=true`.
 
 ## Configuration
 
@@ -333,9 +356,13 @@ either count or an empty `model` to omit the corresponding attribute.
 | `trace_flush_interval`   | `1s`                          | Periodic span flush. `0` disables periodic flush  |
 | `trace_max_batch_size`   | `50`                          | Max spans per export request                      |
 | `trace_max_queue_size`   | `5000`                        | Backpressure threshold for spans                  |
+| `event_max_queue_size`   | `5000`                        | Max distinct buffered event ids                   |
 | `max_attempts`           | `3`                           | HTTP retries (1 = no retries)                     |
 | `base_delay`             | `1s`                          | Backoff base (exponential, ±20% jitter)           |
 | `jitter_fraction`        | `0.2`                         | Backoff jitter fraction (0.0–1.0)                 |
+| `request_timeout`        | `30s`                         | Per-attempt bound on every cloud POST             |
+| `close_timeout`          | `10s`                         | Overall `close()` deadline. `0` disables          |
+| `max_text_field_chars`   | `1_000_000`                   | Per-field cap on AI text content                  |
 | `service_name`           | `raindrop.rust-sdk`           | OTLP `resource.service.name`                      |
 | `library_name`           | `raindrop-rust`               | `$context.library.name`                           |
 | `library_version`        | crate version                 | `$context.library.version`                        |

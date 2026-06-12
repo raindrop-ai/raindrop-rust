@@ -270,9 +270,21 @@ impl Interaction {
     }
 
     /// Finalize the interaction and ship the final patch.
+    ///
+    /// The interaction's captured `user_id`/`convo_id`/`event` ride along in
+    /// the final patch, so finishing works even if the buffer's sticky
+    /// context for this event id was evicted under the queue bound.
     pub async fn finish(&self, opts: FinishOptions) -> Result<()> {
         if let Some(client) = &self.client {
-            let res = client.finish(&self.event_id, opts).await;
+            let res = client
+                .finish_with_context(
+                    &self.event_id,
+                    opts,
+                    &self.user_id,
+                    &self.convo_id,
+                    &self.event,
+                )
+                .await;
             client.forget_interaction(&self.event_id);
             res
         } else {
