@@ -1,6 +1,6 @@
 [package]
 name = "raindrop-ai"
-version = "0.0.7"
+version = "0.0.8"
 edition = "2021"
 rust-version = "1.88"
 description = "Raindrop AI observability SDK for Rust (Beta) — track AI events, signals, and OTLP-style traces."

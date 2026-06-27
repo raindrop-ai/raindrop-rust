@@ -84,6 +84,7 @@ pub struct Client {
 pub struct ClientBuilder {
     write_key: String,
     endpoint: String,
+    project_id: Option<String>,
     local_workshop_url_config: LocalWorkshopUrlConfig,
     auto_detect_local_workshop: bool,
     debug: bool,
@@ -109,6 +110,7 @@ impl Default for ClientBuilder {
         Self {
             write_key: String::new(),
             endpoint: crate::DEFAULT_ENDPOINT.to_string(),
+            project_id: None,
             local_workshop_url_config: LocalWorkshopUrlConfig::Inherit,
             auto_detect_local_workshop: true,
             debug: false,
@@ -141,6 +143,21 @@ impl ClientBuilder {
     /// Set the ingestion endpoint. Defaults to [`DEFAULT_ENDPOINT`](crate::DEFAULT_ENDPOINT).
     pub fn endpoint(mut self, endpoint: impl Into<String>) -> Self {
         self.endpoint = endpoint.into();
+        self
+    }
+
+    /// Route telemetry to a specific Raindrop project. When set to a valid
+    /// slug, every outbound request carries an `X-Raindrop-Project-Id: <slug>`
+    /// header so the backend files events under that project; when unset, no
+    /// header is sent and the backend uses the org's `default` project (so this
+    /// is fully backward compatible).
+    ///
+    /// The value is trimmed and validated against
+    /// `^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$` once, at [`build`](Self::build)
+    /// time. An empty, whitespace-only, or invalid value never breaks
+    /// ingestion: it is logged via `tracing::warn!` and the header is omitted.
+    pub fn project_id(mut self, project_id: impl Into<String>) -> Self {
+        self.project_id = Some(project_id.into());
         self
     }
 
@@ -290,6 +307,7 @@ impl ClientBuilder {
     /// Build the [`Client`].
     pub fn build(self) -> Result<Client> {
         let endpoint = format_endpoint(&self.endpoint);
+        let project_id = crate::project_id::resolve(self.project_id.as_deref());
         let local_workshop_url = resolve_local_workshop_url(
             &self.local_workshop_url_config,
             self.auto_detect_local_workshop,
@@ -310,6 +328,7 @@ impl ClientBuilder {
             TransportConfig {
                 base_url: endpoint,
                 write_key: self.write_key,
+                project_id,
                 local_workshop_url,
                 max_attempts: self.max_attempts,
                 base_delay: self.base_delay,

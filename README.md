@@ -351,6 +351,7 @@ process exit.
 | ------------------------ | ----------------------------- | ------------------------------------------------- |
 | `write_key`              | `""`                          | Empty/missing key → SDK is disabled (no-op)       |
 | `endpoint`               | `https://api.raindrop.ai/v1/` | Base URL                                          |
+| `project_id`             | `None`                        | Route to a project via `X-Raindrop-Project-Id`    |
 | `debug`                  | `false`                       | Verbose debug logging via `tracing`               |
 | `partial_flush_interval` | `1s`                          | Periodic event flush. `0` disables periodic flush |
 | `trace_flush_interval`   | `1s`                          | Periodic span flush. `0` disables periodic flush  |
