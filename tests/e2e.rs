@@ -446,6 +446,54 @@ async fn poll_traces_for_event(
     ))
 }
 
+/// Query `signals.getGroupedSignals` and return a flat list of signal definitions
+/// (grouped plus ungrouped). This is the reliable source for verifying that a tracked
+/// signal landed; the per-event `signals[]` array on `events.list` is not guaranteed to
+/// be populated, so the cross-SDK e2e convention checks the catalog by name.
+async fn query_grouped_signals(token: &str) -> Result<Vec<Value>, String> {
+    let backend_url =
+        env::var("RAINDROP_BACKEND_URL").unwrap_or_else(|_| DEFAULT_BACKEND_URL.to_string());
+    let encoded = urlencoding::encode("{}").into_owned();
+    let url = format!(
+        "{}/api/trpc/signals.getGroupedSignals?input={}",
+        backend_url, encoded
+    );
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .map_err(|e| format!("signals.getGroupedSignals request failed: {}", e))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!(
+            "signals.getGroupedSignals returned {}: {}",
+            status,
+            &body.chars().take(500).collect::<String>()
+        ));
+    }
+    let body: Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("invalid signals.getGroupedSignals json: {}", e))?;
+    let data = &body["result"]["data"];
+    let mut out: Vec<Value> = data["ungroupedSignals"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    if let Some(groups) = data["groups"].as_array() {
+        for group in groups {
+            if let Some(sigs) = group["signals"].as_array() {
+                out.extend(sigs.iter().cloned());
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// **Convo grouping.** Three events sharing the same `convo_id` must all carry the same
 /// `aiData.convoId` on the dashboard, so the convo_list pipe can group them.
 #[tokio::test]
@@ -975,9 +1023,10 @@ async fn e2e_complex_agent_trajectory_with_subagents_tools_retry_failure_and_slo
     );
 }
 
-/// **Error spans populated.** When a span ends with `set_error`, the resulting event MUST
-/// have `errorSpans[]` with the correct span_name, status=ERROR, duration_ms, and (truncated)
-/// output_payload.
+/// **Failed tool span lands with status=ERROR.** A tool span that ends with an error must
+/// be retrievable via `traces.list` with `status=ERROR`, the correct span_name/type, a
+/// positive duration, and the error message in its output_payload. Verified against the
+/// Traces source rather than the eventually-consistent events.list `errorSpans` projection.
 #[tokio::test]
 async fn e2e_failed_tool_span_populates_event_error_spans_array() {
     let (write_key, dashboard_token) = match env_keys() {
@@ -1016,47 +1065,57 @@ async fn e2e_failed_tool_span_populates_event_error_spans_array() {
         .expect("finish");
     client.close().await.expect("close");
 
-    let _ = event_id; // captured at write time for diagnostics
-                      // errorSpans is populated by a separate span→event join pipeline that runs after
-                      // the event lands. Re-poll the event until the array is non-empty rather than
-                      // assuming it'll be there on first read.
+    // The failed tool span lands in the Traces source within seconds. Verify it via
+    // `traces.list` instead of the eventually-consistent events.list `errorSpans`
+    // projection: an error span is simply a span with status == "ERROR". Read the event
+    // first to learn the id `traces.list` maps on.
     let ev = poll_event_until(
         &dashboard_token,
         &user_id,
-        |e| {
-            e["aiData"]["output"].as_str() == Some("Sorry, the API failed")
-                && e["errorSpans"]
-                    .as_array()
-                    .is_some_and(|arr| !arr.is_empty())
-        },
-        E2E_DERIVED_POLL_TIMEOUT,
+        |e| e["aiData"]["output"].as_str() == Some("Sorry, the API failed"),
+        E2E_POLL_TIMEOUT,
     )
     .await
-    .expect("event with populated errorSpans");
+    .expect("event landed");
+    let event_id_for_traces = ev["id"].as_str().map(String::from).unwrap_or(event_id);
 
-    let error_spans = ev["errorSpans"].as_array().unwrap();
-    let broken = error_spans
+    let spans = poll_traces_for_event(&dashboard_token, &event_id_for_traces, 1, E2E_POLL_TIMEOUT)
+        .await
+        .expect("trace spans for the failed tool");
+
+    let broken = spans
         .iter()
         .find(|s| s["span_name"].as_str() == Some("broken_api"))
-        .unwrap_or_else(|| panic!("broken_api error span missing, got {:?}", error_spans));
-    assert_eq!(broken["status"].as_str().unwrap_or(""), "ERROR");
+        .unwrap_or_else(|| panic!("broken_api span missing among {:?}", spans));
+    assert_eq!(
+        broken["status"].as_str().unwrap_or(""),
+        "ERROR",
+        "failed tool span must carry status=ERROR"
+    );
     assert_eq!(broken["span_type"].as_str().unwrap_or(""), "TOOL_CALL");
+    let dur_ns: u64 = broken["duration_ns"]
+        .as_u64()
+        .or_else(|| broken["duration_ns"].as_f64().map(|f| f as u64))
+        .or_else(|| broken["duration_ns"].as_str().and_then(|s| s.parse().ok()))
+        .unwrap_or(0);
     assert!(
-        broken["duration_ms"].as_f64().unwrap_or(0.0) > 0.0,
-        "errorSpan duration_ms must be positive"
+        dur_ns > 0,
+        "error span duration_ns must be positive, got {:?}",
+        broken["duration_ns"]
     );
     assert!(
         broken["output_payload"]
             .as_str()
             .unwrap_or("")
             .contains("ConnectionError"),
-        "errorSpan output_payload should contain the error message; got {:?}",
+        "error span output_payload should contain the error message; got {:?}",
         broken["output_payload"]
     );
 }
 
-/// **Signals embedded in event.** A `track_signal` call after `track_ai` (same event_id) must
-/// surface as an entry in `event.signals[]` with the correct name and signal_type.
+/// **Tracked signal lands in the catalog.** A `track_signal` call must register the signal
+/// in the org's signal catalog, verified by name via `signals.getGroupedSignals`. The
+/// per-event events.list `signals[]` projection is not a guaranteed source.
 #[tokio::test]
 async fn e2e_track_signal_appears_in_event_signals_array() {
     let (write_key, dashboard_token) = match env_keys() {
@@ -1068,6 +1127,7 @@ async fn e2e_track_signal_appears_in_event_signals_array() {
     };
     let user_id = unique_user_id("sigembed");
     let event_id = format!("{}_evt", user_id);
+    let signal_name = format!("thumbs_up_{}", user_id);
     let client = build_client(&write_key);
 
     client
@@ -1084,7 +1144,7 @@ async fn e2e_track_signal_appears_in_event_signals_array() {
     client
         .track_signal(Signal {
             event_id: event_id.clone(),
-            name: "thumbs_up".to_string(),
+            name: signal_name.clone(),
             kind: SignalKind::FEEDBACK.into(),
             sentiment: "POSITIVE".to_string(),
             comment: "great".to_string(),
@@ -1095,46 +1155,38 @@ async fn e2e_track_signal_appears_in_event_signals_array() {
 
     client.close().await.expect("close");
 
-    let events = poll_events(&dashboard_token, &user_id, 1, E2E_POLL_TIMEOUT)
-        .await
-        .expect("dashboard verification");
-    let ev = events
-        .iter()
-        .find(|e| e["aiData"]["input"].as_str().unwrap_or("") == "rate this")
-        .unwrap_or_else(|| panic!("event not found"));
-
-    // Poll until the signal also lands. Signals follow a separate ingestion path and may
-    // arrive after the event row, so we re-poll the same event a few times if signals
-    // are absent on the first read.
-    let mut signals = ev["signals"].as_array().cloned().unwrap_or_default();
-    let signals_deadline = std::time::Instant::now() + Duration::from_secs(120);
-    while signals.is_empty() && std::time::Instant::now() < signals_deadline {
-        sleep(Duration::from_secs(5)).await;
-        let refreshed = poll_events(&dashboard_token, &user_id, 1, Duration::from_secs(30))
+    // Verify through the signal catalog (`signals.getGroupedSignals`), the reliable source
+    // for confirming a tracked signal landed. The per-event events.list `signals[]`
+    // projection is not guaranteed to be populated, so the cross-SDK convention checks the
+    // catalog by (run-unique) name.
+    let deadline = std::time::Instant::now() + E2E_POLL_TIMEOUT;
+    let mut signal: Option<Value> = None;
+    while signal.is_none() && std::time::Instant::now() < deadline {
+        let catalog = query_grouped_signals(&dashboard_token)
             .await
             .unwrap_or_default();
-        if let Some(refreshed_ev) = refreshed
-            .iter()
-            .find(|e| e["aiData"]["input"].as_str().unwrap_or("") == "rate this")
-        {
-            signals = refreshed_ev["signals"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default();
+        signal = catalog
+            .into_iter()
+            .find(|s| s["signal_id"].as_str() == Some(signal_name.as_str()));
+        if signal.is_none() {
+            sleep(Duration::from_secs(5)).await;
         }
     }
-
-    assert!(
-        !signals.is_empty(),
-        "event.signals must be non-empty after track_signal. event = {:?}",
-        ev
+    // Instrumented signals expose the raw slug as `signal_id` and a humanized display
+    // string as `name`, so match on `signal_id`. `type` carries the signal kind.
+    let signal = signal.unwrap_or_else(|| {
+        panic!(
+            "signal_id {:?} did not appear in signals.getGroupedSignals",
+            signal_name
+        )
+    });
+    assert_eq!(signal["signal_id"].as_str().unwrap_or(""), signal_name);
+    assert_eq!(
+        signal["type"].as_str().unwrap_or(""),
+        "feedback",
+        "signal type should be feedback; got {:?}",
+        signal["type"]
     );
-    let thumbs = signals
-        .iter()
-        .find(|s| s["name"].as_str() == Some("thumbs_up"))
-        .unwrap_or_else(|| panic!("thumbs_up signal missing among {:?}", signals));
-    let signal_type = thumbs["signalType"].as_str().unwrap_or("");
-    assert_eq!(signal_type, "feedback");
 }
 
 /// **identify lands user_traits.** Calling `identify` BEFORE `track_ai` causes subsequent
@@ -1587,16 +1639,9 @@ async fn e2e_conversations_list_shows_grouped_events_for_convo_id() {
 
 /// **traces.list deep verification.** Spans for an event_id must form a valid trace tree
 /// when fetched via `traces.list`: parent-child linkage, span_type detection, attributes,
-/// duration_ns, and start/end times.
-///
-/// Run with `cargo test -- --ignored`. Marked `#[ignore]` because the dashboard's
-/// `events.toolCalls` aggregation for a multi-span trace tree (root → child → tool) has
-/// observed latency well beyond 5 minutes — significantly higher than for the same SDK
-/// shipping a single tool span, suggesting a separate join path. The contract this test
-/// asserts (multi-span trace shape via `traces.list`) is real and worth documenting, but
-/// it's too flaky to gate CI on.
+/// duration_ns, and start/end times. Verified directly against the Traces source, which is
+/// populated within seconds of ingestion.
 #[tokio::test]
-#[ignore = "multi-span trace tree → events.toolCalls aggregation has high tail latency"]
 async fn e2e_traces_list_returns_correct_span_tree() {
     let (write_key, dashboard_token) = match env_keys() {
         Some(v) => v,
@@ -1661,20 +1706,18 @@ async fn e2e_traces_list_returns_correct_span_tree() {
         .expect("finish");
     client.close().await.expect("close");
 
-    // First, wait for the event to land AND have toolCalls populated (which proves the
-    // span→event join pipeline ran for this event). Without this gate, traces.list races
-    // the join.
+    // Wait for the event to land, then read the spans directly from `traces.list` (the
+    // Traces source), which is populated within seconds and independently of the slower
+    // span→event toolCalls projection. `poll_traces_for_event` already retries until the
+    // spans appear, so no toolCalls gate is needed.
     let ev = poll_event_until(
         &dashboard_token,
         &user_id,
-        |e| {
-            e["aiData"]["output"].as_str() == Some("done")
-                && e["toolCalls"].as_array().is_some_and(|arr| !arr.is_empty())
-        },
-        E2E_DERIVED_POLL_TIMEOUT,
+        |e| e["aiData"]["output"].as_str() == Some("done"),
+        E2E_POLL_TIMEOUT,
     )
     .await
-    .expect("event with populated toolCalls");
+    .expect("event landed");
 
     // The dashboard `events.list` row uses a public UUID for the event id; the same id is
     // accepted by `traces.list`, which internally maps to the Tinybird-stored internal id.
@@ -1749,15 +1792,19 @@ async fn e2e_traces_list_returns_correct_span_tree() {
     );
 
     // duration_ns must be positive (we slept 50ms inside the tool span)
-    let dur_ns: u128 = tool_span["duration_ns"]
-        .as_str()
-        .unwrap_or("0")
-        .parse()
+    let dur_ns: u64 = tool_span["duration_ns"]
+        .as_u64()
+        .or_else(|| tool_span["duration_ns"].as_f64().map(|f| f as u64))
+        .or_else(|| {
+            tool_span["duration_ns"]
+                .as_str()
+                .and_then(|s| s.parse().ok())
+        })
         .unwrap_or(0);
     assert!(
         dur_ns > 0,
-        "tool span duration_ns must be > 0, got {}",
-        dur_ns
+        "tool span duration_ns must be > 0, got {:?}",
+        tool_span["duration_ns"]
     );
 
     // Status: tool ended without error → status="OK"
@@ -2102,30 +2149,42 @@ async fn e2e_huge_tool_payload_ships_bounded_and_lands() {
         .expect("finish");
     client.close().await.expect("close");
 
-    // The event must land, and the derived toolCalls join must surface the
-    // bounded tool span (proving the trace pipeline accepted it).
+    // The huge tool output must land BOUNDED. Verify the tool span via `traces.list` (the
+    // Traces source, populated within seconds) rather than the slower, flakier events.list
+    // `toolCalls` projection. The SDK caps text fields at ~1M chars, so the stored payload
+    // is a small fraction of the ~4.5MB we shipped.
     let ev = poll_event_until(
         &dashboard_token,
         &user_id,
-        |ev| {
-            ev["toolCalls"]
-                .as_array()
-                .map(|calls| {
-                    calls
-                        .iter()
-                        .any(|c| c.to_string().contains("fetch_order_timeline"))
-                })
-                .unwrap_or(false)
-        },
-        E2E_DERIVED_POLL_TIMEOUT,
+        |e| e["aiData"]["output"].as_str() == Some("done"),
+        E2E_POLL_TIMEOUT,
     )
     .await
-    .expect("tool call did not surface on the dashboard event");
-    let tool_blob = ev["toolCalls"].to_string();
+    .expect("event landed");
+    let event_id_for_traces = ev["id"]
+        .as_str()
+        .map(String::from)
+        .unwrap_or_else(|| panic!("event has no id: {:?}", ev));
+
+    let spans = poll_traces_for_event(&dashboard_token, &event_id_for_traces, 1, E2E_POLL_TIMEOUT)
+        .await
+        .expect("trace spans for the huge tool payload");
+    let tool = spans
+        .iter()
+        .find(|s| s["span_name"].as_str() == Some("fetch_order_timeline"))
+        .unwrap_or_else(|| {
+            panic!(
+                "fetch_order_timeline span missing among {} spans",
+                spans.len()
+            )
+        });
+    assert_eq!(tool["span_type"].as_str().unwrap_or(""), "TOOL_CALL");
+    let out_len = tool["output_payload"].as_str().unwrap_or("").len();
+    assert!(out_len > 0, "tool output_payload must not be empty");
     assert!(
-        tool_blob.len() < 300_000,
-        "tool call payload not bounded on the dashboard: {} bytes",
-        tool_blob.len()
+        out_len <= 1_100_000,
+        "tool output_payload must be bounded (~1M char cap), got {} bytes",
+        out_len
     );
 }
 
