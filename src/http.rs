@@ -28,6 +28,11 @@ pub(crate) const MAX_INGEST_SIZE_BYTES: usize = 1024 * 1024;
 pub(crate) struct TransportConfig {
     pub base_url: String,
     pub write_key: String,
+    /// Validated project slug. When `Some`, every outbound request carries an
+    /// `X-Raindrop-Project-Id` header so the backend routes telemetry to that
+    /// project; when `None`, no header is sent and the backend uses the org's
+    /// default project. Validated once at build time (see [`crate::project_id`]).
+    pub project_id: Option<String>,
     pub local_workshop_url: Option<String>,
     pub max_attempts: u32,
     pub base_delay: Duration,
@@ -147,6 +152,10 @@ impl RetryingHttpClient {
                 .timeout(self.cfg.request_timeout)
                 .body(payload.clone());
 
+            if let Some(project_id) = &self.cfg.project_id {
+                req = req.header(crate::project_id::PROJECT_ID_HEADER, project_id.as_str());
+            }
+
             if self.cfg.debug {
                 req = req.header("X-Raindrop-Sdk", "raindrop-rust");
             }
@@ -192,6 +201,7 @@ impl RetryingHttpClient {
     fn spawn_local_mirror(&self, base_url: String, path: String, payload: Vec<u8>) {
         let http = self.http.clone();
         let write_key = self.cfg.write_key.clone();
+        let project_id = self.cfg.project_id.clone();
         let debug = self.cfg.debug;
         let task = tokio::spawn(async move {
             let url = format!("{}{}", base_url, path.strip_prefix('/').unwrap_or(&path));
@@ -202,6 +212,9 @@ impl RetryingHttpClient {
                 .timeout(LOCAL_MIRROR_TIMEOUT);
             if !write_key.is_empty() {
                 req = req.header("Authorization", format!("Bearer {}", write_key));
+            }
+            if let Some(project_id) = &project_id {
+                req = req.header(crate::project_id::PROJECT_ID_HEADER, project_id.as_str());
             }
             if debug {
                 req = req.header("X-Raindrop-Sdk", "raindrop-rust");

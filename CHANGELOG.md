@@ -4,6 +4,18 @@ All notable changes to this crate are documented here. Format follows [Keep a Ch
 
 ## [Unreleased]
 
+## [0.0.8] - 2026-06-26
+
+### Added
+
+- **`project_id` routing.** New `ClientBuilder::project_id(...)` attaches an
+  `X-Raindrop-Project-Id` header to every outbound request (including the local
+  Workshop mirror), routing telemetry to a named project. When unset the wire
+  format is unchanged and the backend uses the org's default project. The slug
+  is trimmed and validated against `^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$` once
+  at build time; an invalid value is logged and the header is omitted so a typo
+  never breaks ingestion.
+
 ## [0.0.7] - 2026-06-11
 
 Hardening release from the cross-SDK parity audit (mirrors python-sdk
@@ -187,7 +199,8 @@ Initial **beta** release. The wire contract against the Raindrop ingestion API i
 - No client-side PII redaction (Python's `set_redact_pii` and JS's `redactPii` have no Rust equivalent yet).
 - No local-debugger mirroring (no `RAINDROP_LOCAL_DEBUGGER` support).
 
-[Unreleased]: https://github.com/raindrop-ai/raindrop-rust/compare/v0.0.7...HEAD
+[Unreleased]: https://github.com/raindrop-ai/raindrop-rust/compare/v0.0.8...HEAD
+[0.0.8]: https://github.com/raindrop-ai/raindrop-rust/compare/v0.0.7...v0.0.8
 [0.0.7]: https://github.com/raindrop-ai/raindrop-rust/compare/v0.0.6...v0.0.7
 [0.0.6]: https://github.com/raindrop-ai/raindrop-rust/compare/v0.0.5...v0.0.6
 [0.0.5]: https://github.com/raindrop-ai/raindrop-rust/compare/v0.0.4...v0.0.5

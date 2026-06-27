@@ -45,6 +45,7 @@ mod helpers;
 mod http;
 mod local_debugger;
 mod otlp;
+mod project_id;
 mod signals;
 mod trace_buffer;
 mod traces;
