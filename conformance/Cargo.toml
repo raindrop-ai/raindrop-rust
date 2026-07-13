@@ -1,0 +1,25 @@
+# Conformance driver for the raindrop-sdk-harness (DEV-1145).
+#
+# Standalone bin crate, deliberately OUTSIDE any workspace: it depends on the
+# SDK crate by path and must never alter the published crate (cargo excludes
+# nested-package directories from `cargo package`, so this directory does not
+# leak into the raindrop-ai package).
+#
+# Build:  cargo build --manifest-path conformance/Cargo.toml
+# Run:    conformance/target/debug/raindrop-conformance-driver [--describe]
+
+[package]
+name = "raindrop-conformance-driver"
+version = "1.0.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "raindrop-conformance-driver"
+path = "src/main.rs"
+
+[dependencies]
+raindrop-ai = { path = ".." }
+serde_json = "1.0"
+time = { version = "0.3", features = ["parsing"] }
+tokio = { version = "1.36", features = ["rt-multi-thread", "macros"] }

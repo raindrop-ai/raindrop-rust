@@ -1,0 +1,436 @@
+//! Conformance driver for the raindrop-sdk-harness (DEV-1145).
+//!
+//! A thin CLI that maps the harness's language-neutral step vocabulary onto
+//! the *public* Raindrop Rust SDK API — no internals, no test hooks. It speaks
+//! driver protocol 1 (harness README, "Step vocabulary & driver protocol"):
+//!
+//! * `--describe` prints a JSON handshake object and exits 0.
+//! * Otherwise it reads a JSON array of steps from stdin, executes them in
+//!   order against a client configured *only* from the environment, prints one
+//!   `{"step": <n>, "ms": <elapsed>}` timing line per completed step, and
+//!   exits 0 on success.
+//! * An unsupported step prints `unsupported:<step>` as the last stdout line
+//!   and exits 3.
+//!
+//! Client configuration comes only from the environment:
+//!
+//! * `RAINDROP_SINK_URL`   — ingest base URL (the driver appends `/v1/`).
+//! * `RAINDROP_WRITE_KEY`  — bearer write key.
+//! * `RAINDROP_PROJECT_ID` — optional project slug.
+
+use std::collections::BTreeMap;
+use std::io::Read;
+use std::process::ExitCode;
+use std::time::Instant;
+
+use serde_json::{json, Map, Value};
+use time::format_description::well_known::Rfc3339;
+use time::OffsetDateTime;
+
+use raindrop::{
+    AiEvent, Attachment, BeginOptions, Client, Event, FinishOptions, Interaction, PatchOptions,
+    User,
+};
+
+const DRIVER_VERSION: &str = "1.0.0";
+const PROTOCOL: u64 = 1;
+const SDK_NAME: &str = "raindrop-rust";
+
+/// Canonical capability keys (harness `capabilities.yaml`) this SDK supports,
+/// derived honestly from the public API:
+///
+/// * `events.track`         — `Client::track_event` (plain, non-AI event).
+/// * `events.track_ai`      — `Client::track_ai`.
+/// * `events.track_partial` — `Client::begin` / `Interaction::patch` /
+///                            `Interaction::finish`.
+/// * `identify`             — `Client::identify`.
+///
+/// Omitted deliberately:
+///
+/// * `signal` — the `signal` step is out of scope for this driver (DEV-1145),
+///   so it is reported unsupported (exit 3) rather than implemented. An
+///   omitted key is neither supported nor structurally not-applicable, so the
+///   runner skips scenarios that require it.
+const CAPABILITIES: &[&str] = &[
+    "events.track",
+    "events.track_ai",
+    "events.track_partial",
+    "identify",
+];
+const NOT_APPLICABLE: &[&str] = &[];
+
+/// Reserved harness arg handled by the runner (per-step timing bound), never a
+/// payload field, so the driver strips it before mapping args onto SDK calls.
+const RESERVED_ARGS: &[&str] = &["max_ms"];
+
+fn describe() -> Value {
+    json!({
+        "sdk_name": SDK_NAME,
+        "sdk_version": raindrop::VERSION,
+        "driver_version": DRIVER_VERSION,
+        "protocol": PROTOCOL,
+        "capabilities": CAPABILITIES,
+        "not_applicable": NOT_APPLICABLE,
+    })
+}
+
+/// A step the driver cannot execute — the exit-3 `unsupported:<step>` path.
+struct Unsupported(String);
+
+/// A driver/scenario malfunction — any other nonzero exit.
+struct Failure(String);
+
+enum StepError {
+    Unsupported(Unsupported),
+    Failure(Failure),
+}
+
+impl From<Unsupported> for StepError {
+    fn from(u: Unsupported) -> Self {
+        StepError::Unsupported(u)
+    }
+}
+
+impl From<Failure> for StepError {
+    fn from(f: Failure) -> Self {
+        StepError::Failure(f)
+    }
+}
+
+/// Drop reserved args and treat an explicit JSON `null` as omitted.
+///
+/// Per the driver protocol, `null` on an optional arg is equivalent to the
+/// key being absent and must never be forwarded to an SDK call. Unknown keys
+/// are kept (and simply never read): drivers MUST ignore unknown keys per the
+/// harness parse-tolerance rule.
+fn clean(args: &Value) -> Map<String, Value> {
+    match args.as_object() {
+        Some(map) => map
+            .iter()
+            .filter(|(k, v)| !RESERVED_ARGS.contains(&k.as_str()) && !v.is_null())
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+        None => Map::new(),
+    }
+}
+
+fn required_str(args: &Map<String, Value>, key: &str, step: &str) -> Result<String, Failure> {
+    match args.get(key).and_then(Value::as_str) {
+        Some(s) => Ok(s.to_string()),
+        None => Err(Failure(format!(
+            "step {step}: missing or non-string required arg `{key}`"
+        ))),
+    }
+}
+
+fn optional_str(args: &Map<String, Value>, key: &str) -> String {
+    args.get(key)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn properties(args: &Map<String, Value>, key: &str) -> BTreeMap<String, Value> {
+    match args.get(key).and_then(Value::as_object) {
+        Some(map) => map.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+        None => BTreeMap::new(),
+    }
+}
+
+fn timestamp(args: &Map<String, Value>, step: &str) -> Result<Option<OffsetDateTime>, Failure> {
+    match args.get("timestamp").and_then(Value::as_str) {
+        Some(raw) => OffsetDateTime::parse(raw, &Rfc3339).map(Some).map_err(|e| {
+            Failure(format!(
+                "step {step}: cannot parse timestamp {raw:?} as RFC 3339: {e}"
+            ))
+        }),
+        None => Ok(None),
+    }
+}
+
+fn attachments(args: &Map<String, Value>, step: &str) -> Result<Vec<Attachment>, Failure> {
+    let raw = match args.get("attachments") {
+        Some(v) => v,
+        None => return Ok(Vec::new()),
+    };
+    let items = raw
+        .as_array()
+        .ok_or_else(|| Failure(format!("step {step}: `attachments` is not an array")))?;
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let obj = item
+            .as_object()
+            .ok_or_else(|| Failure(format!("step {step}: attachment item is not an object")))?;
+        let get = |key: &str| {
+            obj.get(key)
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        };
+        // `type`, `role`, and `value` are required by the step schema; the
+        // remaining keys are optional. Additional forward-compat keys have no
+        // representation in the public `Attachment` struct and are dropped.
+        out.push(Attachment {
+            kind: get("type"),
+            role: get("role"),
+            value: get("value"),
+            attachment_id: get("attachment_id"),
+            name: get("name"),
+            language: get("language"),
+        });
+    }
+    Ok(out)
+}
+
+/// Owns the single SDK client and (at most one) open interaction binding.
+#[derive(Default)]
+struct Driver {
+    client: Option<Client>,
+    interaction: Option<Interaction>,
+}
+
+impl Driver {
+    fn client(&self) -> Result<&Client, Failure> {
+        self.client
+            .as_ref()
+            .ok_or_else(|| Failure("step executed before init".into()))
+    }
+
+    async fn execute(&mut self, name: &str, args: &Value) -> Result<(), StepError> {
+        let args = clean(args);
+        match name {
+            "init" => self.step_init().map_err(StepError::from),
+            "track" => self.step_track(&args).await.map_err(StepError::from),
+            "track_ai" => self.step_track_ai(&args).await.map_err(StepError::from),
+            "begin" => self.step_begin(&args).await.map_err(StepError::from),
+            "patch" => self.step_patch(&args).await.map_err(StepError::from),
+            "finish" => self.step_finish(&args).await.map_err(StepError::from),
+            "identify" => self.step_identify(&args).await.map_err(StepError::from),
+            "flush" => self.step_flush().await.map_err(StepError::from),
+            "close" => self.step_close().await.map_err(StepError::from),
+            // `signal` (capability deliberately not advertised) and anything
+            // unknown take the exit-3 unsupported path.
+            other => Err(Unsupported(other.to_string()).into()),
+        }
+    }
+
+    // -- lifecycle -------------------------------------------------------- //
+
+    fn step_init(&mut self) -> Result<(), Failure> {
+        let sink_url = std::env::var("RAINDROP_SINK_URL").unwrap_or_default();
+        let sink_url = sink_url.trim_end_matches('/');
+        let write_key = std::env::var("RAINDROP_WRITE_KEY").unwrap_or_default();
+
+        let mut builder = Client::builder()
+            .write_key(write_key)
+            // The driver must talk only to the harness-provided sink; never
+            // mirror to a developer-machine Workshop daemon (env var or TCP
+            // probe) during a conformance run.
+            .disable_local_workshop();
+        if !sink_url.is_empty() {
+            builder = builder.endpoint(format!("{sink_url}/v1/"));
+        }
+        if let Ok(project_id) = std::env::var("RAINDROP_PROJECT_ID") {
+            if !project_id.trim().is_empty() {
+                builder = builder.project_id(project_id);
+            }
+        }
+        let client = builder
+            .build()
+            .map_err(|e| Failure(format!("init: cannot build client: {e}")))?;
+        self.client = Some(client);
+        Ok(())
+    }
+
+    async fn step_flush(&self) -> Result<(), Failure> {
+        self.client()?
+            .flush()
+            .await
+            .map_err(|e| Failure(format!("flush: {e}")))
+    }
+
+    async fn step_close(&self) -> Result<(), Failure> {
+        self.client()?
+            .close()
+            .await
+            .map_err(|e| Failure(format!("close: {e}")))
+    }
+
+    // -- events ----------------------------------------------------------- //
+
+    async fn step_track(&self, args: &Map<String, Value>) -> Result<(), Failure> {
+        let event = Event {
+            event_id: optional_str(args, "event_id"),
+            user_id: required_str(args, "user_id", "track")?,
+            event: required_str(args, "event", "track")?,
+            timestamp: timestamp(args, "track")?,
+            properties: properties(args, "properties"),
+            attachments: attachments(args, "track")?,
+        };
+        self.client()?
+            .track_event(event)
+            .await
+            .map_err(|e| Failure(format!("track: {e}")))
+    }
+
+    async fn step_track_ai(&self, args: &Map<String, Value>) -> Result<(), Failure> {
+        let event = AiEvent {
+            event_id: optional_str(args, "event_id"),
+            user_id: required_str(args, "user_id", "track_ai")?,
+            event: required_str(args, "event", "track_ai")?,
+            timestamp: timestamp(args, "track_ai")?,
+            input: optional_str(args, "input"),
+            output: optional_str(args, "output"),
+            model: optional_str(args, "model"),
+            convo_id: optional_str(args, "convo_id"),
+            properties: properties(args, "properties"),
+            attachments: attachments(args, "track_ai")?,
+        };
+        self.client()?
+            .track_ai(event)
+            .await
+            .map_err(|e| Failure(format!("track_ai: {e}")))
+    }
+
+    async fn step_identify(&self, args: &Map<String, Value>) -> Result<(), Failure> {
+        let user = User {
+            user_id: required_str(args, "user_id", "identify")?,
+            traits: properties(args, "traits"),
+        };
+        self.client()?
+            .identify(user)
+            .await
+            .map_err(|e| Failure(format!("identify: {e}")))
+    }
+
+    // -- partial (begin/patch/finish) lifecycle ---------------------------- //
+
+    async fn step_begin(&mut self, args: &Map<String, Value>) -> Result<(), Failure> {
+        if self.interaction.is_some() {
+            return Err(Failure(
+                "begin: an interaction is already open (single-binding rule)".into(),
+            ));
+        }
+        let opts = BeginOptions {
+            event_id: optional_str(args, "event_id"),
+            user_id: required_str(args, "user_id", "begin")?,
+            event: required_str(args, "event", "begin")?,
+            timestamp: timestamp(args, "begin")?,
+            input: optional_str(args, "input"),
+            model: optional_str(args, "model"),
+            convo_id: optional_str(args, "convo_id"),
+            properties: properties(args, "properties"),
+            attachments: attachments(args, "begin")?,
+        };
+        let interaction = self.client()?.begin(opts).await;
+        self.interaction = Some(interaction);
+        Ok(())
+    }
+
+    async fn step_patch(&self, args: &Map<String, Value>) -> Result<(), Failure> {
+        let interaction = self
+            .interaction
+            .as_ref()
+            .ok_or_else(|| Failure("patch: no open interaction".into()))?;
+        let opts = PatchOptions {
+            user_id: optional_str(args, "user_id"),
+            event: optional_str(args, "event"),
+            timestamp: timestamp(args, "patch")?,
+            input: optional_str(args, "input"),
+            output: optional_str(args, "output"),
+            model: optional_str(args, "model"),
+            convo_id: optional_str(args, "convo_id"),
+            properties: properties(args, "properties"),
+            attachments: attachments(args, "patch")?,
+            is_pending: None,
+        };
+        interaction
+            .patch(opts)
+            .await
+            .map_err(|e| Failure(format!("patch: {e}")))
+    }
+
+    async fn step_finish(&mut self, args: &Map<String, Value>) -> Result<(), Failure> {
+        let interaction = self
+            .interaction
+            .take()
+            .ok_or_else(|| Failure("finish: no open interaction".into()))?;
+        let opts = FinishOptions {
+            timestamp: timestamp(args, "finish")?,
+            output: optional_str(args, "output"),
+            model: optional_str(args, "model"),
+            properties: properties(args, "properties"),
+            attachments: attachments(args, "finish")?,
+        };
+        interaction
+            .finish(opts)
+            .await
+            .map_err(|e| Failure(format!("finish: {e}")))
+    }
+}
+
+async fn run_steps(raw: &str) -> ExitCode {
+    let steps: Vec<Value> = match serde_json::from_str(raw) {
+        Ok(Value::Array(steps)) => steps,
+        Ok(_) => {
+            eprintln!("driver: stdin is valid JSON but not an array of steps");
+            return ExitCode::from(1);
+        }
+        Err(e) => {
+            eprintln!("driver: cannot parse steps from stdin: {e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    let mut driver = Driver::default();
+    for (index, step) in steps.iter().enumerate() {
+        let (name, args) = match step.as_object().and_then(|m| {
+            if m.len() == 1 {
+                m.iter().next()
+            } else {
+                None
+            }
+        }) {
+            Some((name, args)) => (name.clone(), args.clone()),
+            None => {
+                eprintln!("driver: step {index} is not a single-key object");
+                return ExitCode::from(1);
+            }
+        };
+        let start = Instant::now();
+        match driver.execute(&name, &args).await {
+            Ok(()) => {}
+            Err(StepError::Unsupported(Unsupported(step_name))) => {
+                println!("unsupported:{step_name}");
+                return ExitCode::from(3);
+            }
+            Err(StepError::Failure(Failure(message))) => {
+                eprintln!("driver: step {index} ({name}) failed: {message}");
+                return ExitCode::from(1);
+            }
+        }
+        let ms = start.elapsed().as_secs_f64() * 1000.0;
+        println!("{}", json!({ "step": index, "ms": ms }));
+    }
+
+    if driver.interaction.is_some() {
+        eprintln!("driver: steps ended with an interaction still open (invalid scenario)");
+        return ExitCode::from(1);
+    }
+    ExitCode::SUCCESS
+}
+
+#[tokio::main]
+async fn main() -> ExitCode {
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    if argv.iter().any(|a| a == "--describe") {
+        println!("{}", describe());
+        return ExitCode::SUCCESS;
+    }
+    let mut raw = String::new();
+    if let Err(e) = std::io::stdin().read_to_string(&mut raw) {
+        eprintln!("driver: cannot read stdin: {e}");
+        return ExitCode::from(1);
+    }
+    run_steps(&raw).await
+}
