@@ -105,10 +105,7 @@ pub async fn mount_any_post(server: &MockServer) -> Recorder {
 pub fn json_get<'a>(value: &'a Value, p: &[&str]) -> Option<&'a Value> {
     let mut current = value;
     for key in p {
-        match current.get(*key) {
-            Some(next) => current = next,
-            None => return None,
-        }
+        current = current.get(*key)?;
     }
     Some(current)
 }
