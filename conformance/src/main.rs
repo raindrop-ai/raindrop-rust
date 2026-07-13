@@ -234,7 +234,7 @@ impl Driver {
 
     fn step_init(&mut self) -> Result<(), Failure> {
         let sink_url = std::env::var("RAINDROP_SINK_URL").unwrap_or_default();
-        let sink_url = sink_url.trim_end_matches('/').to_string();
+        let sink_url = sink_url.trim().trim_end_matches('/').to_string();
         // A missing sink must never fall through to the SDK's production
         // default: a conformance run pointed at prod would ship test traffic
         // with a real-looking bearer key. Hard config error instead.
@@ -244,6 +244,15 @@ impl Driver {
             ));
         }
         let write_key = std::env::var("RAINDROP_WRITE_KEY").unwrap_or_default();
+        let write_key = write_key.trim().to_string();
+        // An empty write key + disable_local_workshop() yields a disabled
+        // client: every step "succeeds" while nothing ships — a silent
+        // no-op run that would record zero requests. Hard config error.
+        if write_key.is_empty() {
+            return Err(Failure(
+                "RAINDROP_WRITE_KEY is required: an empty key builds a disabled client and the run becomes a silent no-op".to_string(),
+            ));
+        }
 
         let mut builder = Client::builder()
             .write_key(write_key)
