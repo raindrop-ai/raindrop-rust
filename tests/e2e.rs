@@ -76,7 +76,7 @@ async fn query_dashboard(token: &str, limit: usize) -> Result<Vec<Value>, String
         return Err(format!(
             "dashboard returned {}: {}",
             status,
-            &body.chars().take(500).collect::<String>()
+            body.chars().take(500).collect::<String>()
         ));
     }
     let body: Value = resp
@@ -407,7 +407,7 @@ async fn query_traces_for_event(token: &str, event_id: &str) -> Result<Vec<Value
         return Err(format!(
             "traces.list returned {}: {}",
             status,
-            &body.chars().take(500).collect::<String>()
+            body.chars().take(500).collect::<String>()
         ));
     }
     let body: Value = resp
@@ -472,7 +472,7 @@ async fn query_grouped_signals(token: &str) -> Result<Vec<Value>, String> {
         return Err(format!(
             "signals.getGroupedSignals returned {}: {}",
             status,
-            &body.chars().take(500).collect::<String>()
+            body.chars().take(500).collect::<String>()
         ));
     }
     let body: Value = resp
