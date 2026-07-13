@@ -8,3 +8,4 @@ track-batch-array@fault: missing_feature  # events never batch into one events/t
 track-nested-properties@fault: missing_feature  # SDK ships plain track via events/track_partial (bare object), never events/track (found by DEV-1145) (DEV-1149)
 track-plain-single@fault: missing_feature  # SDK ships plain track via events/track_partial (bare object), never events/track (found by DEV-1145) (DEV-1149)
 track-single@fault: missing_feature  # SDK ships track_ai via events/track_partial (bare object), never events/track (found by DEV-1145) (DEV-1149)
+wrap-retry-429-partial-hot-path@fault: bug  # Class 1 violation on the real route: track_ai awaits the Retry-After sleep inline on the caller (step 1004ms vs max_ms 100) before the retry ships (DEV-1150)

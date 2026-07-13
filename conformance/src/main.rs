@@ -54,10 +54,22 @@ const SDK_NAME: &str = "raindrop-rust";
 const CAPABILITIES: &[&str] = &[
     "events.track",
     "events.track_ai",
+    // Factually true delivery mode: track_event/track_ai ship begin-style to
+    // events/track_partial (DEV-1149) — declaring it runs the wrap-*-partial
+    // scenarios against the route this SDK actually uses.
+    "events.track_ai_partial",
     "events.track_partial",
     "identify",
 ];
-const NOT_APPLICABLE: &[&str] = &[];
+const NOT_APPLICABLE: &[&str] = &["wrapper.capture"];
+// A not_applicable claim must argue "not fixable" (README policy).
+// traces.otlp is deliberately neither declared nor not_applicable: the SDK
+// ships OTLP spans, but the harness cannot drive trace emission yet — a
+// visible gap tracked as DEV-1153.
+const NOT_APPLICABLE_REASONS: &[(&str, &str)] = &[(
+    "wrapper.capture",
+    "core SDK driven by direct calls; a framework capture path cannot exist by design",
+)];
 
 /// Reserved harness arg handled by the runner (per-step timing bound), never a
 /// payload field, so the driver strips it before mapping args onto SDK calls.
@@ -71,6 +83,10 @@ fn describe() -> Value {
         "protocol": PROTOCOL,
         "capabilities": CAPABILITIES,
         "not_applicable": NOT_APPLICABLE,
+        "not_applicable_reasons": NOT_APPLICABLE_REASONS
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeMap<_, _>>(),
     })
 }
 
