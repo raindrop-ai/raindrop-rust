@@ -1,0 +1,371 @@
+# Conformance — fault + prod lanes
+#
+# Runs the raindrop-sdk-harness against this SDK's conformance driver
+# (conformance/, DEV-1145). Two jobs:
+#
+#   * fault-lane — on every pull request. Talks only to a local capture/fault
+#     server: no production calls, no Raindrop credentials.
+#   * prod-lane  — on non-fork pull requests with credentials configured. Talks
+#     to the real Raindrop ingest + Query API using org secrets (dedicated
+#     test org).
+#
+# ── Harness pin ──────────────────────────────────────────────────────────────
+# The harness is PINNED to a commit SHA (HARNESS_REF below). Do NOT float to
+# `main`: harness scenario/runner changes must be adopted deliberately so a
+# harness-side change can never turn this repo's CI red without review.
+#
+# Bumping the pin is a normal, reviewed one-line PR:
+#   1. Set HARNESS_REF to the desired invisible-tools/raindrop-sdk-harness
+#      `main` commit SHA.
+#   2. Push; confirm this workflow is still green (and update
+#      conformance/failures.txt if the runner emits ratchet deltas).
+#   3. Merge like any other change.
+#
+# ── Harness access + fork-safety ─────────────────────────────────────────────
+# invisible-tools/raindrop-sdk-harness is a PRIVATE repo in a different org, so
+# the default GITHUB_TOKEN (scoped to this repo) cannot check it out. Provide a
+# read-only token (fine-grained PAT or GitHub App) with Contents:read on the
+# harness as the HARNESS_READ_TOKEN secret. If the harness is instead made
+# public, the default token suffices and no secret is needed.
+#
+# GitHub does not expose secrets to workflows triggered by *forked* PRs, so a
+# fork can never read the private harness (or the prod credentials). To stay
+# fork-safe the jobs SKIP LOUDLY in that case (a warning annotation + a skip
+# note in the summary, neutral status) rather than failing — see each "Gate"
+# step. Same-repo PRs run normally; if harness access has not been configured
+# yet the checkout will be red until it is (that is the expected
+# pre-configuration state).
+#
+# ── Blocking vs. non-blocking ────────────────────────────────────────────────
+# The runner steps are `continue-on-error: true` for now — the suite is
+# non-blocking while it beds in. The result is still visible: the runner step
+# shows pass/fail in the checks UI and the job summary reports the runner exit
+# code plus its full results table. Flipping a lane to required is a later
+# one-line change: remove `continue-on-error` from that lane's "Run conformance
+# runner" step.
+#
+# Ratchet semantics come from the runner: an unexpected pass OR an unexpected
+# failure exits non-zero (see raindrop-sdk-harness/runner). `status:
+# experimental` scenarios run and report but never affect the exit code.
+#
+# ── Action pinning ───────────────────────────────────────────────────────────
+# All third-party actions below are pinned to immutable commit SHAs (per
+# .github/workflows/ci.yml). The `# v…` comment after each SHA records the
+# human-readable release the SHA points to, so dependency updates remain
+# reviewable.
+
+name: Conformance
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+# One in-flight run per PR ref. Overlapping prod-lane runs are data-safe
+# (scenarios isolate records with a per-execution ${EXEC} token) but share the
+# org's Raindrop rate bucket, so cancelling superseded runs keeps the bucket
+# for the newest commit.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # invisible-tools/raindrop-sdk-harness — see "Harness pin" in the header.
+  HARNESS_REPO: invisible-tools/raindrop-sdk-harness
+  HARNESS_REF: 98163c965d3f08b845fda8c68bdc3531e8461b2e # main @ 2026-07-13 (31 scenarios incl. expect.traces vocabulary + wrap-capture-attachments)
+  SERVER_URL: http://127.0.0.1:8787
+  # Driver binary produced by `cargo build --manifest-path conformance/Cargo.toml`.
+  # conformance/ is a standalone bin crate outside the workspace that depends on
+  # the SDK crate by path, so the driver always exercises the SDK from this
+  # checkout (see conformance/Cargo.toml).
+  DRIVER_BIN: ${{ github.workspace }}/conformance/target/debug/raindrop-conformance-driver
+
+jobs:
+  fault-lane:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Gate (fork-safety)
+        id: gate
+        # Scope the PAT to this step only (the harness checkout receives it
+        # separately via with.token) so npm/cargo/server steps never inherit
+        # it. Surfaced as an env var because secrets cannot be referenced
+        # directly in step `if:` conditions.
+        env:
+          HARNESS_READ_TOKEN: ${{ secrets.HARNESS_READ_TOKEN }}
+        run: |
+          # Run when either a harness read token is available, or this is a
+          # same-repo PR (where the default token can read a public harness and
+          # a configured HARNESS_READ_TOKEN can read a private one). Forked PRs
+          # get no secrets, so a private harness is unreachable — skip loudly.
+          if [ -n "$HARNESS_READ_TOKEN" ] || \
+             [ "${{ github.event.pull_request.head.repo.fork }}" != "true" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "conformance fault lane will run"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Forked PR without HARNESS_READ_TOKEN: the private harness repo cannot be checked out from a fork. Skipping the conformance fault lane (loud skip, not a failure)."
+          fi
+
+      - name: Checkout raindrop-rust
+        if: steps.gate.outputs.run == 'true'
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Checkout harness (pinned)
+        if: steps.gate.outputs.run == 'true'
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: ${{ env.HARNESS_REPO }}
+          ref: ${{ env.HARNESS_REF }}
+          path: harness
+          # Prefer the read-only harness token; fall back to the default token,
+          # which is sufficient only if the harness is (or becomes) public.
+          token: ${{ secrets.HARNESS_READ_TOKEN || github.token }}
+          # Do not write the PAT into harness/.git/config — later steps in this
+          # job (npm, cargo) would otherwise be able to read it. We only need a
+          # one-shot read-only checkout, never subsequent authed git ops.
+          persist-credentials: false
+
+      - name: Set up Node
+        if: steps.gate.outputs.run == 'true'
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "20"
+
+      - name: Set up Rust
+        if: steps.gate.outputs.run == 'true'
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04
+
+      - name: Cache cargo (conformance crate)
+        if: steps.gate.outputs.run == 'true'
+        # Caches the cargo registry + the conformance crate's target dir, keyed
+        # on the conformance lockfile/manifest, to keep runtime sane.
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        with:
+          workspaces: conformance
+
+      - name: Build harness server + runner
+        if: steps.gate.outputs.run == 'true'
+        working-directory: harness
+        run: |
+          npm --prefix server ci
+          npm --prefix server run build
+          npm --prefix runner ci
+          npm --prefix runner run build
+
+      - name: Build conformance driver
+        if: steps.gate.outputs.run == 'true'
+        # Standalone bin crate outside the workspace; depends on the SDK crate
+        # by path, so cargo builds the SDK from this checkout. Output lands at
+        # $DRIVER_BIN. The published crate is never altered.
+        run: cargo build --manifest-path conformance/Cargo.toml
+
+      - name: Start fault server
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          node harness/server/dist/src/index.js --port 8787 \
+            > "$RUNNER_TEMP/fault-server.log" 2>&1 &
+          echo "FAULT_SERVER_PID=$!" >> "$GITHUB_ENV"
+          for _ in $(seq 1 50); do
+            if curl -sf "$SERVER_URL/__control/v1/health" >/dev/null; then
+              echo "fault server healthy"
+              exit 0
+            fi
+            sleep 0.2
+          done
+          echo "::error::fault server did not become healthy"
+          cat "$RUNNER_TEMP/fault-server.log"
+          exit 1
+
+      - name: Run conformance runner (fault lane)
+        id: runner
+        if: steps.gate.outputs.run == 'true'
+        continue-on-error: true
+        run: |
+          set +e
+          node harness/runner/dist/src/index.js \
+            --driver "$DRIVER_BIN" \
+            --failures conformance/failures.txt \
+            --lane fault \
+            --server "$SERVER_URL" \
+            --report "$RUNNER_TEMP/report.json" \
+            2>&1 | tee "$RUNNER_TEMP/runner-output.txt"
+          code=${PIPESTATUS[0]}
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+          exit "$code"
+
+      - name: Stop fault server
+        if: always() && steps.gate.outputs.run == 'true'
+        run: kill "$FAULT_SERVER_PID" 2>/dev/null || true
+
+      - name: Report result
+        if: always()
+        run: |
+          {
+            echo "## Conformance — fault lane"
+            echo
+            if [ "${{ steps.gate.outputs.run }}" != "true" ]; then
+              echo "- Result: **SKIPPED** — forked PR without \`HARNESS_READ_TOKEN\`; the private harness is unreachable from forks (fork-safe, non-blocking)."
+              exit 0
+            fi
+            code="${{ steps.runner.outputs.exit_code }}"
+            echo "- Harness: \`${HARNESS_REPO}@${HARNESS_REF}\`"
+            echo "- Runner exit code: \`${code:-unknown}\`"
+            case "$code" in
+              0) echo "- Result: **PASS** (warnings allowed)" ;;
+              1) echo "- Result: **FAIL** — scenario/ratchet failures (non-blocking for now)" ;;
+              2) echo "- Result: **ERROR** — infra/config problem (non-blocking for now)" ;;
+              *) echo "- Result: **UNKNOWN** (runner did not report an exit code)" ;;
+            esac
+            echo
+            echo '```'
+            cat "$RUNNER_TEMP/runner-output.txt" 2>/dev/null || echo "(no runner output captured)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload report
+        if: always() && steps.gate.outputs.run == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: conformance-fault-report
+          path: |
+            ${{ runner.temp }}/report.json
+            ${{ runner.temp }}/runner-output.txt
+          if-no-files-found: warn
+
+  prod-lane:
+    runs-on: ubuntu-latest
+    # Prod scenarios are dominated by the ~30s duplicate-settle window (~40s
+    # each), so allow generous headroom over the fault lane.
+    timeout-minutes: 15
+    steps:
+      - name: Gate (secrets + fork-safety)
+        id: gate
+        # The prod lane needs the harness read token AND the Raindrop write /
+        # query credentials. Forked PRs get no secrets, so this naturally skips
+        # loudly there; same-repo PRs run once the org secrets exist. Scoped to
+        # this step so downstream steps don't inherit the credentials (they get
+        # them explicitly on the steps that need them).
+        env:
+          HARNESS_READ_TOKEN: ${{ secrets.HARNESS_READ_TOKEN }}
+          RAINDROP_WRITE_KEY: ${{ secrets.RAINDROP_WRITE_KEY }}
+          RAINDROP_QUERY_API_KEY: ${{ secrets.RAINDROP_QUERY_API_KEY }}
+        run: |
+          if [ -n "$HARNESS_READ_TOKEN" ] && \
+             [ -n "$RAINDROP_WRITE_KEY" ] && \
+             [ -n "$RAINDROP_QUERY_API_KEY" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "conformance prod lane will run"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Prod lane requires HARNESS_READ_TOKEN + RAINDROP_WRITE_KEY + RAINDROP_QUERY_API_KEY; one or more is unavailable (e.g. a forked PR gets no secrets). Skipping the conformance prod lane (loud skip, not a failure)."
+          fi
+
+      - name: Checkout raindrop-rust
+        if: steps.gate.outputs.run == 'true'
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Checkout harness (pinned)
+        if: steps.gate.outputs.run == 'true'
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: ${{ env.HARNESS_REPO }}
+          ref: ${{ env.HARNESS_REF }}
+          path: harness
+          token: ${{ secrets.HARNESS_READ_TOKEN || github.token }}
+          # Do not persist the PAT into harness/.git/config (see fault lane).
+          persist-credentials: false
+
+      - name: Set up Node
+        if: steps.gate.outputs.run == 'true'
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "20"
+
+      - name: Set up Rust
+        if: steps.gate.outputs.run == 'true'
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04
+
+      - name: Cache cargo (conformance crate)
+        if: steps.gate.outputs.run == 'true'
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        with:
+          workspaces: conformance
+
+      - name: Build harness runner
+        if: steps.gate.outputs.run == 'true'
+        working-directory: harness
+        run: |
+          npm --prefix runner ci
+          npm --prefix runner run build
+
+      - name: Build conformance driver
+        if: steps.gate.outputs.run == 'true'
+        run: cargo build --manifest-path conformance/Cargo.toml
+
+      - name: Run conformance runner (prod lane)
+        id: runner
+        if: steps.gate.outputs.run == 'true'
+        continue-on-error: true
+        # Prod lane talks to the real Raindrop ingest + Query API (dedicated
+        # test org). No local server. The driver ingests to RAINDROP_SINK_URL
+        # with RAINDROP_WRITE_KEY; the runner polls RAINDROP_QUERY_URL with
+        # RAINDROP_QUERY_API_KEY. Endpoints + credentials are scoped to this
+        # step so no other step in the job can read them.
+        env:
+          RAINDROP_SINK_URL: https://api.raindrop.ai
+          RAINDROP_WRITE_KEY: ${{ secrets.RAINDROP_WRITE_KEY }}
+          RAINDROP_QUERY_URL: https://query.raindrop.ai
+          RAINDROP_QUERY_API_KEY: ${{ secrets.RAINDROP_QUERY_API_KEY }}
+        run: |
+          set +e
+          node harness/runner/dist/src/index.js \
+            --driver "$DRIVER_BIN" \
+            --failures conformance/failures.txt \
+            --lane prod \
+            --report "$RUNNER_TEMP/report.json" \
+            2>&1 | tee "$RUNNER_TEMP/runner-output.txt"
+          code=${PIPESTATUS[0]}
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+          exit "$code"
+
+      - name: Report result
+        if: always()
+        run: |
+          {
+            echo "## Conformance — prod lane"
+            echo
+            if [ "${{ steps.gate.outputs.run }}" != "true" ]; then
+              echo "- Result: **SKIPPED** — Raindrop credentials unavailable (e.g. a forked PR gets no secrets); prod lane cannot run (fork-safe, non-blocking)."
+              exit 0
+            fi
+            code="${{ steps.runner.outputs.exit_code }}"
+            echo "- Harness: \`${HARNESS_REPO}@${HARNESS_REF}\`"
+            echo "- Runner exit code: \`${code:-unknown}\`"
+            case "$code" in
+              0) echo "- Result: **PASS** (warnings allowed)" ;;
+              1) echo "- Result: **FAIL** — scenario/ratchet failures (non-blocking for now)" ;;
+              2) echo "- Result: **ERROR** — infra/config problem (non-blocking for now)" ;;
+              *) echo "- Result: **UNKNOWN** (runner did not report an exit code)" ;;
+            esac
+            echo
+            echo '```'
+            cat "$RUNNER_TEMP/runner-output.txt" 2>/dev/null || echo "(no runner output captured)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload report
+        if: always() && steps.gate.outputs.run == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: conformance-prod-report
+          path: |
+            ${{ runner.temp }}/report.json
+            ${{ runner.temp }}/runner-output.txt
+          if-no-files-found: warn
