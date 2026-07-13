@@ -218,7 +218,15 @@ impl Driver {
 
     fn step_init(&mut self) -> Result<(), Failure> {
         let sink_url = std::env::var("RAINDROP_SINK_URL").unwrap_or_default();
-        let sink_url = sink_url.trim_end_matches('/');
+        let sink_url = sink_url.trim_end_matches('/').to_string();
+        // A missing sink must never fall through to the SDK's production
+        // default: a conformance run pointed at prod would ship test traffic
+        // with a real-looking bearer key. Hard config error instead.
+        if sink_url.is_empty() {
+            return Err(Failure(
+                "RAINDROP_SINK_URL is required: refusing to run against the SDK's default production endpoint".to_string(),
+            ));
+        }
         let write_key = std::env::var("RAINDROP_WRITE_KEY").unwrap_or_default();
 
         let mut builder = Client::builder()
@@ -227,9 +235,7 @@ impl Driver {
             // mirror to a developer-machine Workshop daemon (env var or TCP
             // probe) during a conformance run.
             .disable_local_workshop();
-        if !sink_url.is_empty() {
-            builder = builder.endpoint(format!("{sink_url}/v1/"));
-        }
+        builder = builder.endpoint(format!("{sink_url}/v1/"));
         if let Ok(project_id) = std::env::var("RAINDROP_PROJECT_ID") {
             if !project_id.trim().is_empty() {
                 builder = builder.project_id(project_id);
