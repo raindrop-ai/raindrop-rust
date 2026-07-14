@@ -240,8 +240,10 @@ jobs:
   prod-lane:
     runs-on: ubuntu-latest
     # Prod scenarios are dominated by the ~30s duplicate-settle window (~40s
-    # each), so allow generous headroom over the fault lane.
-    timeout-minutes: 15
+    # each), so allow generous headroom over the fault lane. Sized to fit TWO
+    # prod attempts (the runner step retries once, per-attempt timeout_minutes
+    # below) plus checkout/build setup.
+    timeout-minutes: 25
     steps:
       - name: Gate (secrets + fork-safety)
         id: gate
@@ -318,22 +320,40 @@ jobs:
         # with RAINDROP_WRITE_KEY; the runner polls RAINDROP_QUERY_URL with
         # RAINDROP_QUERY_API_KEY. Endpoints + credentials are scoped to this
         # step so no other step in the job can read them.
+        #
+        # GHA-native retry (nick-fields/retry): the prod lane crosses the real
+        # network (ingest + Query API readback), so a transient blip can fail an
+        # otherwise-conformant run. Retry the prod lane ONCE — max 2 attempts,
+        # green on a single pass — while the fault lane (a separate job) is never
+        # retried. The runner's `exit_code`/`total_attempts` outputs drive the
+        # summary + the flake annotation below; a retried pass is never silent.
+        uses: nick-fields/retry@ce71cc2ab81d554ebbe88c79ab5975992d79ba08 # v3.0.2
         env:
           RAINDROP_SINK_URL: https://api.raindrop.ai
           RAINDROP_WRITE_KEY: ${{ secrets.RAINDROP_WRITE_KEY }}
           RAINDROP_QUERY_URL: https://query.raindrop.ai
           RAINDROP_QUERY_API_KEY: ${{ secrets.RAINDROP_QUERY_API_KEY }}
-        run: |
-          set +e
-          node harness/runner/dist/src/index.js \
-            --driver "$DRIVER_BIN" \
-            --failures conformance/failures.txt \
-            --lane prod \
-            --report "$RUNNER_TEMP/report.json" \
-            2>&1 | tee "$RUNNER_TEMP/runner-output.txt"
-          code=${PIPESTATUS[0]}
-          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
-          exit "$code"
+        with:
+          max_attempts: 2
+          # Per-attempt cap; the job timeout-minutes above is sized for 2 of them.
+          timeout_minutes: 10
+          retry_wait_seconds: 15
+          shell: bash
+          command: |
+            set +e
+            node harness/runner/dist/src/index.js \
+              --driver "$DRIVER_BIN" \
+              --failures conformance/failures.txt \
+              --lane prod \
+              --report "$RUNNER_TEMP/report.json" \
+              2>&1 | tee "$RUNNER_TEMP/runner-output.txt"
+            exit "${PIPESTATUS[0]}"
+
+      - name: Flag prod-lane flake (passed on retry)
+        # A prod pass that needed attempt 2 is a flake — surface it loudly so a
+        # retried green is visible in the run summary, never silent.
+        if: steps.gate.outputs.run == 'true' && steps.runner.outputs.total_attempts == '2' && steps.runner.outputs.exit_code == '0'
+        run: echo "::warning::raindrop-rust prod lane passed on retry (flake)"
 
       - name: Report result
         if: always()
