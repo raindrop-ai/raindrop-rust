@@ -29,7 +29,7 @@ use time::OffsetDateTime;
 
 use raindrop::{
     AiEvent, Attachment, BeginOptions, Client, Event, FinishOptions, Interaction, PatchOptions,
-    User,
+    Signal, User,
 };
 
 const DRIVER_VERSION: &str = "1.0.0";
@@ -44,13 +44,10 @@ const SDK_NAME: &str = "raindrop-rust";
 /// * `events.track_partial` — `Client::begin` / `Interaction::patch` /
 ///                            `Interaction::finish`.
 /// * `identify`             — `Client::identify`.
-///
-/// Omitted deliberately:
-///
-/// * `signal` — the `signal` step is out of scope for this driver (DEV-1145),
-///   so it is reported unsupported (exit 3) rather than implemented. An
-///   omitted key is neither supported nor structurally not-applicable, so the
-///   runner skips scenarios that require it.
+/// * `signal`               — `Client::track_signal` (DEV-1201): the step's
+///                            event_id/name land on signals/track as
+///                            event_id/signal_name with signal_type defaulting
+///                            to "default".
 const CAPABILITIES: &[&str] = &[
     "events.track",
     "events.track_ai",
@@ -60,6 +57,7 @@ const CAPABILITIES: &[&str] = &[
     "events.track_ai_partial",
     "events.track_partial",
     "identify",
+    "signal",
 ];
 const NOT_APPLICABLE: &[&str] = &["wrapper.capture"];
 // A not_applicable claim must argue "not fixable" (README policy).
@@ -222,10 +220,10 @@ impl Driver {
             "patch" => self.step_patch(&args).await.map_err(StepError::from),
             "finish" => self.step_finish(&args).await.map_err(StepError::from),
             "identify" => self.step_identify(&args).await.map_err(StepError::from),
+            "signal" => self.step_signal(&args).await.map_err(StepError::from),
             "flush" => self.step_flush().await.map_err(StepError::from),
             "close" => self.step_close().await.map_err(StepError::from),
-            // `signal` (capability deliberately not advertised) and anything
-            // unknown take the exit-3 unsupported path.
+            // Anything unknown takes the exit-3 unsupported path.
             other => Err(Unsupported(other.to_string()).into()),
         }
     }
@@ -332,6 +330,24 @@ impl Driver {
             .identify(user)
             .await
             .map_err(|e| Failure(format!("identify: {e}")))
+    }
+
+    async fn step_signal(&self, args: &Map<String, Value>) -> Result<(), Failure> {
+        let signal = Signal {
+            event_id: required_str(args, "event_id", "signal")?,
+            name: required_str(args, "name", "signal")?,
+            kind: optional_str(args, "signal_type"),
+            sentiment: optional_str(args, "sentiment"),
+            timestamp: timestamp(args, "signal")?,
+            properties: properties(args, "properties"),
+            attachment_id: optional_str(args, "attachment_id"),
+            comment: optional_str(args, "comment"),
+            after: optional_str(args, "after"),
+        };
+        self.client()?
+            .track_signal(signal)
+            .await
+            .map_err(|e| Failure(format!("signal: {e}")))
     }
 
     // -- partial (begin/patch/finish) lifecycle ---------------------------- //
