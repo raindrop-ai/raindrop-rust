@@ -241,9 +241,9 @@ jobs:
     runs-on: ubuntu-latest
     # Prod scenarios are dominated by the ~30s duplicate-settle window (~40s
     # each), so allow generous headroom over the fault lane. Sized to fit TWO
-    # prod attempts (the runner step retries once, per-attempt timeout_minutes
-    # below) plus checkout/build setup.
-    timeout-minutes: 25
+    # full 20-min prod attempts (the runner step retries once, per-attempt
+    # timeout_minutes below) plus the retry wait and checkout/build setup.
+    timeout-minutes: 45
     steps:
       - name: Gate (secrets + fork-safety)
         id: gate
@@ -335,8 +335,9 @@ jobs:
           RAINDROP_QUERY_API_KEY: ${{ secrets.RAINDROP_QUERY_API_KEY }}
         with:
           max_attempts: 2
-          # Per-attempt cap; the job timeout-minutes above is sized for 2 of them.
-          timeout_minutes: 10
+          # Per-attempt cap sized above the measured prod runtime (~8.4 min) with
+          # headroom for scenario growth; the job timeout-minutes above fits 2.
+          timeout_minutes: 20
           retry_wait_seconds: 15
           shell: bash
           command: |
