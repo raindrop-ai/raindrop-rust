@@ -241,8 +241,8 @@ jobs:
     runs-on: ubuntu-latest
     # Prod scenarios are dominated by the ~30s duplicate-settle window (~40s
     # each), so allow generous headroom over the fault lane. Sized to fit TWO
-    # full 20-min prod attempts (the runner step retries once, per-attempt
-    # timeout_minutes below) plus the retry wait and checkout/build setup.
+    # full 20-min prod attempts (the runner step's inline retry loop caps each
+    # attempt at `timeout 1200`) plus the retry wait and checkout/build setup.
     timeout-minutes: 50
     steps:
       - name: Gate (secrets + fork-safety)
@@ -321,34 +321,40 @@ jobs:
         # RAINDROP_QUERY_API_KEY. Endpoints + credentials are scoped to this
         # step so no other step in the job can read them.
         #
-        # GHA-native retry (nick-fields/retry): the prod lane crosses the real
-        # network (ingest + Query API readback), so a transient blip can fail an
-        # otherwise-conformant run. Retry the prod lane ONCE — max 2 attempts,
-        # green on a single pass — while the fault lane (a separate job) is never
-        # retried. The runner's `exit_code`/`total_attempts` outputs drive the
-        # summary + the flake annotation below; a retried pass is never silent.
-        uses: nick-fields/retry@ce71cc2ab81d554ebbe88c79ab5975992d79ba08 # v3.0.2
+        # Inline retry loop (repo-controlled shell, no third-party action): the
+        # prod lane crosses the real network (ingest + Query API readback), so a
+        # transient blip can fail an otherwise-conformant run. Run the prod lane
+        # up to twice — green on a single pass — while the fault lane (a separate
+        # job) is never retried; each attempt is capped at 20 min by
+        # `timeout 1200`. We write `exit_code`/`total_attempts` ourselves so the
+        # summary + the flake annotation below are unchanged; a retried pass is
+        # never silent.
+        shell: bash
         env:
           RAINDROP_SINK_URL: https://api.raindrop.ai
           RAINDROP_WRITE_KEY: ${{ secrets.RAINDROP_WRITE_KEY }}
           RAINDROP_QUERY_URL: https://query.raindrop.ai
           RAINDROP_QUERY_API_KEY: ${{ secrets.RAINDROP_QUERY_API_KEY }}
-        with:
-          max_attempts: 2
-          # Per-attempt cap sized above the measured prod runtime (~8.4 min) with
-          # headroom for scenario growth; the job timeout-minutes above fits 2.
-          timeout_minutes: 20
-          retry_wait_seconds: 15
-          shell: bash
-          command: |
+        run: |
+          attempts=0
+          code=1
+          for i in 1 2; do
+            attempts=$i
             set +e
-            node harness/runner/dist/src/index.js \
+            timeout 1200 node harness/runner/dist/src/index.js \
               --driver "$DRIVER_BIN" \
               --failures conformance/failures.txt \
               --lane prod \
               --report "$RUNNER_TEMP/report.json" \
               2>&1 | tee "$RUNNER_TEMP/runner-output.txt"
-            exit "${PIPESTATUS[0]}"
+            code=${PIPESTATUS[0]}
+            set -e
+            [ "$code" -eq 0 ] && break
+            [ "$i" -eq 1 ] && { echo "raindrop-rust prod lane attempt 1 exited $code; retrying in 15s"; sleep 15; }
+          done
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+          echo "total_attempts=$attempts" >> "$GITHUB_OUTPUT"
+          exit "$code"
 
       - name: Flag prod-lane flake (passed on retry)
         # A prod pass that needed attempt 2 is a flake — surface it loudly so a
