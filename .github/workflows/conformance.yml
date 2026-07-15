@@ -379,6 +379,7 @@ jobs:
               0) echo "- Result: **PASS** (warnings allowed)" ;;
               1) echo "- Result: **FAIL** — scenario/ratchet failures (non-blocking for now)" ;;
               2) echo "- Result: **ERROR** — infra/config problem (non-blocking for now)" ;;
+              124) echo "- Result: **TIMEOUT** — an attempt exceeded the 20-min \`timeout 1200\` cap and was killed (recorded as a failure)" ;;
               *) echo "- Result: **UNKNOWN** (runner did not report an exit code)" ;;
             esac
             echo
