@@ -192,6 +192,152 @@ async fn track_ai_attachments_serialize_with_type_role_and_optional_fields() {
     );
 }
 
+// ────────────────────────────────────────────────────────────────────────────────────
+// feature_flags wire shape (DEV-1214)
+//
+// `feature_flags` is a first-class ingest field: dawn's `TrackEventSchema` declares
+// `feature_flags: z.record(z.string()).optional()` as a top-level sibling of `ai_data` /
+// `properties`, and the JS SDK's event-shipper ships exactly that key as a
+// `Record<string,string>`. These tests pin that wire shape and the additive-only
+// guarantee: a caller that passes no flags produces a byte-identical request to before.
+// ────────────────────────────────────────────────────────────────────────────────────
+
+/// `feature_flags` serialize on the wire as a top-level string→string object, verbatim
+/// (UTF-8 multibyte values round-trip unmangled), NOT nested under `ai_data` or
+/// `properties`.
+#[tokio::test]
+async fn feature_flags_serialize_as_top_level_string_map() {
+    let server = MockServer::start().await;
+    let recorder = mount_path(&server, "POST", "/events/track_partial").await;
+    let client = fast_client_builder(&server).build().expect("build");
+
+    client
+        .track_ai(AiEvent {
+            user_id: "flags-u1".into(),
+            event: "chat".into(),
+            input: "How do I enable reasoning?".into(),
+            output: "Toggle it in Settings.".into(),
+            model: "mock-gpt".into(),
+            feature_flags: BTreeMap::from([
+                ("prompt-version".to_string(), "v2".to_string()),
+                ("locale-label".to_string(), "café-日本語".to_string()),
+            ]),
+            ..Default::default()
+        })
+        .await
+        .expect("track_ai");
+    client.close().await.expect("close");
+
+    let payload = recorder.requests()[0].json();
+
+    // Top-level `feature_flags` (snake_case), sibling to ai_data / properties.
+    let flags = &payload["feature_flags"];
+    assert!(
+        flags.is_object(),
+        "feature_flags must be a top-level object"
+    );
+    assert_eq!(flags["prompt-version"], "v2");
+    assert_eq!(
+        flags["locale-label"], "café-日本語",
+        "UTF-8 verbatim round-trip"
+    );
+    assert_eq!(
+        payload.get("featureFlags"),
+        None,
+        "MUST NOT use camelCase featureFlags"
+    );
+
+    // Flags must NOT leak into ai_data or properties.
+    assert_eq!(payload["ai_data"].get("feature_flags"), None);
+    assert_eq!(payload["properties"].get("feature_flags"), None);
+}
+
+/// Omitting `feature_flags` leaves the wire body byte-identical to the pre-feature
+/// request: the key is entirely absent (additive-only, no behavior change for existing
+/// callers).
+#[tokio::test]
+async fn omitted_feature_flags_leave_body_unchanged() {
+    let server = MockServer::start().await;
+    let recorder = mount_path(&server, "POST", "/events/track_partial").await;
+    let client = fast_client_builder(&server).build().expect("build");
+
+    let event = AiEvent {
+        event_id: "evt-no-flags".into(),
+        user_id: "flags-u1".into(),
+        event: "chat".into(),
+        input: "hello".into(),
+        output: "hi".into(),
+        model: "mock-gpt".into(),
+        // feature_flags left at its Default (empty map).
+        ..Default::default()
+    };
+    // The event must not carry any flags — this is the "existing caller" path.
+    assert!(event.feature_flags.is_empty());
+
+    client.track_ai(event).await.expect("track_ai");
+    client.close().await.expect("close");
+
+    let payload = recorder.requests()[0].json();
+    assert_eq!(
+        payload.get("feature_flags"),
+        None,
+        "omitted feature_flags must be absent from the wire body, not an empty object"
+    );
+    // Byte-level guarantee: the serialized bytes contain no `feature_flags` token at all.
+    let raw = String::from_utf8(recorder.requests()[0].body.clone()).expect("utf8 body");
+    assert!(
+        !raw.contains("feature_flags"),
+        "serialized body must not mention feature_flags when omitted"
+    );
+}
+
+/// Feature flags supplied across the begin → patch → finish lifecycle merge (last write
+/// wins per key) and ship as the top-level object on the final payload — proving the
+/// partial/patch surface carries flags too.
+#[tokio::test]
+async fn feature_flags_merge_across_partial_lifecycle() {
+    let server = MockServer::start().await;
+    let recorder = mount_path(&server, "POST", "/events/track_partial").await;
+    let client = fast_client_builder(&server).build().expect("build");
+
+    let interaction = client
+        .begin(BeginOptions {
+            event_id: "evt-flags-lifecycle".into(),
+            user_id: "flags-u1".into(),
+            event: "agent_run".into(),
+            input: "start".into(),
+            feature_flags: BTreeMap::from([
+                ("prompt-version".to_string(), "v1".to_string()),
+                ("cohort".to_string(), "beta".to_string()),
+            ]),
+            ..Default::default()
+        })
+        .await;
+
+    // A patch overrides one key and adds another.
+    interaction
+        .set_feature_flag("prompt-version", "v2")
+        .await
+        .expect("set_feature_flag");
+
+    interaction
+        .finish(FinishOptions {
+            output: "done".into(),
+            feature_flags: BTreeMap::from([("locale".to_string(), "en".to_string())]),
+            ..Default::default()
+        })
+        .await
+        .expect("finish");
+    client.close().await.expect("close");
+
+    let requests = recorder.requests();
+    let final_payload = requests.last().expect("at least one request").json();
+    let flags = &final_payload["feature_flags"];
+    assert_eq!(flags["prompt-version"], "v2", "last write wins per key");
+    assert_eq!(flags["cohort"], "beta");
+    assert_eq!(flags["locale"], "en");
+}
+
 /// The full begin → patch → finish lifecycle merges patches such that the final shipped
 /// payload contains the SUM of all sticky data: input from begin, properties from patches,
 /// and output from finish.

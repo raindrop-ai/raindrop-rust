@@ -4,6 +4,24 @@ All notable changes to this crate are documented here. Format follows [Keep a Ch
 
 ## [Unreleased]
 
+## [0.0.9] - 2026-07-16
+
+### Added
+
+- **Public `feature_flags` surface on events.** `AiEvent`, `Event`,
+  `BeginOptions`, `PatchOptions`, and `FinishOptions` gain an optional
+  `feature_flags: BTreeMap<String, String>` field, plus
+  `Interaction::set_feature_flags` / `set_feature_flag` convenience methods.
+  Flags serialize verbatim as a top-level `feature_flags` string→string object
+  on the wire — a sibling of `ai_data` / `properties`, matching the JS SDK's
+  event-shipper (dawn ingest `TrackEventSchema.feature_flags`). Flags supplied
+  across a `begin`→`patch`→`finish` lifecycle merge like `properties` (last
+  write wins per key). This is **additive-only**: callers that pass no flags
+  omit the key entirely, so their request bodies are byte-identical to before
+  (covered by `omitted_feature_flags_leave_body_unchanged`). The conformance
+  driver declares the `events.feature_flags` capability and maps the harness
+  `feature_flags` step arg through to the public API. (DEV-1214)
+
 ## [0.0.8] - 2026-06-26
 
 ### Added
