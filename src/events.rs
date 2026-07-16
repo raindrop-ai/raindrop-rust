@@ -60,6 +60,10 @@ pub struct Event {
     pub properties: BTreeMap<String, Value>,
     /// Attachments to ship with the event.
     pub attachments: Vec<Attachment>,
+    /// Feature flags active for this event (flag name → value). Serialized
+    /// verbatim as the top-level `feature_flags` string→string object on the
+    /// wire (matching the JS SDK's event-shipper). Empty → key omitted.
+    pub feature_flags: BTreeMap<String, String>,
 }
 
 /// An AI event (model invocation).
@@ -85,6 +89,10 @@ pub struct AiEvent {
     pub properties: BTreeMap<String, Value>,
     /// Attachments.
     pub attachments: Vec<Attachment>,
+    /// Feature flags active for this event (flag name → value). Serialized
+    /// verbatim as the top-level `feature_flags` string→string object on the
+    /// wire (matching the JS SDK's event-shipper). Empty → key omitted.
+    pub feature_flags: BTreeMap<String, String>,
 }
 
 /// Options for [`Client::begin`].
@@ -108,6 +116,10 @@ pub struct BeginOptions {
     pub properties: BTreeMap<String, Value>,
     /// Initial attachments.
     pub attachments: Vec<Attachment>,
+    /// Feature flags active for this interaction (flag name → value). Serialized
+    /// verbatim as the top-level `feature_flags` string→string object on the
+    /// wire (matching the JS SDK's event-shipper). Empty → key omitted.
+    pub feature_flags: BTreeMap<String, String>,
 }
 
 /// Options for [`Interaction::patch`] / [`Client::patch`].
@@ -131,6 +143,11 @@ pub struct PatchOptions {
     pub properties: BTreeMap<String, Value>,
     /// Attachments to append.
     pub attachments: Vec<Attachment>,
+    /// Feature flags to merge into the patch (flag name → value). Merged like
+    /// [`properties`](Self::properties) — last write wins per key. Serialized
+    /// verbatim as the top-level `feature_flags` string→string object on the
+    /// wire (matching the JS SDK's event-shipper). Empty → no change.
+    pub feature_flags: BTreeMap<String, String>,
     /// Override the `is_pending` flag.
     pub is_pending: Option<bool>,
 }
@@ -148,6 +165,12 @@ pub struct FinishOptions {
     pub properties: BTreeMap<String, Value>,
     /// Final attachments to append.
     pub attachments: Vec<Attachment>,
+    /// Feature flags to merge into the final patch (flag name → value). Merged
+    /// like [`properties`](Self::properties) — last write wins per key.
+    /// Serialized verbatim as the top-level `feature_flags` string→string
+    /// object on the wire (matching the JS SDK's event-shipper). Empty → no
+    /// change.
+    pub feature_flags: BTreeMap<String, String>,
 }
 
 /// In-progress interaction returned by [`Client::begin`]. Holds an `event_id` and forwards
@@ -258,6 +281,33 @@ impl Interaction {
             ..Default::default()
         })
         .await
+    }
+
+    /// Merge feature flags (flag name → value) into the interaction. They ride
+    /// along on the next flushed patch as the top-level `feature_flags`
+    /// string→string object on the wire (matching the JS SDK's event-shipper).
+    /// An empty map is a no-op.
+    pub async fn set_feature_flags(&self, feature_flags: BTreeMap<String, String>) -> Result<()> {
+        self.patch(PatchOptions {
+            feature_flags,
+            ..Default::default()
+        })
+        .await
+    }
+
+    /// Set a single feature flag (flag name → value). An empty key is a no-op.
+    pub async fn set_feature_flag(
+        &self,
+        key: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Result<()> {
+        let key = key.into();
+        if key.is_empty() {
+            return Ok(());
+        }
+        let mut flags = BTreeMap::new();
+        flags.insert(key, value.into());
+        self.set_feature_flags(flags).await
     }
 
     /// Update the input.

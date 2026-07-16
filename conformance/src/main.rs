@@ -56,6 +56,14 @@ const CAPABILITIES: &[&str] = &[
     // scenarios against the route this SDK actually uses.
     "events.track_ai_partial",
     "events.track_partial",
+    // events.feature_flags (DEV-1214): the public event surfaces accept an
+    // optional feature_flags map (string→string) that ships verbatim as the
+    // top-level `feature_flags` wire key. NOTE: this SDK ships track_ai via
+    // events/track_partial (not events/track), so the request-shape scenario —
+    // which asserts the events/track route — is a route gap (DEV-1149),
+    // ratcheted like every other events/track scenario; the wire shape itself
+    // is proven by the SDK's unit tests.
+    "events.feature_flags",
     "identify",
     "signal",
 ];
@@ -147,6 +155,20 @@ fn optional_str(args: &Map<String, Value>, key: &str) -> String {
 fn properties(args: &Map<String, Value>, key: &str) -> BTreeMap<String, Value> {
     match args.get(key).and_then(Value::as_object) {
         Some(map) => map.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+        None => BTreeMap::new(),
+    }
+}
+
+/// Map the language-neutral `feature_flags` step arg onto the SDK's public
+/// feature-flag surface (a string→string map). Non-string values are dropped:
+/// the wire contract is `Record<string,string>`, so a driver must never
+/// forward a non-string flag value.
+fn feature_flags(args: &Map<String, Value>) -> BTreeMap<String, String> {
+    match args.get("feature_flags").and_then(Value::as_object) {
+        Some(map) => map
+            .iter()
+            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+            .collect(),
         None => BTreeMap::new(),
     }
 }
@@ -295,6 +317,7 @@ impl Driver {
             timestamp: timestamp(args, "track")?,
             properties: properties(args, "properties"),
             attachments: attachments(args, "track")?,
+            feature_flags: feature_flags(args),
         };
         self.client()?
             .track_event(event)
@@ -314,6 +337,7 @@ impl Driver {
             convo_id: optional_str(args, "convo_id"),
             properties: properties(args, "properties"),
             attachments: attachments(args, "track_ai")?,
+            feature_flags: feature_flags(args),
         };
         self.client()?
             .track_ai(event)
@@ -368,6 +392,7 @@ impl Driver {
             convo_id: optional_str(args, "convo_id"),
             properties: properties(args, "properties"),
             attachments: attachments(args, "begin")?,
+            feature_flags: feature_flags(args),
         };
         let interaction = self.client()?.begin(opts).await;
         self.interaction = Some(interaction);
@@ -389,6 +414,7 @@ impl Driver {
             convo_id: optional_str(args, "convo_id"),
             properties: properties(args, "properties"),
             attachments: attachments(args, "patch")?,
+            feature_flags: feature_flags(args),
             is_pending: None,
         };
         interaction
@@ -408,6 +434,7 @@ impl Driver {
             model: optional_str(args, "model"),
             properties: properties(args, "properties"),
             attachments: attachments(args, "finish")?,
+            feature_flags: feature_flags(args),
         };
         interaction
             .finish(opts)
@@ -431,19 +458,17 @@ async fn run_steps(raw: &str) -> ExitCode {
 
     let mut driver = Driver::default();
     for (index, step) in steps.iter().enumerate() {
-        let (name, args) = match step.as_object().and_then(|m| {
-            if m.len() == 1 {
-                m.iter().next()
-            } else {
-                None
-            }
-        }) {
-            Some((name, args)) => (name.clone(), args.clone()),
-            None => {
-                eprintln!("driver: step {index} is not a single-key object");
-                return ExitCode::from(1);
-            }
-        };
+        let (name, args) =
+            match step
+                .as_object()
+                .and_then(|m| if m.len() == 1 { m.iter().next() } else { None })
+            {
+                Some((name, args)) => (name.clone(), args.clone()),
+                None => {
+                    eprintln!("driver: step {index} is not a single-key object");
+                    return ExitCode::from(1);
+                }
+            };
         let start = Instant::now();
         match driver.execute(&name, &args).await {
             Ok(()) => {}

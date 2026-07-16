@@ -426,6 +426,7 @@ impl Client {
             model: String::new(),
             properties: event.properties,
             attachments: event.attachments,
+            feature_flags: event.feature_flags,
             is_pending: Some(false),
             timestamp: event.timestamp,
         };
@@ -455,6 +456,7 @@ impl Client {
             model: event.model,
             properties: event.properties,
             attachments: event.attachments,
+            feature_flags: event.feature_flags,
             is_pending: Some(false),
             timestamp: event.timestamp,
         };
@@ -487,6 +489,7 @@ impl Client {
             model: opts.model,
             properties: opts.properties,
             attachments: opts.attachments,
+            feature_flags: opts.feature_flags,
             is_pending: Some(true),
             timestamp: opts.timestamp,
         };
@@ -528,6 +531,7 @@ impl Client {
             model: opts.model,
             properties: opts.properties,
             attachments: opts.attachments,
+            feature_flags: opts.feature_flags,
             is_pending: opts.is_pending,
             timestamp: opts.timestamp,
         };
@@ -567,6 +571,7 @@ impl Client {
             model: opts.model,
             properties: opts.properties,
             attachments: opts.attachments,
+            feature_flags: opts.feature_flags,
             is_pending: Some(false),
             timestamp: opts.timestamp,
             ..Default::default()

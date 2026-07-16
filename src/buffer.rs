@@ -23,6 +23,7 @@ pub(crate) struct EventPatch {
     pub model: String,
     pub properties: BTreeMap<String, Value>,
     pub attachments: Vec<Attachment>,
+    pub feature_flags: BTreeMap<String, String>,
     pub is_pending: Option<bool>,
     pub timestamp: Option<OffsetDateTime>,
 }
@@ -47,6 +48,13 @@ pub(crate) struct TrackPartialPayload {
     pub ai_data: Option<AiDataPayload>,
     pub properties: BTreeMap<String, Value>,
     pub attachments: Vec<Attachment>,
+    /// Feature flags carried verbatim as a top-level string→string object,
+    /// sibling to `ai_data` / `properties` — the ratified wire shape
+    /// (dawn ingest `TrackEventSchema.feature_flags: z.record(z.string())`,
+    /// matching the JS event-shipper). Omitted entirely when empty so requests
+    /// for callers that pass no flags are byte-identical to before.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub feature_flags: BTreeMap<String, String>,
     pub is_pending: bool,
 }
 
@@ -315,6 +323,11 @@ pub(crate) fn merge_event_patches(target: EventPatch, source: EventPatch) -> Eve
     if !source.attachments.is_empty() {
         out.attachments = merge_attachments(&out.attachments, &source.attachments);
     }
+    if !source.feature_flags.is_empty() {
+        for (k, v) in source.feature_flags {
+            out.feature_flags.insert(k, v);
+        }
+    }
     out
 }
 
@@ -382,6 +395,7 @@ fn build_track_partial_payload(
         ai_data: None,
         properties,
         attachments,
+        feature_flags: patch.feature_flags.clone(),
         is_pending,
     };
 
