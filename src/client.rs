@@ -9,8 +9,8 @@ use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
 use crate::app_git::{
-    canonical_properties, is_canonical_property, AppGitConfig, AppGitOperationRegistry,
-    AppGitProvider, AppGitSnapshot,
+    canonical_properties, is_canonical_property, AppGitConfig, AppGitOperationContext,
+    AppGitOperationRegistry, AppGitProvider, AppGitSnapshot,
 };
 use crate::buffer::{EventBuffer, EventPatch};
 use crate::error::{Error, Result};
@@ -517,11 +517,12 @@ impl Client {
             opts.event_id
         };
 
-        let app_git_snapshot = self.inner.app_git_operations.begin(
+        let app_git_context = self.inner.app_git_operations.begin_context(
             &event_id,
             self.inner.app_git.snapshot(),
             &opts.properties,
         );
+        let app_git_snapshot = app_git_context.snapshot();
         let patch = EventPatch {
             event_name: opts.event.clone(),
             user_id: opts.user_id.clone(),
@@ -547,6 +548,7 @@ impl Client {
             opts.user_id,
             opts.convo_id,
             opts.event,
+            app_git_context,
         )
     }
 
@@ -557,7 +559,8 @@ impl Client {
             return Interaction::noop();
         }
         let event_id = event_id.into();
-        Interaction::new(self.clone(), event_id)
+        let app_git_context = self.app_git_context_handle_for_event(&event_id);
+        Interaction::new(self.clone(), event_id, app_git_context)
     }
 
     /// Apply a patch directly to a buffered interaction by id.
@@ -565,7 +568,22 @@ impl Client {
         if !self.inner.enabled {
             return Ok(());
         }
-        let app_git_snapshot = self.app_git_context_for_patch(event_id, &opts.properties);
+        self.patch_with_app_git_context(event_id, opts, None).await
+    }
+
+    pub(crate) async fn patch_with_app_git_context(
+        &self,
+        event_id: &str,
+        opts: PatchOptions,
+        app_git_context: Option<AppGitOperationContext>,
+    ) -> Result<()> {
+        if !self.inner.enabled {
+            return Ok(());
+        }
+        let app_git_snapshot = match app_git_context {
+            Some(context) => context.update(&opts.properties),
+            None => self.app_git_context_for_patch(event_id, &opts.properties),
+        };
         let patch = EventPatch {
             event_name: opts.event,
             user_id: opts.user_id,
@@ -588,7 +606,8 @@ impl Client {
 
     /// Finalize an interaction directly (rarely used; prefer [`Interaction::finish`]).
     pub async fn finish(&self, event_id: &str, opts: FinishOptions) -> Result<()> {
-        self.finish_with_context(event_id, opts, "", "", "").await
+        self.finish_with_context(event_id, opts, "", "", "", None)
+            .await
     }
 
     /// Finalize with the interaction's captured association context. Carrying
@@ -603,11 +622,15 @@ impl Client {
         user_id: &str,
         convo_id: &str,
         event_name: &str,
+        app_git_context: Option<AppGitOperationContext>,
     ) -> Result<()> {
         if !self.inner.enabled {
             return Ok(());
         }
-        let app_git_snapshot = self.app_git_context_for_patch(event_id, &opts.properties);
+        let app_git_snapshot = match app_git_context {
+            Some(context) => context.update(&opts.properties),
+            None => self.app_git_context_for_patch(event_id, &opts.properties),
+        };
         let patch = EventPatch {
             event_name: event_name.to_string(),
             user_id: user_id.to_string(),
@@ -628,10 +651,14 @@ impl Client {
             .await
     }
 
-    fn app_git_context_for_event(&self, event_id: &str) -> AppGitSnapshot {
+    fn app_git_context_handle_for_event(&self, event_id: &str) -> AppGitOperationContext {
         self.inner
             .app_git_operations
-            .context_for_event(event_id, self.inner.app_git.snapshot())
+            .context_handle_for_event(event_id, self.inner.app_git.snapshot())
+    }
+
+    fn app_git_context_for_event(&self, event_id: &str) -> AppGitSnapshot {
+        self.app_git_context_handle_for_event(event_id).snapshot()
     }
 
     fn app_git_context_for_patch(
@@ -660,10 +687,6 @@ impl Client {
         if !self.inner.enabled {
             return Span::noop();
         }
-        let app_git_snapshot = self
-            .inner
-            .app_git_operations
-            .context_for_event(&opts.event_id, app_git_snapshot);
         let parent_ids = opts.parent.as_ref().and_then(|p| p.ids());
         let ids = create_span_ids(parent_ids.as_ref());
         let mut attrs = opts.attributes;
@@ -700,7 +723,7 @@ impl Client {
         opts: LlmOptions,
         event_id: &str,
     ) -> LlmSpan {
-        let snapshot = self.inner.app_git.snapshot();
+        let snapshot = self.app_git_context_for_event(event_id);
         self.start_llm_span_with_app_git(name, opts, event_id, snapshot)
     }
 
@@ -748,7 +771,7 @@ impl Client {
         opts: ToolOptions,
         event_id: &str,
     ) -> ToolSpan {
-        let snapshot = self.inner.app_git.snapshot();
+        let snapshot = self.app_git_context_for_event(event_id);
         self.start_tool_span_with_app_git(name, opts, event_id, snapshot)
     }
 
@@ -821,10 +844,6 @@ impl Client {
             &opts.properties,
             self.inner.max_text_field_chars,
         );
-        let app_git_snapshot = self
-            .inner
-            .app_git_operations
-            .context_for_event(event_id, app_git_snapshot);
         let _ = app_git_snapshot.enrich_attributes(&opts.properties, &mut attrs);
         let parent_ids = opts.parent.as_ref().and_then(|p| p.ids());
         let ids = create_span_ids(parent_ids.as_ref());

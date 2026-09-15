@@ -270,6 +270,35 @@ fn canonical_attribute(key: &str, value: &Value) -> Option<Attribute> {
 }
 
 #[derive(Debug, Clone)]
+pub(crate) struct AppGitOperationContext {
+    inner: Arc<Mutex<AppGitSnapshot>>,
+}
+
+impl AppGitOperationContext {
+    fn new(snapshot: AppGitSnapshot) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(snapshot)),
+        }
+    }
+
+    pub(crate) fn snapshot(&self) -> AppGitSnapshot {
+        self.inner
+            .lock()
+            .map(|snapshot| snapshot.clone())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn update(&self, properties: &BTreeMap<String, Value>) -> AppGitSnapshot {
+        let Ok(mut snapshot) = self.inner.lock() else {
+            return AppGitSnapshot::default().with_canonical_properties(properties);
+        };
+        let updated = snapshot.clone().with_canonical_properties(properties);
+        *snapshot = updated.clone();
+        updated
+    }
+}
+
+#[derive(Debug, Clone)]
 pub(crate) struct AppGitOperationRegistry {
     inner: Arc<Mutex<AppGitOperationRegistryState>>,
     max_entries: usize,
@@ -277,7 +306,7 @@ pub(crate) struct AppGitOperationRegistry {
 
 #[derive(Debug, Default)]
 struct AppGitOperationRegistryState {
-    contexts: BTreeMap<String, AppGitSnapshot>,
+    contexts: BTreeMap<String, AppGitOperationContext>,
     saturated: bool,
 }
 
@@ -289,13 +318,24 @@ impl AppGitOperationRegistry {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn begin(
         &self,
         event_id: &str,
         snapshot: AppGitSnapshot,
         properties: &BTreeMap<String, Value>,
     ) -> AppGitSnapshot {
-        self.update(event_id, snapshot, properties)
+        self.begin_context(event_id, snapshot, properties)
+            .snapshot()
+    }
+
+    pub(crate) fn begin_context(
+        &self,
+        event_id: &str,
+        snapshot: AppGitSnapshot,
+        properties: &BTreeMap<String, Value>,
+    ) -> AppGitOperationContext {
+        self.update_context(event_id, snapshot, properties)
     }
 
     pub(crate) fn update(
@@ -304,52 +344,73 @@ impl AppGitOperationRegistry {
         fallback: AppGitSnapshot,
         properties: &BTreeMap<String, Value>,
     ) -> AppGitSnapshot {
-        if event_id.is_empty() {
-            return fallback.with_canonical_properties(properties);
-        }
-        let Ok(mut state) = self.inner.lock() else {
-            return AppGitSnapshot::default().with_canonical_properties(properties);
-        };
-        if let Some(existing) = state.contexts.get(event_id) {
-            let snapshot = existing.clone().with_canonical_properties(properties);
-            state
-                .contexts
-                .insert(event_id.to_string(), snapshot.clone());
-            return snapshot;
-        }
-        if state.saturated || state.contexts.len() >= self.max_entries {
-            state.saturated = true;
-            return AppGitSnapshot::default().with_canonical_properties(properties);
-        }
-        let snapshot = fallback.with_canonical_properties(properties);
-        state
-            .contexts
-            .insert(event_id.to_string(), snapshot.clone());
-        snapshot
+        self.update_context(event_id, fallback, properties)
+            .snapshot()
     }
 
+    pub(crate) fn update_context(
+        &self,
+        event_id: &str,
+        fallback: AppGitSnapshot,
+        properties: &BTreeMap<String, Value>,
+    ) -> AppGitOperationContext {
+        if event_id.is_empty() {
+            return AppGitOperationContext::new(fallback.with_canonical_properties(properties));
+        }
+        let context = {
+            let Ok(mut state) = self.inner.lock() else {
+                return AppGitOperationContext::new(
+                    AppGitSnapshot::default().with_canonical_properties(properties),
+                );
+            };
+            if let Some(existing) = state.contexts.get(event_id) {
+                existing.clone()
+            } else {
+                if state.saturated || state.contexts.len() >= self.max_entries {
+                    state.saturated = true;
+                    return AppGitOperationContext::new(
+                        AppGitSnapshot::default().with_canonical_properties(properties),
+                    );
+                }
+                let context = AppGitOperationContext::new(fallback);
+                state.contexts.insert(event_id.to_string(), context.clone());
+                context
+            }
+        };
+        context.update(properties);
+        context
+    }
+
+    #[cfg(test)]
     pub(crate) fn context_for_event(
         &self,
         event_id: &str,
         fallback: AppGitSnapshot,
     ) -> AppGitSnapshot {
+        self.context_handle_for_event(event_id, fallback).snapshot()
+    }
+
+    pub(crate) fn context_handle_for_event(
+        &self,
+        event_id: &str,
+        fallback: AppGitSnapshot,
+    ) -> AppGitOperationContext {
         if event_id.is_empty() {
-            return fallback;
+            return AppGitOperationContext::new(fallback);
         }
         let Ok(mut state) = self.inner.lock() else {
-            return AppGitSnapshot::default();
+            return AppGitOperationContext::new(AppGitSnapshot::default());
         };
-        if let Some(snapshot) = state.contexts.get(event_id) {
-            return snapshot.clone();
+        if let Some(context) = state.contexts.get(event_id) {
+            return context.clone();
         }
         if state.saturated || state.contexts.len() >= self.max_entries {
             state.saturated = true;
-            return AppGitSnapshot::default();
+            return AppGitOperationContext::new(AppGitSnapshot::default());
         }
-        state
-            .contexts
-            .insert(event_id.to_string(), fallback.clone());
-        fallback
+        let context = AppGitOperationContext::new(fallback);
+        state.contexts.insert(event_id.to_string(), context.clone());
+        context
     }
 
     pub(crate) fn remove(&self, event_id: &str) {

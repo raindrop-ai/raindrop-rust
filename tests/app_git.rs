@@ -396,6 +396,172 @@ async fn terminal_flush_keeps_newer_same_id_app_git_context() {
 }
 
 #[tokio::test]
+async fn repeated_finish_retains_live_handle_context_after_registry_reclaim() {
+    let server = MockServer::start().await;
+    let event_recorder = mount_path(&server, "POST", "/events/track_partial").await;
+    let trace_recorder = mount_path(&server, "POST", "/traces").await;
+    let client = fast_client_builder(&server)
+        .app_git(configured_git(SHA_A))
+        .build()
+        .expect("build");
+
+    let interaction = client
+        .begin(raindrop::BeginOptions {
+            event_id: "repeat-finish-shared".into(),
+            user_id: "user".into(),
+            input: "hello".into(),
+            ..Default::default()
+        })
+        .await;
+    client.flush().await.expect("flush initial A");
+    let resumed = client.resume_interaction("repeat-finish-shared");
+    client
+        .patch(
+            "repeat-finish-shared",
+            raindrop::PatchOptions {
+                properties: BTreeMap::from([("raindrop.app.commit_sha".into(), json!(SHA_B))]),
+                is_pending: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("client patch B");
+    client.flush().await.expect("flush B patch");
+
+    resumed
+        .finish(raindrop::FinishOptions {
+            output: "first terminal".into(),
+            ..Default::default()
+        })
+        .await
+        .expect("first finish");
+    interaction
+        .finish(raindrop::FinishOptions {
+            output: "second terminal".into(),
+            ..Default::default()
+        })
+        .await
+        .expect("repeat finish from original handle");
+    interaction.track_tool(TrackToolOptions {
+        name: "tool-after-repeat-finish".into(),
+        ..Default::default()
+    });
+    client.flush().await.expect("flush repeated lifecycle");
+
+    let payloads = event_payloads(&event_recorder, "repeat-finish-shared");
+    assert!(
+        payloads.len() >= 4,
+        "expected initial, B, and two terminal payloads"
+    );
+    assert_eq!(
+        payloads[0]["properties"]["raindrop.app.commit_sha"], SHA_A,
+        "first pending flush uses the initial client snapshot"
+    );
+    for payload in &payloads[1..] {
+        assert_eq!(
+            payload["properties"]["raindrop.app.commit_sha"], SHA_B,
+            "late explicit operation SHA survives registry reclamation and repeat finish"
+        );
+    }
+
+    let spans: Vec<Value> = trace_recorder
+        .requests()
+        .into_iter()
+        .flat_map(|request| spans_of(&request.json()))
+        .collect();
+    let span = spans
+        .iter()
+        .find(|span| span["name"] == "tool-after-repeat-finish")
+        .expect("tracked tool after repeat finish");
+    assert_eq!(span_sha(span), Some(SHA_B));
+    client.close().await.expect("close");
+}
+
+#[tokio::test]
+async fn unknown_resume_freezes_owning_client_snapshot_for_events_and_tools() {
+    let server = MockServer::start().await;
+    let event_recorder = mount_path(&server, "POST", "/events/track_partial").await;
+    let trace_recorder = mount_path(&server, "POST", "/traces").await;
+    let client_a = fast_client_builder(&server)
+        .app_git(configured_git(SHA_A))
+        .build()
+        .expect("build a");
+    let client_b = fast_client_builder(&server)
+        .app_git(configured_git(SHA_B))
+        .build()
+        .expect("build b");
+
+    let resumed_a = client_a.resume_interaction("unknown-resume");
+    resumed_a.track_tool(TrackToolOptions {
+        name: "unknown-a-first-tool".into(),
+        ..Default::default()
+    });
+    resumed_a
+        .patch(raindrop::PatchOptions {
+            user_id: "user".into(),
+            input: "hello".into(),
+            is_pending: Some(true),
+            ..Default::default()
+        })
+        .await
+        .expect("first partial");
+    let matching = client_a.start_span(SpanOptions {
+        name: "unknown-a-matching-span".into(),
+        event_id: "unknown-resume".into(),
+        operation_id: "ai.workflow".into(),
+        ..Default::default()
+    });
+    matching.end();
+    resumed_a
+        .finish(raindrop::FinishOptions {
+            output: "done".into(),
+            ..Default::default()
+        })
+        .await
+        .expect("finish unknown resume");
+    resumed_a.track_tool(TrackToolOptions {
+        name: "unknown-a-after-finish-tool".into(),
+        ..Default::default()
+    });
+
+    let resumed_b = client_b.resume_interaction("unknown-resume");
+    resumed_b.track_tool(TrackToolOptions {
+        name: "unknown-b-tool".into(),
+        ..Default::default()
+    });
+    client_a.flush().await.expect("flush a");
+    client_b.flush().await.expect("flush b");
+
+    for payload in event_payloads(&event_recorder, "unknown-resume") {
+        assert_eq!(payload["properties"]["raindrop.app.commit_sha"], SHA_A);
+    }
+
+    let spans: Vec<Value> = trace_recorder
+        .requests()
+        .into_iter()
+        .flat_map(|request| spans_of(&request.json()))
+        .collect();
+    for name in [
+        "unknown-a-first-tool",
+        "unknown-a-matching-span",
+        "unknown-a-after-finish-tool",
+    ] {
+        let span = spans
+            .iter()
+            .find(|span| span["name"] == name)
+            .unwrap_or_else(|| panic!("missing {name}"));
+        assert_eq!(span_sha(span), Some(SHA_A), "{name}");
+    }
+    let span = spans
+        .iter()
+        .find(|span| span["name"] == "unknown-b-tool")
+        .expect("client b tool");
+    assert_eq!(span_sha(span), Some(SHA_B));
+    client_a.close().await.expect("close a");
+    client_b.close().await.expect("close b");
+}
+
+#[tokio::test]
 async fn operation_raw_sha_override_persists_across_flush_resume_and_spans() {
     let server = MockServer::start().await;
     let event_recorder = mount_path(&server, "POST", "/events/track_partial").await;
