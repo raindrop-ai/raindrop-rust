@@ -6,6 +6,7 @@ use serde::Serialize;
 use serde_json::Value;
 use time::OffsetDateTime;
 
+use crate::app_git::{is_canonical_property, InferredAttributeFlags};
 use crate::client::Client;
 use crate::helpers::{
     capped_string, merge_maps, stringify_serialize_bounded, stringify_value_bounded,
@@ -146,6 +147,7 @@ struct SpanState {
     attrs: Vec<Attribute>,
     status: Option<OtlpStatus>,
     ended: bool,
+    inferred_app_git: InferredAttributeFlags,
 }
 
 impl Span {
@@ -161,6 +163,7 @@ impl Span {
         event_id: String,
         start: OffsetDateTime,
         attrs: Vec<Attribute>,
+        inferred_app_git: InferredAttributeFlags,
     ) -> Self {
         Self {
             inner: Some(Arc::new(SpanInner {
@@ -173,6 +176,7 @@ impl Span {
                     attrs,
                     status: None,
                     ended: false,
+                    inferred_app_git,
                 }),
             })),
         }
@@ -211,7 +215,37 @@ impl Span {
             if state.ended {
                 return;
             }
-            state.attrs.extend(attrs);
+            let attrs: Vec<Attribute> = attrs.into_iter().collect();
+            if attrs
+                .iter()
+                .any(|attr| attr.key == crate::app_git::COMMIT_SHA_PROPERTY)
+            {
+                // A new explicit SHA selects a different provenance source;
+                // discard automatic companions from the old source. Callers
+                // can provide matching dirty/branch values in this same call.
+                let inferred = state.inferred_app_git;
+                state.attrs.retain(|existing| {
+                    existing.key != crate::app_git::COMMIT_SHA_PROPERTY
+                        && !(inferred.commit_dirty
+                            && existing.key == crate::app_git::COMMIT_DIRTY_PROPERTY)
+                        && !(inferred.branch && existing.key == crate::app_git::BRANCH_PROPERTY)
+                });
+                state.inferred_app_git = InferredAttributeFlags::default();
+            }
+            for attr in attrs {
+                // An explicit canonical attribute added after span creation
+                // replaces automatic provenance instead of producing an
+                // invalid duplicate OTLP key.
+                if is_canonical_property(&attr.key) {
+                    state.attrs.retain(|existing| existing.key != attr.key);
+                    if attr.key == crate::app_git::COMMIT_DIRTY_PROPERTY {
+                        state.inferred_app_git.commit_dirty = false;
+                    } else if attr.key == crate::app_git::BRANCH_PROPERTY {
+                        state.inferred_app_git.branch = false;
+                    }
+                }
+                state.attrs.push(attr);
+            }
         }
     }
 
@@ -804,7 +838,11 @@ pub(crate) fn tool_property_attributes(
         if key.is_empty() || matches!(value, Value::Null) {
             continue;
         }
-        let attr_key = format!("traceloop.association.properties.{}", key);
+        let attr_key = if is_canonical_property(key) {
+            key.clone()
+        } else {
+            format!("traceloop.association.properties.{}", key)
+        };
         let attr = match value {
             Value::String(s) => Attribute::string(attr_key, capped_string(s, limit)),
             Value::Bool(b) => Attribute::bool(attr_key, *b),

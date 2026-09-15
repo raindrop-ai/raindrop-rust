@@ -12,11 +12,14 @@
 //! * An unsupported step prints `unsupported:<step>` as the last stdout line
 //!   and exits 3.
 //!
-//! Client configuration comes only from the environment:
+//! Transport configuration comes only from the environment:
 //!
 //! * `RAINDROP_SINK_URL`   — ingest base URL (the driver appends `/v1/`).
 //! * `RAINDROP_WRITE_KEY`  — bearer write key.
 //! * `RAINDROP_PROJECT_ID` — optional project slug.
+//!
+//! The `init.app_git` step argument is mapped through the public
+//! `ClientBuilder::app_git` / `disable_app_git` API.
 
 use std::collections::BTreeMap;
 use std::io::Read;
@@ -28,8 +31,8 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
 use raindrop::{
-    AiEvent, Attachment, BeginOptions, Client, Event, FinishOptions, Interaction, PatchOptions,
-    Signal, User,
+    AiEvent, AppGitConfig, Attachment, BeginOptions, Client, ClientBuilder, Event, FinishOptions,
+    Interaction, PatchOptions, Signal, User,
 };
 
 const DRIVER_VERSION: &str = "1.0.0";
@@ -42,13 +45,15 @@ const SDK_NAME: &str = "raindrop-rust";
 /// * `events.track`         — `Client::track_event` (plain, non-AI event).
 /// * `events.track_ai`      — `Client::track_ai`.
 /// * `events.track_partial` — `Client::begin` / `Interaction::patch` /
-///                            `Interaction::finish`.
+///   `Interaction::finish`.
 /// * `identify`             — `Client::identify`.
 /// * `signal`               — `Client::track_signal` (DEV-1201): the step's
-///                            event_id/name land on signals/track as
-///                            event_id/signal_name with signal_type defaulting
-///                            to "default".
+///   event_id/name land on signals/track as event_id/signal_name with
+///   signal_type defaulting to "default".
 const CAPABILITIES: &[&str] = &[
+    "app_git.config",
+    "app_git.environment",
+    "app_git.contextual_auto_detection",
     "events.track",
     "events.track_ai",
     // Factually true delivery mode: track_event/track_ai ship begin-style to
@@ -213,7 +218,7 @@ impl Driver {
     async fn execute(&mut self, name: &str, args: &Value) -> Result<(), StepError> {
         let args = clean(args);
         match name {
-            "init" => self.step_init().map_err(StepError::from),
+            "init" => self.step_init(&args).map_err(StepError::from),
             "track" => self.step_track(&args).await.map_err(StepError::from),
             "track_ai" => self.step_track_ai(&args).await.map_err(StepError::from),
             "begin" => self.step_begin(&args).await.map_err(StepError::from),
@@ -230,7 +235,7 @@ impl Driver {
 
     // -- lifecycle -------------------------------------------------------- //
 
-    fn step_init(&mut self) -> Result<(), Failure> {
+    fn step_init(&mut self, args: &Map<String, Value>) -> Result<(), Failure> {
         let sink_url = std::env::var("RAINDROP_SINK_URL").unwrap_or_default();
         let sink_url = sink_url.trim().trim_end_matches('/').to_string();
         // A missing sink must never fall through to the SDK's production
@@ -264,6 +269,7 @@ impl Driver {
                 builder = builder.project_id(project_id);
             }
         }
+        builder = configure_app_git(builder, args)?;
         let client = builder
             .build()
             .map_err(|e| Failure(format!("init: cannot build client: {e}")))?;
@@ -416,6 +422,72 @@ impl Driver {
     }
 }
 
+fn configure_app_git(
+    builder: ClientBuilder,
+    args: &Map<String, Value>,
+) -> Result<ClientBuilder, Failure> {
+    let Some(value) = args.get("app_git") else {
+        return Ok(builder);
+    };
+    if value == &Value::Bool(false) {
+        return Ok(builder.disable_app_git());
+    }
+    let object = value
+        .as_object()
+        .ok_or_else(|| Failure("init: `app_git` must be false or an object".to_string()))?;
+    const KNOWN: &[&str] = &[
+        "commit_sha",
+        "commit_dirty",
+        "branch",
+        "source_directory",
+        "detect_branch",
+        "auto_detect",
+    ];
+    let unknown: Vec<&str> = object
+        .keys()
+        .map(String::as_str)
+        .filter(|key| !KNOWN.contains(key))
+        .collect();
+    if !unknown.is_empty() {
+        return Err(Failure(format!(
+            "init: unknown app_git options: {}",
+            unknown.join(", ")
+        )));
+    }
+
+    let mut config = AppGitConfig::new();
+    for key in ["commit_sha", "branch", "source_directory"] {
+        if let Some(value) = object.get(key) {
+            let value = value
+                .as_str()
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    Failure(format!("init: app_git.{key} must be a non-empty string"))
+                })?;
+            config = match key {
+                "commit_sha" => config.commit_sha(value),
+                "branch" => config.branch(value),
+                "source_directory" => config.source_directory(value),
+                _ => unreachable!(),
+            };
+        }
+    }
+    for key in ["commit_dirty", "detect_branch", "auto_detect"] {
+        if let Some(value) = object.get(key) {
+            let value = value
+                .as_bool()
+                .ok_or_else(|| Failure(format!("init: app_git.{key} must be a boolean")))?;
+            config = match key {
+                "commit_dirty" => config.commit_dirty(value),
+                "detect_branch" => config.detect_branch(value),
+                "auto_detect" => config.auto_detect(value),
+                _ => unreachable!(),
+            };
+        }
+    }
+    Ok(builder.app_git(config))
+}
+
 async fn run_steps(raw: &str) -> ExitCode {
     let steps: Vec<Value> = match serde_json::from_str(raw) {
         Ok(Value::Array(steps)) => steps,
@@ -431,19 +503,17 @@ async fn run_steps(raw: &str) -> ExitCode {
 
     let mut driver = Driver::default();
     for (index, step) in steps.iter().enumerate() {
-        let (name, args) = match step.as_object().and_then(|m| {
-            if m.len() == 1 {
-                m.iter().next()
-            } else {
-                None
-            }
-        }) {
-            Some((name, args)) => (name.clone(), args.clone()),
-            None => {
-                eprintln!("driver: step {index} is not a single-key object");
-                return ExitCode::from(1);
-            }
-        };
+        let (name, args) =
+            match step
+                .as_object()
+                .and_then(|m| if m.len() == 1 { m.iter().next() } else { None })
+            {
+                Some((name, args)) => (name.clone(), args.clone()),
+                None => {
+                    eprintln!("driver: step {index} is not a single-key object");
+                    return ExitCode::from(1);
+                }
+            };
         let start = Instant::now();
         match driver.execute(&name, &args).await {
             Ok(()) => {}

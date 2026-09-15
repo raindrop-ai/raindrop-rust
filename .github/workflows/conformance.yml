@@ -74,7 +74,7 @@ env:
   CARGO_TERM_COLOR: always
   # invisible-tools/raindrop-sdk-harness — see "Harness pin" in the header.
   HARNESS_REPO: invisible-tools/raindrop-sdk-harness
-  HARNESS_REF: cf744e9c53185c1fd6c350888f64a016b46a10a3 # main @ 2026-07-14 (signal capability active + signal scenarios, DEV-1201)
+  HARNESS_REF: caa57a1661f3176cd59957ef0576628d96530214 # DEV-1673 candidate @ 2026-09-15 (complete Git gate, actual retries and browser config)
   SERVER_URL: http://127.0.0.1:8787
   # Driver binary produced by `cargo build --manifest-path conformance/Cargo.toml`.
   # conformance/ is a standalone bin crate outside the workspace that depends on
@@ -197,6 +197,14 @@ jobs:
           code=${PIPESTATUS[0]}
           echo "exit_code=$code" >> "$GITHUB_OUTPUT"
           exit "$code"
+
+      - name: Require application Git regressions
+        if: always() && steps.gate.outputs.run == 'true'
+        # Keep legacy non-blocking transport checks unchanged; Git regressions
+        # introduced by DEV-1673 must not be hidden by continue-on-error.
+        run: |
+          node --test harness/scripts/check-app-git-results.test.mjs
+          node harness/scripts/check-app-git-results.mjs "$RUNNER_TEMP/report.json"
 
       - name: Stop fault server
         if: always() && steps.gate.outputs.run == 'true'

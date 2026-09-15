@@ -4,7 +4,7 @@ The official Rust SDK for [Raindrop AI](https://raindrop.ai) — track AI events
 
 📖 **Full documentation:** [docs.raindrop.ai/sdk/rust](https://docs.raindrop.ai/sdk/rust). This README is the quick reference; the docs page is the canonical narrative tour.
 
-> **Beta.** The crate is `0.0.6`. The wire contract against the Raindrop ingestion API is stable and verified end-to-end against the live backend on every push, but the crate API may still change in minor ways before `0.1.0`. We recommend pinning the git revision in your `Cargo.toml` and reviewing the [Known Limitations](#known-limitations) before using it in production.
+> **Beta.** The crate is `0.0.9`. The wire contract against the Raindrop ingestion API is stable and verified end-to-end against the live backend on every push, but the crate API may still change in minor ways before `0.1.0`. We recommend pinning the git revision in your `Cargo.toml` and reviewing the [Known Limitations](#known-limitations) before using it in production.
 
 ## Installation
 
@@ -12,7 +12,7 @@ The official Rust SDK for [Raindrop AI](https://raindrop.ai) — track AI events
 
 ```toml
 [dependencies]
-raindrop-ai = { git = "https://github.com/raindrop-ai/raindrop-rust", tag = "v0.0.6" }
+raindrop-ai = { git = "https://github.com/raindrop-ai/raindrop-rust", tag = "v0.0.9" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 serde_json = "1"
 ```
@@ -370,6 +370,62 @@ process exit.
 | `http_client`            | new `reqwest::Client`         | Bring your own connection-pooled HTTP client      |
 | `local_workshop_url`     | auto-detected localhost       | Mirror cloud-bound posts to a local Workshop      |
 | `disable_local_workshop` | —                             | Disable env/probe-based local Workshop mirroring  |
+| `app_git`                | automatic                     | Configure application Git provenance              |
+| `disable_app_git`        | —                             | Disable application Git provenance                 |
+
+### Application Git provenance
+
+Events and OTLP spans report the instrumented application's commit as
+`raindrop.app.commit_sha`, with optional `raindrop.app.commit_dirty` and
+`raindrop.app.branch`. This is application provenance; it does not reinterpret
+the SDK's library version or OTLP `service.version`.
+
+```rust
+use raindrop::{AppGitConfig, Client};
+
+let client = Client::builder()
+    .write_key("rk_...")
+    .app_git(
+        AppGitConfig::new()
+            .commit_sha("0123456789abcdef0123456789abcdef01234567")
+            .commit_dirty(false)
+            .branch("main"),
+    )
+    .build()?;
+# Ok::<(), raindrop::Error>(())
+```
+
+Automatic local Git discovery is enabled by default, runs once per client in a
+bounded background task, and uses the application's current directory. The
+first operations may omit provenance while discovery is pending. Set
+`source_directory` when the application source is elsewhere, opt into automatic
+branch lookup with `detect_branch(true)`, disable only automatic sources with
+`auto_detect(false)`, or disable all reporting with `disable_app_git()`.
+Repository-selector and Git config-injection environment variables are removed
+from the discovery subprocess only, so inherited observer-repository settings
+cannot redirect `source_directory`; the application process environment is not
+modified.
+
+Explicit canonical event/span properties always win, including empty or
+otherwise invalid values. Configuration takes precedence over
+`RAINDROP_COMMIT_SHA`, `RAINDROP_COMMIT_DIRTY`, and `RAINDROP_BRANCH`.
+`RAINDROP_GIT_SOURCE_DIRECTORY` selects the discovery directory,
+`RAINDROP_GIT_DETECT_BRANCH=true` opts into branch discovery, and
+`RAINDROP_GIT_AUTO_DETECT=false` disables automatic sources without disabling
+explicit config or explicit Raindrop environment values. Automatically detected
+SHAs must be full 40- or 64-character hexadecimal values; unavailable metadata
+is omitted. A nonempty `source_directory` or `RAINDROP_GIT_SOURCE_DIRECTORY`
+exclusively identifies the application repository: deployment and CI metadata
+are not used if that selection is unavailable. Without a selected directory,
+automatic precedence is deployment metadata, current-directory Git, then
+contextual CI metadata. For interaction lifecycles, canonical application Git
+properties are frozen per `event_id`; later raw canonical overrides persist
+across pending flushes, resumed handles, and child spans until the terminal
+event flush completes. If more than 10,000 operation ids are active at once and
+the internal operation registry cannot retain a new id, existing operation
+contexts are not evicted; unknown ids omit automatic application Git metadata
+for the remainder of that client, while caller-supplied canonical properties
+still pass through.
 
 ## Architecture
 

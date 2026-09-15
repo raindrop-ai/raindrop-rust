@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use time::OffsetDateTime;
 
+use crate::app_git::{AppGitOperationContext, AppGitSnapshot};
 use crate::client::Client;
 use crate::error::Result;
 use crate::traces::{
@@ -165,6 +166,7 @@ pub struct Interaction {
     /// Sticky `event` (event name) captured from `BeginOptions`. Mostly informational — used by
     /// matching the Python/Go/JS SDK shape that exposes interaction metadata to spans.
     pub(crate) event: String,
+    pub(crate) app_git_context: Option<AppGitOperationContext>,
 }
 
 impl Interaction {
@@ -176,17 +178,23 @@ impl Interaction {
             user_id: String::new(),
             convo_id: String::new(),
             event: String::new(),
+            app_git_context: None,
         }
     }
 
     /// Internal constructor for resumed/standalone interactions where only `event_id` is known.
-    pub(crate) fn new(client: Client, event_id: String) -> Self {
+    pub(crate) fn new(
+        client: Client,
+        event_id: String,
+        app_git_context: AppGitOperationContext,
+    ) -> Self {
         Self {
             client: Some(client),
             event_id,
             user_id: String::new(),
             convo_id: String::new(),
             event: String::new(),
+            app_git_context: Some(app_git_context),
         }
     }
 
@@ -198,6 +206,7 @@ impl Interaction {
         user_id: String,
         convo_id: String,
         event: String,
+        app_git_context: AppGitOperationContext,
     ) -> Self {
         Self {
             client: Some(client),
@@ -205,6 +214,7 @@ impl Interaction {
             user_id,
             convo_id,
             event,
+            app_git_context: Some(app_git_context),
         }
     }
 
@@ -221,7 +231,9 @@ impl Interaction {
     /// Apply a patch to this interaction.
     pub async fn patch(&self, opts: PatchOptions) -> Result<()> {
         if let Some(client) = &self.client {
-            client.patch(&self.event_id, opts).await
+            client
+                .patch_with_app_git_context(&self.event_id, opts, self.app_git_context.clone())
+                .await
         } else {
             Ok(())
         }
@@ -283,9 +295,9 @@ impl Interaction {
                     &self.user_id,
                     &self.convo_id,
                     &self.event,
+                    self.app_git_context.clone(),
                 )
                 .await;
-            client.forget_interaction(&self.event_id);
             res
         } else {
             Ok(())
@@ -305,7 +317,7 @@ impl Interaction {
         }
         self.inject_association_properties(&mut opts.properties);
         match &self.client {
-            Some(client) => client.start_span(opts),
+            Some(client) => client.start_span_with_app_git(opts, self.app_git_snapshot()),
             None => Span::noop(),
         }
     }
@@ -317,7 +329,12 @@ impl Interaction {
     pub fn start_tool_span(&self, name: impl Into<String>, mut opts: ToolOptions) -> ToolSpan {
         self.inject_association_properties(&mut opts.properties);
         match &self.client {
-            Some(client) => client.start_tool_span(name, opts, &self.event_id),
+            Some(client) => client.start_tool_span_with_app_git(
+                name,
+                opts,
+                &self.event_id,
+                self.app_git_snapshot(),
+            ),
             None => ToolSpan::noop(),
         }
     }
@@ -329,7 +346,12 @@ impl Interaction {
     pub fn start_llm_span(&self, name: impl Into<String>, mut opts: LlmOptions) -> LlmSpan {
         self.inject_association_properties(&mut opts.properties);
         match &self.client {
-            Some(client) => client.start_llm_span(name, opts, &self.event_id),
+            Some(client) => client.start_llm_span_with_app_git(
+                name,
+                opts,
+                &self.event_id,
+                self.app_git_snapshot(),
+            ),
             None => LlmSpan::noop(),
         }
     }
@@ -354,6 +376,13 @@ impl Interaction {
                 .entry("event".to_string())
                 .or_insert_with(|| Value::String(self.event.clone()));
         }
+    }
+
+    fn app_git_snapshot(&self) -> AppGitSnapshot {
+        self.app_git_context
+            .as_ref()
+            .map(AppGitOperationContext::snapshot)
+            .unwrap_or_default()
     }
 
     /// Run an async closure inside a manually-managed span. The span is ended when the closure
@@ -385,7 +414,7 @@ impl Interaction {
     pub fn track_tool(&self, mut opts: TrackToolOptions) {
         if let Some(client) = &self.client {
             self.inject_association_properties(&mut opts.properties);
-            client.track_tool_for_interaction(&self.event_id, opts);
+            client.track_tool_for_interaction(&self.event_id, opts, self.app_git_snapshot());
         }
     }
 }

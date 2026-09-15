@@ -37,6 +37,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_debug_implementations)]
 
+mod app_git;
 mod buffer;
 mod client;
 mod error;
@@ -51,6 +52,7 @@ mod trace_buffer;
 mod traces;
 mod users;
 
+pub use app_git::AppGitConfig;
 pub use client::{Client, ClientBuilder};
 pub use error::{Error, Result};
 pub use events::{
