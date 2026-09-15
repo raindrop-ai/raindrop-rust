@@ -384,7 +384,7 @@ impl ClientBuilder {
             }
         });
 
-        let app_git = if self.app_git_enabled {
+        let app_git = if self.app_git_enabled && enabled {
             AppGitProvider::new(self.app_git)
         } else {
             AppGitProvider::disabled()
@@ -1117,6 +1117,83 @@ mod tests {
     use super::*;
 
     const OTEL_LIMIT_VAR: &str = "OTEL_SPAN_ATTRIBUTE_VALUE_LENGTH_LIMIT";
+
+    #[test]
+    fn no_destination_client_disables_app_git_provider() {
+        let client = Client::builder()
+            .disable_local_workshop()
+            .app_git(AppGitConfig::new().commit_sha("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"))
+            .build()
+            .expect("build no-destination client");
+
+        assert!(!client.is_enabled());
+        assert_eq!(client.inner.app_git.snapshot(), AppGitSnapshot::default());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn no_destination_client_never_starts_git() {
+        const CHILD: &str = "RAINDROP_NO_DESTINATION_GIT_TEST_CHILD";
+        if let Ok(marker) = std::env::var(CHILD) {
+            let client = Client::builder()
+                .disable_local_workshop()
+                .app_git(AppGitConfig::new().source_directory("."))
+                .build()
+                .expect("build no-destination client");
+            assert!(!client.is_enabled());
+            std::thread::sleep(Duration::from_millis(300));
+            assert!(!std::path::Path::new(&marker).exists());
+            return;
+        }
+
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!(
+            "raindrop-no-destination-git-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let fake_bin = root.join("bin");
+        let fake_git = fake_bin.join("git");
+        let marker = root.join("git-started");
+        std::fs::create_dir_all(&fake_bin).expect("create fake bin");
+        std::fs::write(
+            &fake_git,
+            format!("#!/bin/sh\n: > '{}'\n", marker.display()),
+        )
+        .expect("write fake git");
+        let mut permissions = std::fs::metadata(&fake_git)
+            .expect("fake git metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&fake_git, permissions).expect("make fake git executable");
+
+        let control = std::process::Command::new(&fake_git)
+            .status()
+            .expect("run fake Git positive control");
+        assert!(control.success());
+        assert!(
+            marker.exists(),
+            "fake Git positive control must create marker"
+        );
+        std::fs::remove_file(&marker).expect("clear positive-control marker");
+
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "client::tests::no_destination_client_never_starts_git",
+                "--nocapture",
+            ])
+            .env(CHILD, &marker)
+            .env("PATH", &fake_bin)
+            .output()
+            .expect("run no-destination child probe");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(!marker.exists());
+        std::fs::remove_dir_all(root).expect("remove fake Git directory");
+    }
 
     #[test]
     fn otel_env_limit_applies_only_when_stricter() {
