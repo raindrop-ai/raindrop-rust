@@ -8,6 +8,10 @@ use time::OffsetDateTime;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
+use crate::app_git::{
+    canonical_properties, is_canonical_property, AppGitConfig, AppGitOperationRegistry,
+    AppGitProvider, AppGitSnapshot,
+};
 use crate::buffer::{EventBuffer, EventPatch};
 use crate::error::{Error, Result};
 use crate::events::{AiEvent, BeginOptions, Event, FinishOptions, Interaction, PatchOptions};
@@ -50,6 +54,8 @@ pub(crate) struct ClientInner {
     pub(crate) service_name: String,
     pub(crate) version: String,
     pub(crate) context_data: Value,
+    pub(crate) app_git: AppGitProvider,
+    pub(crate) app_git_operations: AppGitOperationRegistry,
     pub(crate) event_buffer: Arc<EventBuffer>,
     pub(crate) trace_buffer: Arc<TraceBuffer>,
     pub(crate) max_text_field_chars: usize,
@@ -103,6 +109,8 @@ pub struct ClientBuilder {
     library_name: String,
     library_version: String,
     http_client: Option<reqwest::Client>,
+    app_git_enabled: bool,
+    app_git: AppGitConfig,
 }
 
 impl Default for ClientBuilder {
@@ -129,6 +137,8 @@ impl Default for ClientBuilder {
             library_name: crate::DEFAULT_LIBRARY_NAME.to_string(),
             library_version: crate::VERSION.to_string(),
             http_client: None,
+            app_git_enabled: true,
+            app_git: AppGitConfig::default(),
         }
     }
 }
@@ -304,6 +314,23 @@ impl ClientBuilder {
         self
     }
 
+    /// Configure application Git metadata reported on events and spans.
+    ///
+    /// Explicit values take precedence over `RAINDROP_COMMIT_SHA`,
+    /// `RAINDROP_COMMIT_DIRTY`, and `RAINDROP_BRANCH`. Local Git discovery is
+    /// best-effort and never blocks event or span methods.
+    pub fn app_git(mut self, config: AppGitConfig) -> Self {
+        self.app_git_enabled = true;
+        self.app_git = config;
+        self
+    }
+
+    /// Disable all application Git metadata reporting for this client.
+    pub fn disable_app_git(mut self) -> Self {
+        self.app_git_enabled = false;
+        self
+    }
+
     /// Build the [`Client`].
     pub fn build(self) -> Result<Client> {
         let endpoint = format_endpoint(&self.endpoint);
@@ -357,6 +384,12 @@ impl ClientBuilder {
             }
         });
 
+        let app_git = if self.app_git_enabled {
+            AppGitProvider::new(self.app_git)
+        } else {
+            AppGitProvider::disabled()
+        };
+
         let inner = Arc::new(ClientInner {
             transport,
             enabled,
@@ -364,6 +397,8 @@ impl ClientBuilder {
             service_name: self.service_name,
             version: self.library_version,
             context_data,
+            app_git,
+            app_git_operations: AppGitOperationRegistry::new(10_000),
             event_buffer,
             trace_buffer,
             max_text_field_chars: effective_text_field_limit(self.max_text_field_chars),
@@ -417,6 +452,7 @@ impl Client {
         } else {
             event.event_id
         };
+        let app_git_snapshot = self.app_git_context_for_patch(&event_id, &event.properties);
         let patch = EventPatch {
             event_name: event.event,
             user_id: event.user_id,
@@ -428,6 +464,7 @@ impl Client {
             attachments: event.attachments,
             is_pending: Some(false),
             timestamp: event.timestamp,
+            app_git_snapshot: Some(app_git_snapshot),
         };
         self.inner
             .event_buffer
@@ -446,6 +483,7 @@ impl Client {
         } else {
             event.event_id
         };
+        let app_git_snapshot = self.app_git_context_for_patch(&event_id, &event.properties);
         let patch = EventPatch {
             event_name: event.event,
             user_id: event.user_id,
@@ -457,6 +495,7 @@ impl Client {
             attachments: event.attachments,
             is_pending: Some(false),
             timestamp: event.timestamp,
+            app_git_snapshot: Some(app_git_snapshot),
         };
         self.inner
             .event_buffer
@@ -478,6 +517,11 @@ impl Client {
             opts.event_id
         };
 
+        let app_git_snapshot = self.inner.app_git_operations.begin(
+            &event_id,
+            self.inner.app_git.snapshot(),
+            &opts.properties,
+        );
         let patch = EventPatch {
             event_name: opts.event.clone(),
             user_id: opts.user_id.clone(),
@@ -489,6 +533,7 @@ impl Client {
             attachments: opts.attachments,
             is_pending: Some(true),
             timestamp: opts.timestamp,
+            app_git_snapshot: Some(app_git_snapshot),
         };
         let _ = self
             .inner
@@ -511,7 +556,8 @@ impl Client {
         if !self.inner.enabled {
             return Interaction::noop();
         }
-        Interaction::new(self.clone(), event_id.into())
+        let event_id = event_id.into();
+        Interaction::new(self.clone(), event_id)
     }
 
     /// Apply a patch directly to a buffered interaction by id.
@@ -519,6 +565,7 @@ impl Client {
         if !self.inner.enabled {
             return Ok(());
         }
+        let app_git_snapshot = self.app_git_context_for_patch(event_id, &opts.properties);
         let patch = EventPatch {
             event_name: opts.event,
             user_id: opts.user_id,
@@ -530,6 +577,7 @@ impl Client {
             attachments: opts.attachments,
             is_pending: opts.is_pending,
             timestamp: opts.timestamp,
+            app_git_snapshot: Some(app_git_snapshot),
         };
         self.inner
             .event_buffer
@@ -559,6 +607,7 @@ impl Client {
         if !self.inner.enabled {
             return Ok(());
         }
+        let app_git_snapshot = self.app_git_context_for_patch(event_id, &opts.properties);
         let patch = EventPatch {
             event_name: event_name.to_string(),
             user_id: user_id.to_string(),
@@ -569,6 +618,7 @@ impl Client {
             attachments: opts.attachments,
             is_pending: Some(false),
             timestamp: opts.timestamp,
+            app_git_snapshot: Some(app_git_snapshot),
             ..Default::default()
         };
         self.inner
@@ -578,27 +628,60 @@ impl Client {
             .await
     }
 
-    pub(crate) fn forget_interaction(&self, _event_id: &str) {
-        // Currently a no-op; sticky data is cleared after a successful flush of a final patch.
+    fn app_git_context_for_event(&self, event_id: &str) -> AppGitSnapshot {
+        self.inner
+            .app_git_operations
+            .context_for_event(event_id, self.inner.app_git.snapshot())
+    }
+
+    fn app_git_context_for_patch(
+        &self,
+        event_id: &str,
+        properties: &BTreeMap<String, Value>,
+    ) -> AppGitSnapshot {
+        self.inner
+            .app_git_operations
+            .update(event_id, self.inner.app_git.snapshot(), properties)
     }
 
     /// Start a manually-managed span. The returned [`Span`] **must** have `end()` called or it
     /// will leak (the span won't be shipped). For convenience, drop-on-end is not implemented to
     /// match Go semantics (manual control over end time).
     pub fn start_span(&self, opts: SpanOptions) -> Span {
+        let snapshot = self.app_git_context_for_event(&opts.event_id);
+        self.start_span_with_app_git(opts, snapshot)
+    }
+
+    pub(crate) fn start_span_with_app_git(
+        &self,
+        opts: SpanOptions,
+        app_git_snapshot: AppGitSnapshot,
+    ) -> Span {
         if !self.inner.enabled {
             return Span::noop();
         }
+        let app_git_snapshot = self
+            .inner
+            .app_git_operations
+            .context_for_event(&opts.event_id, app_git_snapshot);
         let parent_ids = opts.parent.as_ref().and_then(|p| p.ids());
         let ids = create_span_ids(parent_ids.as_ref());
         let mut attrs = opts.attributes;
         if !opts.operation_id.is_empty() {
             attrs.push(Attribute::string("ai.operationId", &opts.operation_id));
         }
+        for key in opts
+            .properties
+            .keys()
+            .filter(|key| is_canonical_property(key))
+        {
+            attrs.retain(|attribute| attribute.key != *key);
+        }
         attrs.extend(tool_property_attributes(
             &opts.properties,
             self.inner.max_text_field_chars,
         ));
+        let inferred_app_git = app_git_snapshot.enrich_attributes(&opts.properties, &mut attrs);
         Span::new(
             self.clone(),
             ids,
@@ -606,6 +689,7 @@ impl Client {
             opts.event_id,
             opts.start_time.unwrap_or_else(OffsetDateTime::now_utc),
             attrs,
+            inferred_app_git,
         )
     }
 
@@ -615,6 +699,17 @@ impl Client {
         name: impl Into<String>,
         opts: LlmOptions,
         event_id: &str,
+    ) -> LlmSpan {
+        let snapshot = self.inner.app_git.snapshot();
+        self.start_llm_span_with_app_git(name, opts, event_id, snapshot)
+    }
+
+    pub(crate) fn start_llm_span_with_app_git(
+        &self,
+        name: impl Into<String>,
+        opts: LlmOptions,
+        event_id: &str,
+        app_git_snapshot: crate::app_git::AppGitSnapshot,
     ) -> LlmSpan {
         let name = name.into();
         if !self.inner.enabled {
@@ -633,16 +728,17 @@ impl Client {
             opts.operation_id.clone()
         };
         let attrs = build_llm_attributes(&opts, self.inner.max_text_field_chars);
+        let app_git_properties = canonical_properties(&opts.properties);
         let span_opts = SpanOptions {
             name,
             event_id: event_id.to_string(),
             operation_id,
             parent: opts.parent,
-            properties: BTreeMap::new(),
+            properties: app_git_properties,
             attributes: attrs,
             start_time: Some(start),
         };
-        LlmSpan::from_span(self.start_span(span_opts))
+        LlmSpan::from_span(self.start_span_with_app_git(span_opts, app_git_snapshot))
     }
 
     /// Start a tool span linked to an event id.
@@ -651,6 +747,17 @@ impl Client {
         name: impl Into<String>,
         opts: ToolOptions,
         event_id: &str,
+    ) -> ToolSpan {
+        let snapshot = self.inner.app_git.snapshot();
+        self.start_tool_span_with_app_git(name, opts, event_id, snapshot)
+    }
+
+    pub(crate) fn start_tool_span_with_app_git(
+        &self,
+        name: impl Into<String>,
+        opts: ToolOptions,
+        event_id: &str,
+        app_git_snapshot: crate::app_git::AppGitSnapshot,
     ) -> ToolSpan {
         let name = name.into();
         if !self.inner.enabled {
@@ -671,19 +778,28 @@ impl Client {
             &properties,
             self.inner.max_text_field_chars,
         );
+        let app_git_properties = canonical_properties(&properties);
         let span_opts = SpanOptions {
             name,
             event_id: event_id.to_string(),
             operation_id: "ai.toolCall".to_string(),
             parent: opts.parent,
-            properties: BTreeMap::new(),
+            properties: app_git_properties,
             attributes: attrs,
             start_time: Some(start),
         };
-        ToolSpan::from_span(self.start_span(span_opts), Some(start))
+        ToolSpan::from_span(
+            self.start_span_with_app_git(span_opts, app_git_snapshot),
+            Some(start),
+        )
     }
 
-    pub(crate) fn track_tool_for_interaction(&self, event_id: &str, opts: TrackToolOptions) {
+    pub(crate) fn track_tool_for_interaction(
+        &self,
+        event_id: &str,
+        opts: TrackToolOptions,
+        app_git_snapshot: AppGitSnapshot,
+    ) {
         if !self.inner.enabled {
             return;
         }
@@ -697,7 +813,7 @@ impl Client {
                 .entry("event_id".to_string())
                 .or_insert_with(|| Value::String(event_id.to_string()));
         }
-        let attrs = build_tool_attributes(
+        let mut attrs = build_tool_attributes(
             &opts.name,
             opts.input.as_ref(),
             opts.output.as_ref(),
@@ -705,6 +821,11 @@ impl Client {
             &opts.properties,
             self.inner.max_text_field_chars,
         );
+        let app_git_snapshot = self
+            .inner
+            .app_git_operations
+            .context_for_event(event_id, app_git_snapshot);
+        let _ = app_git_snapshot.enrich_attributes(&opts.properties, &mut attrs);
         let parent_ids = opts.parent.as_ref().and_then(|p| p.ids());
         let ids = create_span_ids(parent_ids.as_ref());
         let mut otlp_attrs: Vec<OtlpKeyValue> = Vec::with_capacity(attrs.len() + 2);
@@ -743,7 +864,7 @@ impl Client {
     }
 
     pub(crate) fn track_tool_standalone(&self, opts: TrackToolOptions) {
-        self.track_tool_for_interaction("", opts)
+        self.track_tool_for_interaction("", opts, self.inner.app_git.snapshot())
     }
 
     pub(crate) fn enqueue_span(&self, span: OtlpSpan) {

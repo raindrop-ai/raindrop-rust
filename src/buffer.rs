@@ -7,6 +7,7 @@ use serde_json::Value;
 use time::OffsetDateTime;
 use tokio::sync::{Mutex, Notify};
 
+use crate::app_git::AppGitSnapshot;
 use crate::client::ClientInner;
 use crate::error::Result;
 use crate::events::Attachment;
@@ -25,6 +26,9 @@ pub(crate) struct EventPatch {
     pub attachments: Vec<Attachment>,
     pub is_pending: Option<bool>,
     pub timestamp: Option<OffsetDateTime>,
+    /// Frozen at operation start. `Some(default())` deliberately records that
+    /// metadata was unavailable then, so a later patch cannot adopt it.
+    pub app_git_snapshot: Option<AppGitSnapshot>,
 }
 
 /// Sticky context preserved across patches.
@@ -34,6 +38,7 @@ pub(crate) struct StickyEventData {
     pub user_id: String,
     pub convo_id: String,
     pub is_pending: Option<bool>,
+    pub app_git_snapshot: Option<AppGitSnapshot>,
 }
 
 /// Wire payload for `events/track_partial`.
@@ -140,12 +145,15 @@ impl EventBuffer {
                          (logged at most once per 30s)"
                     );
                 }
+                client.app_git_operations.remove(event_id);
                 return Ok(());
             }
             let existing = state.buffers.remove(event_id).unwrap_or_default();
             let sticky = state.sticky.get(event_id).cloned().unwrap_or_default();
 
+            let frozen_app_git = frozen_app_git_snapshot(&existing, &sticky, &patch);
             let mut merged = merge_event_patches(existing, patch);
+            merged.app_git_snapshot = frozen_app_git;
             if merged.is_pending.is_none() {
                 merged.is_pending = sticky.is_pending.or(Some(true));
             }
@@ -205,7 +213,7 @@ impl EventBuffer {
             Some(p) => p,
             None => {
                 // Cannot ship yet (missing user_id) — restore.
-                self.restore(event_id, patch).await;
+                self.restore(client, event_id, patch).await;
                 return Ok(());
             }
         };
@@ -227,6 +235,7 @@ impl EventBuffer {
             let mut state = self.state.lock().await;
             if !state.buffers.contains_key(event_id) {
                 state.sticky.remove(event_id);
+                client.app_git_operations.remove(event_id);
             }
             return Ok(());
         }
@@ -243,17 +252,18 @@ impl EventBuffer {
                 let mut state = self.state.lock().await;
                 if !state.buffers.contains_key(event_id) {
                     state.sticky.remove(event_id);
+                    client.app_git_operations.remove(event_id);
                 }
                 Ok(())
             }
             Err(err) => {
-                self.restore(event_id, patch).await;
+                self.restore(client, event_id, patch).await;
                 Err(err)
             }
         }
     }
 
-    async fn restore(self: &Arc<Self>, event_id: &str, patch: EventPatch) {
+    async fn restore(self: &Arc<Self>, client: &ClientInner, event_id: &str, patch: EventPatch) {
         let mut state = self.state.lock().await;
         // The cap applies to restores too: under a sustained outage every
         // failed send funnels back here, and honest backpressure (drop +
@@ -267,6 +277,7 @@ impl EventBuffer {
                      (logged at most once per 30s)"
                 );
             }
+            client.app_git_operations.remove(event_id);
             return;
         }
         let current = state.buffers.remove(event_id).unwrap_or_default();
@@ -279,6 +290,18 @@ impl EventBuffer {
     pub(crate) fn stop(&self) {
         self.stop_notify.notify_one();
     }
+}
+
+fn frozen_app_git_snapshot(
+    existing: &EventPatch,
+    sticky: &StickyEventData,
+    patch: &EventPatch,
+) -> Option<AppGitSnapshot> {
+    patch
+        .app_git_snapshot
+        .clone()
+        .or_else(|| existing.app_git_snapshot.clone())
+        .or_else(|| sticky.app_git_snapshot.clone())
 }
 
 pub(crate) fn merge_event_patches(target: EventPatch, source: EventPatch) -> EventPatch {
@@ -307,6 +330,9 @@ pub(crate) fn merge_event_patches(target: EventPatch, source: EventPatch) -> Eve
     if source.is_pending.is_some() {
         out.is_pending = source.is_pending;
     }
+    if out.app_git_snapshot.is_none() {
+        out.app_git_snapshot = source.app_git_snapshot;
+    }
     if !source.properties.is_empty() {
         for (k, v) in source.properties {
             out.properties.insert(k, v);
@@ -331,6 +357,9 @@ fn merge_sticky_event_data(existing: &StickyEventData, patch: &EventPatch) -> St
     }
     if patch.is_pending.is_some() {
         out.is_pending = patch.is_pending;
+    }
+    if patch.app_git_snapshot.is_some() {
+        out.app_git_snapshot = patch.app_git_snapshot.clone();
     }
     out
 }
@@ -368,6 +397,13 @@ fn build_track_partial_payload(
     };
 
     let mut properties = clone_map(&patch.properties);
+    if let Some(snapshot) = patch
+        .app_git_snapshot
+        .as_ref()
+        .or(sticky.app_git_snapshot.as_ref())
+    {
+        snapshot.enrich_properties(&mut properties);
+    }
     properties.insert("$context".to_string(), client.context_data.clone());
 
     let attachments = patch.attachments.clone();
@@ -439,5 +475,50 @@ fn should_drop_empty_ai_event(payload: &TrackPartialPayload) -> bool {
     match &payload.ai_data {
         Some(data) => data.input.is_empty() && data.output.is_empty(),
         None => payload.event == crate::DEFAULT_EVENT_NAME,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merge_preserves_an_empty_frozen_git_snapshot() {
+        let target = EventPatch {
+            app_git_snapshot: Some(AppGitSnapshot::default()),
+            ..Default::default()
+        };
+        let source = EventPatch {
+            app_git_snapshot: Some(AppGitSnapshot {
+                commit_sha: Some("a".repeat(40)),
+                commit_dirty: Some(false),
+                branch: Some("main".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            merge_event_patches(target, source).app_git_snapshot,
+            Some(AppGitSnapshot::default())
+        );
+    }
+
+    #[test]
+    fn direct_event_id_patch_preserves_sticky_frozen_absence_after_flush() {
+        let sticky = StickyEventData {
+            app_git_snapshot: Some(AppGitSnapshot::default()),
+            ..Default::default()
+        };
+        let later = EventPatch {
+            app_git_snapshot: Some(AppGitSnapshot {
+                commit_sha: Some("a".repeat(40)),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            frozen_app_git_snapshot(&EventPatch::default(), &sticky, &later),
+            later.app_git_snapshot
+        );
     }
 }

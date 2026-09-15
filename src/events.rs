@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use time::OffsetDateTime;
 
+use crate::app_git::AppGitSnapshot;
 use crate::client::Client;
 use crate::error::Result;
 use crate::traces::{
@@ -285,7 +286,6 @@ impl Interaction {
                     &self.event,
                 )
                 .await;
-            client.forget_interaction(&self.event_id);
             res
         } else {
             Ok(())
@@ -305,7 +305,7 @@ impl Interaction {
         }
         self.inject_association_properties(&mut opts.properties);
         match &self.client {
-            Some(client) => client.start_span(opts),
+            Some(client) => client.start_span_with_app_git(opts, AppGitSnapshot::default()),
             None => Span::noop(),
         }
     }
@@ -317,7 +317,12 @@ impl Interaction {
     pub fn start_tool_span(&self, name: impl Into<String>, mut opts: ToolOptions) -> ToolSpan {
         self.inject_association_properties(&mut opts.properties);
         match &self.client {
-            Some(client) => client.start_tool_span(name, opts, &self.event_id),
+            Some(client) => client.start_tool_span_with_app_git(
+                name,
+                opts,
+                &self.event_id,
+                AppGitSnapshot::default(),
+            ),
             None => ToolSpan::noop(),
         }
     }
@@ -329,7 +334,12 @@ impl Interaction {
     pub fn start_llm_span(&self, name: impl Into<String>, mut opts: LlmOptions) -> LlmSpan {
         self.inject_association_properties(&mut opts.properties);
         match &self.client {
-            Some(client) => client.start_llm_span(name, opts, &self.event_id),
+            Some(client) => client.start_llm_span_with_app_git(
+                name,
+                opts,
+                &self.event_id,
+                AppGitSnapshot::default(),
+            ),
             None => LlmSpan::noop(),
         }
     }
@@ -385,7 +395,7 @@ impl Interaction {
     pub fn track_tool(&self, mut opts: TrackToolOptions) {
         if let Some(client) = &self.client {
             self.inject_association_properties(&mut opts.properties);
-            client.track_tool_for_interaction(&self.event_id, opts);
+            client.track_tool_for_interaction(&self.event_id, opts, AppGitSnapshot::default());
         }
     }
 }
