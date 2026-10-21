@@ -61,7 +61,8 @@ jobs:
   relay-alerts:
     name: Relay new High/Critical alerts
     needs: analyze
-    if: github.event_name == 'push'
+    # Run even if one language's scan failed, so alerts the other languages uploaded still go out.
+    if: ${{ !cancelled() && github.event_name == 'push' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -128,7 +129,8 @@ jobs:
           done < <(jq -c '.[]' alerts.json)
 
       - name: Notify Devin triage webhook
-        if: steps.collect.outputs.count != '0'
+        # Independent of the Slack step, so a Slack outage doesn't block triage.
+        if: ${{ !cancelled() && steps.collect.outcome == 'success' && steps.collect.outputs.count != '0' }}
         env:
           DEVIN_WEBHOOK_URL: ${{ secrets.DEVIN_CODEQL_WEBHOOK_URL }}
           DEVIN_WEBHOOK_SECRET: ${{ secrets.DEVIN_CODEQL_WEBHOOK_SECRET }}
