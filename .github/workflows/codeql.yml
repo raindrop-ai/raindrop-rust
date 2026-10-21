@@ -1,0 +1,156 @@
+name: CodeQL
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    # Mondays 06:00 UTC
+    - cron: "0 6 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  # Per commit so a merge landing while `main` is still scanning doesn't
+  # cancel the earlier commit's scan and its alert relay.
+  group: codeql-${{ github.workflow }}-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: rust
+            build-mode: none
+            # Public repos' standard runner is already 4-core / 16 GB, the same size as the org's gh-ci larger runner.
+            runner: ubuntu-latest
+          - language: actions
+            build-mode: none
+            runner: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+          # Default (high-precision) suite; the relay only forwards High/Critical.
+          config: |
+            paths-ignore:
+              - "tests/**"
+              - "examples/**"
+              - "conformance/**"
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
+        with:
+          category: "/language:${{ matrix.language }}"
+
+  relay-alerts:
+    name: Relay new High/Critical alerts
+    needs: analyze
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      security-events: read
+      actions: read
+    steps:
+      - name: Collect alerts created by this run
+        id: collect
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          run_started_at="$(gh api "repos/${REPO}/actions/runs/${RUN_ID}" --jq '.run_started_at')"
+          echo "Run started at ${run_started_at}; commit ${HEAD_SHA}"
+
+          gh api --paginate -X GET "repos/${REPO}/code-scanning/alerts" \
+            -f state=open -f ref=refs/heads/main -f per_page=100 \
+            | jq -sc --arg since "$run_started_at" --arg sha "$HEAD_SHA" '
+              [ .[][]
+                | select(.created_at >= $since)
+                | select(.most_recent_instance.commit_sha == $sha)
+                | select((.rule.security_severity_level // "") | ascii_downcase | IN("high", "critical"))
+                | {
+                    number,
+                    rule: (.rule.id // .rule.name),
+                    description: (.rule.description // ""),
+                    severity: ((.rule.security_severity_level // "") | ascii_downcase),
+                    file: (.most_recent_instance.location.path // ""),
+                    line: (.most_recent_instance.location.start_line // 0),
+                    url: .html_url
+                  }
+              ]' > alerts.json
+
+          count="$(jq 'length' alerts.json)"
+          echo "count=${count}" >> "$GITHUB_OUTPUT"
+          echo "${count} new High/Critical alert(s) from this run"
+          jq -r '.[] | "- [\(.severity)] \(.rule) \(.file):\(.line) \(.url)"' alerts.json
+
+      - name: Notify Slack
+        if: steps.collect.outputs.count != '0'
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_CODEQL_WEBHOOK_URL }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          while IFS= read -r alert; do
+            payload="$(jq -n --argjson a "$alert" --arg repo "$REPO" --arg sha "$HEAD_SHA" '{
+              text: (
+                ":rotating_light: New CodeQL *\($a.severity | ascii_upcase)* alert in \($repo)\n"
+                + "*Rule:* \($a.rule)"
+                + (if $a.description != "" then " — \($a.description)" else "" end) + "\n"
+                + "*File:* `\($a.file):\($a.line)`\n"
+                + "*Commit:* \($sha[0:12])\n"
+                + "<\($a.url)|View alert #\($a.number)>"
+              )
+            }')"
+            curl -sSf -X POST -H 'Content-Type: application/json' \
+              --data "$payload" "$SLACK_WEBHOOK_URL" > /dev/null
+          done < <(jq -c '.[]' alerts.json)
+
+      - name: Notify Devin triage webhook
+        if: steps.collect.outputs.count != '0'
+        env:
+          DEVIN_WEBHOOK_URL: ${{ secrets.DEVIN_CODEQL_WEBHOOK_URL }}
+          DEVIN_WEBHOOK_SECRET: ${{ secrets.DEVIN_CODEQL_WEBHOOK_SECRET }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          while IFS= read -r alert; do
+            payload="$(jq -n --argjson a "$alert" --arg repo "$REPO" --arg sha "$HEAD_SHA" '{
+              source: "codeql",
+              repository: $repo,
+              commit: $sha,
+              alert_number: $a.number,
+              rule: $a.rule,
+              description: $a.description,
+              severity: $a.severity,
+              file: $a.file,
+              line: $a.line,
+              url: $a.url
+            }')"
+            curl -sSf -X POST \
+              -H 'Content-Type: application/json' \
+              -H "Authorization: Bearer ${DEVIN_WEBHOOK_SECRET}" \
+              --data "$payload" "$DEVIN_WEBHOOK_URL" > /dev/null
+          done < <(jq -c '.[]' alerts.json)
