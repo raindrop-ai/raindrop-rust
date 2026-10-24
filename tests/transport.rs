@@ -6,9 +6,108 @@ use serde_json::Value;
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use raindrop::{AiEvent, BeginOptions, FinishOptions, PatchOptions};
+use raindrop::{AiEvent, BeginOptions, Error, FinishOptions, PatchOptions, User};
 
 use crate::common::{fast_client_builder, mount_path, Recorder};
+
+#[tokio::test]
+async fn error_bodies_are_truncated_at_utf8_boundaries() {
+    let mut cases = vec![
+        ("short Unicode".to_string(), "é".repeat(2), "é".repeat(2)),
+        (
+            "exact limit".to_string(),
+            "é".repeat(2048),
+            "é".repeat(2048),
+        ),
+        (
+            "ASCII overflow".to_string(),
+            "a".repeat(4097),
+            "a".repeat(4096),
+        ),
+        (
+            "Unicode ending at limit".to_string(),
+            format!("{}étail", "a".repeat(4094)),
+            format!("{}é", "a".repeat(4094)),
+        ),
+    ];
+    for character in ["é", "€", "🦀"] {
+        for offset in 1..character.len() {
+            let prefix = "a".repeat(4096 - offset);
+            cases.push((
+                format!("{character} crossing limit at byte {offset}"),
+                format!("{prefix}{character}tail"),
+                prefix,
+            ));
+        }
+    }
+
+    for status_code in [400, 503] {
+        for (name, response_body, expected_body) in &cases {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/users/identify"))
+                .respond_with(
+                    ResponseTemplate::new(status_code).set_body_string(response_body.clone()),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            let client = fast_client_builder(&server)
+                .max_attempts(1)
+                .build()
+                .expect("build");
+
+            let error = client
+                .identify(User {
+                    user_id: "user-123".into(),
+                    ..Default::default()
+                })
+                .await
+                .expect_err("non-success response must remain an error");
+            match error {
+                Error::HttpStatus { status, body } => {
+                    assert_eq!(status, status_code, "{name}");
+                    assert_eq!(&body, expected_body, "{name}");
+                    assert!(body.len() <= 4096, "{name}");
+                }
+                other => panic!("{name}: expected HTTP status error, got {other:?}"),
+            }
+            client.close().await.expect("close");
+            server.verify().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn long_unicode_error_body_does_not_interrupt_retries() {
+    let server = MockServer::start().await;
+    let recorder = Recorder::new()
+        .push_response(
+            ResponseTemplate::new(503).set_body_string(format!("{}🦀", "a".repeat(4095))),
+        )
+        .push_response(ResponseTemplate::new(204));
+    Mock::given(method("POST"))
+        .and(path("/users/identify"))
+        .respond_with(recorder.clone())
+        .expect(2)
+        .mount(&server)
+        .await;
+    let client = fast_client_builder(&server)
+        .max_attempts(2)
+        .build()
+        .expect("build");
+
+    client
+        .identify(User {
+            user_id: "user-123".into(),
+            ..Default::default()
+        })
+        .await
+        .expect("503 should be retried");
+    client.close().await.expect("close");
+    assert_eq!(recorder.count(), 2);
+    server.verify().await;
+}
 
 #[tokio::test]
 async fn retry_on_retryable_statuses() {
