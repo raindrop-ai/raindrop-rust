@@ -174,16 +174,19 @@ impl RetryingHttpClient {
             }
 
             let retry_after = parse_retry_after(resp.headers());
-            let body = resp.text().await.unwrap_or_default();
-            let truncated_body = if body.len() > 4096 {
-                body[..4096].to_string()
-            } else {
-                body
-            };
+            let mut body = resp.text().await.unwrap_or_default();
+            if body.len() > 4096 {
+                // Keep the byte cap without splitting a UTF-8 character.
+                let mut end = 4096;
+                while !body.is_char_boundary(end) {
+                    end -= 1;
+                }
+                body.truncate(end);
+            }
 
             let err = Error::HttpStatus {
                 status: status.as_u16(),
-                body: truncated_body,
+                body,
             };
 
             // Non-retryable client errors: don't retry, return immediately.
