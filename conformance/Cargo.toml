@@ -23,3 +23,6 @@ raindrop-ai = { path = ".." }
 serde_json = "1.0"
 time = { version = "0.3", features = ["parsing"] }
 tokio = { version = "1.36", features = ["rt-multi-thread", "macros"] }
+# SDK log capture for the harness (CONTRACT 14): the SDK logs through `tracing`.
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"] }

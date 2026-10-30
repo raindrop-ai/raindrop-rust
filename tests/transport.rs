@@ -15,25 +15,24 @@ async fn retry_on_retryable_statuses() {
     let server = MockServer::start().await;
 
     let recorder = Recorder::new();
-    // First two attempts return 429, third returns 204.
+    // 429, 408 and 503 are retryable; the fourth attempt succeeds.
     recorder.sequence.lock().unwrap().extend(vec![
         ResponseTemplate::new(429)
             .insert_header("Retry-After", "0")
             .set_body_string("retry me"),
-        ResponseTemplate::new(429)
-            .insert_header("Retry-After", "0")
-            .set_body_string("retry me"),
+        ResponseTemplate::new(408).set_body_string("timeout"),
+        ResponseTemplate::new(503).set_body_string("unavailable"),
         ResponseTemplate::new(204),
     ]);
 
     Mock::given(method("POST"))
-        .and(path("/events/track_partial"))
+        .and(path("/events/track"))
         .respond_with(recorder.clone())
         .mount(&server)
         .await;
 
     let client = fast_client_builder(&server)
-        .max_attempts(3)
+        .max_attempts(4)
         .base_delay(Duration::from_millis(1))
         .jitter_fraction(0.0)
         .build()
@@ -48,23 +47,23 @@ async fn retry_on_retryable_statuses() {
             ..Default::default()
         })
         .await
-        .expect("track_ai retried");
+        .expect("track_ai queued");
     let _ = client.close().await;
 
-    assert_eq!(recorder.count(), 3, "expected exactly 3 attempts");
+    assert_eq!(recorder.count(), 4, "expected exactly 4 attempts");
 }
 
 #[tokio::test]
 async fn fails_fast_on_non_retryable_4xx() {
     let server = MockServer::start().await;
     let recorder = Recorder::new();
+    recorder
+        .sequence
+        .lock()
+        .unwrap()
+        .extend((0..5).map(|_| ResponseTemplate::new(400).set_body_string("bad request")));
     Mock::given(method("POST"))
-        .and(path("/events/track_partial"))
-        .respond_with(ResponseTemplate::new(400).set_body_string("bad request"))
-        .mount(&server)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/events/track_partial"))
+        .and(path("/events/track"))
         .respond_with(recorder.clone())
         .mount(&server)
         .await;
@@ -73,7 +72,7 @@ async fn fails_fast_on_non_retryable_4xx() {
         .max_attempts(5)
         .build()
         .expect("build");
-    let res = client
+    client
         .track_ai(AiEvent {
             event_id: "evt_400".into(),
             user_id: "user-123".into(),
@@ -81,18 +80,14 @@ async fn fails_fast_on_non_retryable_4xx() {
             output: "hello".into(),
             ..Default::default()
         })
-        .await;
+        .await
+        .expect("track_ai only queues");
+    let _ = client.flush().await;
+    // A permanent rejection is dropped, so a second flush sends nothing.
+    let _ = client.flush().await;
+    let _ = client.close().await;
 
-    assert!(res.is_err(), "expected error for 400");
-    if let Err(e) = res {
-        let msg = e.to_string();
-        assert!(msg.contains("400"), "expected 400 in error: {}", msg);
-    }
-    // The patch should have been restored on failure; do not close to avoid additional flush.
-    drop(client);
-    // Recorder mock isn't matched (the 400 mock matches first); so only check that the path was hit
-    // by counting *all* requests against the server. wiremock's verify defaults are fine here.
-    let _ = recorder; // not used, kept for symmetry.
+    assert_eq!(recorder.count(), 1, "a 400 must not be retried or re-sent");
 }
 
 #[tokio::test]
@@ -188,7 +183,7 @@ async fn auth_header_uses_bearer_write_key() {
 #[tokio::test]
 async fn endpoint_normalization_appends_slash() {
     let server = MockServer::start().await;
-    let recorder = mount_path(&server, "POST", "/events/track_partial").await;
+    let recorder = mount_path(&server, "POST", "/events/track").await;
 
     let client = raindrop::Client::builder()
         .write_key("rk_test")

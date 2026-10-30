@@ -130,6 +130,9 @@ pub struct LlmOptions {
 #[derive(Debug, Clone)]
 pub struct Span {
     inner: Option<Arc<SpanInner>>,
+    /// Ids of a span recorded elsewhere (see [`Span::from_saved_ids`]); used
+    /// only as a parent.
+    remote: Option<SpanIds>,
 }
 
 #[derive(Debug)]
@@ -153,7 +156,31 @@ struct SpanState {
 impl Span {
     /// Construct a no-op span (used when the client is disabled).
     pub fn noop() -> Self {
-        Self { inner: None }
+        Self {
+            inner: None,
+            remote: None,
+        }
+    }
+
+    /// A span recorded elsewhere, for example by another process that saved
+    /// its ids with the event, to use as the `parent` of new spans
+    /// (CONTRACT 12.2). Ids are lowercase hex: 32 characters for the trace,
+    /// 16 for the span. Returns `None` for malformed or all-zero ids.
+    ///
+    /// The returned span is only a parent reference: ending it or setting
+    /// attributes on it does nothing.
+    pub fn from_saved_ids(trace_id: &str, span_id: &str) -> Option<Self> {
+        let trace = decode_hex_id(trace_id, 16)?;
+        let span = decode_hex_id(span_id, 8)?;
+        let engine = base64::engine::general_purpose::STANDARD;
+        Some(Self {
+            inner: None,
+            remote: Some(SpanIds {
+                trace_id_b64: base64::Engine::encode(&engine, trace),
+                span_id_b64: base64::Engine::encode(&engine, span),
+                parent_span_id_b64: None,
+            }),
+        })
     }
 
     pub(crate) fn new(
@@ -179,6 +206,7 @@ impl Span {
                     inferred_app_git,
                 }),
             })),
+            remote: None,
         }
     }
 
@@ -193,7 +221,10 @@ impl Span {
     }
 
     pub(crate) fn ids(&self) -> Option<SpanIds> {
-        self.inner.as_ref().map(|i| i.ids.clone())
+        self.inner
+            .as_ref()
+            .map(|i| i.ids.clone())
+            .or_else(|| self.remote.clone())
     }
 
     /// Effective per-field character cap of the owning client (default for
@@ -939,4 +970,19 @@ where
             Err(err)
         }
     }
+}
+
+/// Decode a lowercase-hex id of `bytes` bytes; `None` when malformed or all zero.
+fn decode_hex_id(hex: &str, bytes: usize) -> Option<Vec<u8>> {
+    if hex.len() != bytes * 2 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let out: Vec<u8> = (0..bytes)
+        .map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16))
+        .collect::<std::result::Result<_, _>>()
+        .ok()?;
+    if out.iter().all(|b| *b == 0) {
+        return None;
+    }
+    Some(out)
 }

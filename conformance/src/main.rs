@@ -32,47 +32,65 @@ use time::OffsetDateTime;
 
 use raindrop::{
     AiEvent, AppGitConfig, Attachment, BeginOptions, Client, ClientBuilder, Event, FinishOptions,
-    Interaction, PatchOptions, Signal, User,
+    Interaction, PatchOptions, ResumeOptions, ResumeSubagentOptions, Signal, Span, SubagentOptions,
+    ToolOptions, TrackToolOptions, User,
 };
 
-const DRIVER_VERSION: &str = "1.0.0";
+const DRIVER_VERSION: &str = "1.1.0";
 const PROTOCOL: u64 = 1;
 const SDK_NAME: &str = "raindrop-rust";
 
 /// Canonical capability keys (harness `capabilities.yaml`) this SDK supports,
 /// derived honestly from the public API:
 ///
-/// * `events.track`         — `Client::track_event` (plain, non-AI event).
-/// * `events.track_ai`      — `Client::track_ai`.
+/// * `events.track`         — `Client::track_event` (plain, non-AI event),
+///   queued and batched to events/track.
+/// * `events.track_ai`      — `Client::track_ai`, queued and batched to
+///   events/track.
 /// * `events.track_partial` — `Client::begin` / `Interaction::patch` /
 ///   `Interaction::finish`.
+/// * `events.resume`        — `Client::resume_interaction_with`.
+/// * `events.optional_user_id` — user ids are plain strings the caller may
+///   leave empty; the SDK then does not send the event.
 /// * `identify`             — `Client::identify`.
 /// * `signal`               — `Client::track_signal` (DEV-1201): the step's
 ///   event_id/name land on signals/track as event_id/signal_name with
 ///   signal_type defaulting to "default".
+/// * `logs.capture`         — SDK `tracing` records go to
+///   `RAINDROP_HARNESS_LOG` (CONTRACT 14).
+/// * `traces.retroactive_span` / `traces.span_parent` —
+///   `Interaction::track_tool` with `Span::from_saved_ids` as the parent.
+/// * `subagents.detached_dispatch` / `subagents.detached_child` —
+///   `Interaction::subagent` and `Client::resume_subagent`.
 const CAPABILITIES: &[&str] = &[
     "app_git.config",
     "app_git.environment",
     "app_git.contextual_auto_detection",
     "events.track",
     "events.track_ai",
-    // Factually true delivery mode: track_event/track_ai ship begin-style to
-    // events/track_partial (DEV-1149) — declaring it runs the wrap-*-partial
-    // scenarios against the route this SDK actually uses.
-    "events.track_ai_partial",
     "events.track_partial",
+    "events.resume",
+    "events.optional_user_id",
     "identify",
     "signal",
+    "logs.capture",
+    "traces.retroactive_span",
+    "traces.span_parent",
+    "subagents.detached_dispatch",
+    "subagents.detached_child",
 ];
-const NOT_APPLICABLE: &[&str] = &["wrapper.capture"];
+const NOT_APPLICABLE: &[&str] = &["wrapper.capture", "events.track_ai_partial"];
 // A not_applicable claim must argue "not fixable" (README policy).
-// traces.otlp is deliberately neither declared nor not_applicable: the SDK
-// ships OTLP spans, but the harness cannot drive trace emission yet — a
-// visible gap tracked as DEV-1153.
-const NOT_APPLICABLE_REASONS: &[(&str, &str)] = &[(
-    "wrapper.capture",
-    "core SDK driven by direct calls; a framework capture path cannot exist by design",
-)];
+const NOT_APPLICABLE_REASONS: &[(&str, &str)] = &[
+    (
+        "wrapper.capture",
+        "core SDK driven by direct calls; a framework capture path cannot exist by design",
+    ),
+    (
+        "events.track_ai_partial",
+        "track_ai delivers via the ratified events/track batch route; the alternate partial-routing declaration cannot apply to it",
+    ),
+];
 
 /// Reserved harness arg handled by the runner (per-step timing bound), never a
 /// payload field, so the driver strips it before mapping args onto SDK calls.
@@ -206,6 +224,8 @@ fn attachments(args: &Map<String, Value>, step: &str) -> Result<Vec<Attachment>,
 struct Driver {
     client: Option<Client>,
     interaction: Option<Interaction>,
+    /// Carriers from `dispatch_subagent`, by child event id.
+    carriers: BTreeMap<String, BTreeMap<String, String>>,
 }
 
 impl Driver {
@@ -224,6 +244,10 @@ impl Driver {
             "begin" => self.step_begin(&args).await.map_err(StepError::from),
             "patch" => self.step_patch(&args).await.map_err(StepError::from),
             "finish" => self.step_finish(&args).await.map_err(StepError::from),
+            "resume" => self.step_resume(&args).map_err(StepError::from),
+            "track_tool" => self.step_track_tool(&args).map_err(StepError::from),
+            "dispatch_subagent" => self.step_dispatch_subagent(&args).map_err(StepError::from),
+            "run_subagent" => self.step_run_subagent(&args).await.map_err(StepError::from),
             "identify" => self.step_identify(&args).await.map_err(StepError::from),
             "signal" => self.step_signal(&args).await.map_err(StepError::from),
             "flush" => self.step_flush().await.map_err(StepError::from),
@@ -296,7 +320,7 @@ impl Driver {
     async fn step_track(&self, args: &Map<String, Value>) -> Result<(), Failure> {
         let event = Event {
             event_id: optional_str(args, "event_id"),
-            user_id: required_str(args, "user_id", "track")?,
+            user_id: optional_str(args, "user_id"),
             event: required_str(args, "event", "track")?,
             timestamp: timestamp(args, "track")?,
             properties: properties(args, "properties"),
@@ -311,7 +335,7 @@ impl Driver {
     async fn step_track_ai(&self, args: &Map<String, Value>) -> Result<(), Failure> {
         let event = AiEvent {
             event_id: optional_str(args, "event_id"),
-            user_id: required_str(args, "user_id", "track_ai")?,
+            user_id: optional_str(args, "user_id"),
             event: required_str(args, "event", "track_ai")?,
             timestamp: timestamp(args, "track_ai")?,
             input: optional_str(args, "input"),
@@ -366,7 +390,7 @@ impl Driver {
         }
         let opts = BeginOptions {
             event_id: optional_str(args, "event_id"),
-            user_id: required_str(args, "user_id", "begin")?,
+            user_id: optional_str(args, "user_id"),
             event: required_str(args, "event", "begin")?,
             timestamp: timestamp(args, "begin")?,
             input: optional_str(args, "input"),
@@ -378,6 +402,141 @@ impl Driver {
         let interaction = self.client()?.begin(opts).await;
         self.interaction = Some(interaction);
         Ok(())
+    }
+
+    /// CONTRACT 9.2: continue an event begun elsewhere by id. Nothing is
+    /// sent now; identity the step supplies rides on the next update.
+    fn step_resume(&mut self, args: &Map<String, Value>) -> Result<(), Failure> {
+        if self.interaction.is_some() {
+            return Err(Failure(
+                "resume: an interaction is already open (single-binding rule)".into(),
+            ));
+        }
+        let event_id = required_str(args, "event_id", "resume")?;
+        let identity = ResumeOptions {
+            user_id: optional_str(args, "user_id"),
+            convo_id: optional_str(args, "convo_id"),
+            event: optional_str(args, "event"),
+        };
+        let interaction = self.client()?.resume_interaction_with(event_id, identity);
+        self.interaction = Some(interaction);
+        Ok(())
+    }
+
+    /// CONTRACT 12: a tool span recorded after the fact on the open event.
+    fn step_track_tool(&self, args: &Map<String, Value>) -> Result<(), Failure> {
+        let interaction = self
+            .interaction
+            .as_ref()
+            .ok_or_else(|| Failure("track_tool: no open interaction".into()))?;
+        let time = |key: &str| -> Result<Option<OffsetDateTime>, Failure> {
+            match args.get(key).and_then(Value::as_str) {
+                Some(raw) => OffsetDateTime::parse(raw, &Rfc3339)
+                    .map(Some)
+                    .map_err(|e| Failure(format!("track_tool: cannot parse {key} {raw:?}: {e}"))),
+                None => Ok(None),
+            }
+        };
+        let parent = match args.get("parent").and_then(Value::as_object) {
+            Some(p) => {
+                let trace_id = p
+                    .get("trace_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let span_id = p.get("span_id").and_then(Value::as_str).unwrap_or_default();
+                Some(Span::from_saved_ids(trace_id, span_id).ok_or_else(|| {
+                    Failure("track_tool: parent ids are not valid lowercase hex".into())
+                })?)
+            }
+            None => None,
+        };
+        let duration = args
+            .get("duration_ms")
+            .and_then(Value::as_u64)
+            .map(std::time::Duration::from_millis);
+        interaction.track_tool(TrackToolOptions {
+            name: required_str(args, "name", "track_tool")?,
+            parent,
+            input: args.get("input").cloned(),
+            output: args.get("output").cloned(),
+            error: args
+                .get("error")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            properties: BTreeMap::new(),
+            start_time: time("start_time")?,
+            end_time: time("end_time")?,
+            duration,
+        });
+        Ok(())
+    }
+
+    /// CONTRACT 13.1: launch a detached sub-agent from the open event; the
+    /// carrier is kept for a later `run_subagent`.
+    fn step_dispatch_subagent(&mut self, args: &Map<String, Value>) -> Result<(), Failure> {
+        let interaction = self
+            .interaction
+            .as_ref()
+            .ok_or_else(|| Failure("dispatch_subagent: no open interaction".into()))?;
+        let dispatch = interaction.subagent(SubagentOptions {
+            name: required_str(args, "name", "dispatch_subagent")?,
+            child_event_id: required_str(args, "child_event_id", "dispatch_subagent")?,
+            input: args.get("input").cloned(),
+            ..Default::default()
+        });
+        self.carriers
+            .insert(dispatch.child_event_id, dispatch.headers);
+        Ok(())
+    }
+
+    /// CONTRACT 13.2: run as a detached sub-agent from a carrier, reporting
+    /// the child's own event.
+    async fn step_run_subagent(&mut self, args: &Map<String, Value>) -> Result<(), Failure> {
+        if self.interaction.is_some() {
+            return Err(Failure(
+                "run_subagent: an interaction is already open (single-binding rule)".into(),
+            ));
+        }
+        let headers: BTreeMap<String, String> = match (
+            args.get("carrier_from").and_then(Value::as_str),
+            args.get("headers").and_then(Value::as_object),
+        ) {
+            (Some(child), None) => self.carriers.get(child).cloned().ok_or_else(|| {
+                Failure(format!(
+                    "run_subagent: no dispatch for child event {child:?}"
+                ))
+            })?,
+            (None, Some(map)) => map
+                .iter()
+                .filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_string())))
+                .collect(),
+            _ => {
+                return Err(Failure(
+                    "run_subagent: exactly one of `carrier_from` and `headers` is required".into(),
+                ))
+            }
+        };
+        let output = required_str(args, "output", "run_subagent")?;
+        let client = self.client()?;
+        let run = client
+            .resume_subagent(
+                &headers,
+                ResumeSubagentOptions {
+                    user_id: optional_str(args, "user_id"),
+                    ..Default::default()
+                },
+            )
+            .await;
+        if let Some(tool_name) = args.get("tool_name").and_then(Value::as_str) {
+            let tool = run.start_tool_span(tool_name, ToolOptions::default());
+            tool.end();
+        }
+        run.finish(FinishOptions {
+            output,
+            ..Default::default()
+        })
+        .await
+        .map_err(|e| Failure(format!("run_subagent: {e}")))
     }
 
     async fn step_patch(&self, args: &Map<String, Value>) -> Result<(), Failure> {
@@ -488,6 +647,77 @@ fn configure_app_git(
     Ok(builder.app_git(config))
 }
 
+/// SDK log records as JSON lines for the runner (CONTRACT 14): one
+/// `{"level", "message"}` object per `tracing` event, appended to
+/// `RAINDROP_HARNESS_LOG`.
+struct HarnessLog {
+    path: String,
+}
+
+#[derive(Default)]
+struct MessageVisitor {
+    message: String,
+    fields: Vec<String>,
+}
+
+impl tracing::field::Visit for MessageVisitor {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            self.message = format!("{value:?}");
+        } else {
+            self.fields.push(format!("{}={value:?}", field.name()));
+        }
+    }
+
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "message" {
+            self.message = value.to_string();
+        } else {
+            self.fields.push(format!("{}={value}", field.name()));
+        }
+    }
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for HarnessLog {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let level = match *event.metadata().level() {
+            tracing::Level::ERROR => "error",
+            tracing::Level::WARN => "warn",
+            tracing::Level::INFO => "info",
+            _ => "debug",
+        };
+        let mut visitor = MessageVisitor::default();
+        event.record(&mut visitor);
+        let mut message = visitor.message;
+        if !visitor.fields.is_empty() {
+            message = format!("{message} ({})", visitor.fields.join(", "));
+        }
+        let line = json!({ "level": level, "message": message }).to_string();
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+        {
+            use std::io::Write;
+            let _ = writeln!(file, "{line}");
+        }
+    }
+}
+
+fn capture_sdk_logs() {
+    use tracing_subscriber::layer::SubscriberExt;
+    if let Ok(path) = std::env::var("RAINDROP_HARNESS_LOG") {
+        if !path.trim().is_empty() {
+            let subscriber = tracing_subscriber::registry().with(HarnessLog { path });
+            let _ = tracing::subscriber::set_global_default(subscriber);
+        }
+    }
+}
+
 async fn run_steps(raw: &str) -> ExitCode {
     let steps: Vec<Value> = match serde_json::from_str(raw) {
         Ok(Value::Array(steps)) => steps,
@@ -544,6 +774,7 @@ async fn main() -> ExitCode {
         println!("{}", describe());
         return ExitCode::SUCCESS;
     }
+    capture_sdk_logs();
     let mut raw = String::new();
     if let Err(e) = std::io::stdin().read_to_string(&mut raw) {
         eprintln!("driver: cannot read stdin: {e}");

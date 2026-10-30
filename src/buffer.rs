@@ -11,7 +11,7 @@ use crate::app_git::AppGitSnapshot;
 use crate::client::ClientInner;
 use crate::error::Result;
 use crate::events::Attachment;
-use crate::helpers::{clone_map, iso8601_timestamp, merge_attachments, truncate_text_in_place};
+use crate::helpers::{clone_map, merge_attachments, truncate_text_in_place};
 
 /// In-flight patch state for a single event id.
 #[derive(Debug, Default, Clone)]
@@ -29,6 +29,9 @@ pub(crate) struct EventPatch {
     /// Frozen at operation start. `Some(default())` deliberately records that
     /// metadata was unavailable then, so a later patch cannot adopt it.
     pub app_git_snapshot: Option<AppGitSnapshot>,
+    /// Set by an interaction continued by id ([`crate::Client::resume_interaction`]):
+    /// the event began elsewhere, so its user, name and start live there.
+    pub resumed: bool,
 }
 
 /// Sticky context preserved across patches.
@@ -39,15 +42,25 @@ pub(crate) struct StickyEventData {
     pub convo_id: String,
     pub is_pending: Option<bool>,
     pub app_git_snapshot: Option<AppGitSnapshot>,
+    /// The event's start (CONTRACT 9.1): the caller's timestamp, else the
+    /// clock when it was begun here. Sent unchanged on every request.
+    pub started_at: Option<OffsetDateTime>,
+    /// Continued by id; its updates are sent without a user (CONTRACT 9.2).
+    pub resumed: bool,
+    /// Input, output or attachments were sent for it from this process.
+    pub had_content: bool,
 }
 
 /// Wire payload for `events/track_partial`.
 #[derive(Debug, Default, Clone, Serialize)]
 pub(crate) struct TrackPartialPayload {
     pub event_id: String,
-    pub user_id: String,
-    pub event: String,
-    pub timestamp: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ai_data: Option<AiDataPayload>,
     pub properties: BTreeMap<String, Value>,
@@ -84,7 +97,13 @@ pub(crate) struct EventBuffer {
 struct EventBufferState {
     buffers: BTreeMap<String, EventPatch>,
     sticky: BTreeMap<String, StickyEventData>,
+    /// Recently finished event ids, so a second finish can be warned about
+    /// (CONTRACT 10.2). Bounded; oldest first.
+    finished: std::collections::VecDeque<String>,
 }
+
+/// How many finished event ids are remembered for the repeated-finish warning.
+const FINISHED_MEMORY: usize = 1000;
 
 impl std::fmt::Debug for EventBuffer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -149,7 +168,32 @@ impl EventBuffer {
                 return Ok(());
             }
             let existing = state.buffers.remove(event_id).unwrap_or_default();
-            let sticky = state.sticky.get(event_id).cloned().unwrap_or_default();
+            let known = state.sticky.contains_key(event_id);
+            let mut sticky = state.sticky.get(event_id).cloned().unwrap_or_default();
+            if !known && patch.resumed {
+                sticky.resumed = true;
+            }
+            record_start(&mut sticky, patch.timestamp);
+            if matches!(patch.is_pending, Some(false)) {
+                if state.finished.iter().any(|id| id == event_id) {
+                    // Still sent: ingest handles repeated finishes (CONTRACT
+                    // 10.2), but two finishes usually mean two interactions
+                    // share one event id.
+                    if crate::helpers::should_log_rate_limited("repeated_finish") {
+                        tracing::warn!(
+                            event_id,
+                            "raindrop: event was already finished in this process; sending the \
+                             update anyway. Use a separate event id per interaction, or keep it \
+                             pending until its last update (logged at most once per 30s)"
+                        );
+                    }
+                } else {
+                    state.finished.push_back(event_id.to_string());
+                    while state.finished.len() > FINISHED_MEMORY {
+                        state.finished.pop_front();
+                    }
+                }
+            }
 
             let frozen_app_git = frozen_app_git_snapshot(&existing, &sticky, &patch);
             let mut merged = merge_event_patches(existing, patch);
@@ -211,33 +255,65 @@ impl EventBuffer {
 
         let payload = match build_track_partial_payload(client, event_id, &patch, &sticky) {
             Some(p) => p,
+            None if matches!(patch.is_pending, Some(false)) => {
+                // A finished event that never got a user is not sent
+                // (CONTRACT 10.1): no user would ever arrive to ship it.
+                if crate::helpers::should_log_rate_limited("missing_user_dropped") {
+                    tracing::warn!(
+                        event_id,
+                        "raindrop: dropping an event finished without a user_id; set user_id in \
+                         BeginOptions or AiEvent (logged at most once per 30s)"
+                    );
+                }
+                let mut state = self.state.lock().await;
+                if !state.buffers.contains_key(event_id) {
+                    state.sticky.remove(event_id);
+                    client.app_git_operations.remove(event_id);
+                }
+                return Ok(());
+            }
             None => {
-                // Cannot ship yet (missing user_id) — restore.
+                // Cannot ship yet (missing user_id): restore until a user
+                // arrives. Not sent, and warned about (CONTRACT 10.1).
+                if crate::helpers::should_log_rate_limited("missing_user_held") {
+                    tracing::warn!(
+                        event_id,
+                        "raindrop: holding an event that has no user_id; it is not sent until \
+                         one is set (logged at most once per 30s)"
+                    );
+                }
                 self.restore(client, event_id, patch).await;
                 return Ok(());
             }
         };
 
-        if should_drop_empty_ai_event(&payload) {
-            // Rate-limited: a wrapper bug emitting empty events on every turn
-            // must not flood the host's logs with one warning per event.
-            if crate::helpers::should_log_rate_limited("empty_ai_event_dropped") {
+        let has_content = payload_has_content(&payload);
+        if has_content {
+            let mut state = self.state.lock().await;
+            if let Some(entry) = state.sticky.get_mut(event_id) {
+                entry.had_content = true;
+            }
+        }
+        if !payload.is_pending && !has_content && !sticky.had_content && !sticky.resumed {
+            // Still sent: whether an empty event is kept is ingest's call
+            // (CONTRACT 14.2, rule C5). A resumed event is exempt because
+            // another process may have sent its content.
+            if crate::helpers::should_log_rate_limited("empty_ai_event") {
                 tracing::warn!(
                     event_id,
-                    event_name = %payload.event,
-                    has_ai_data = payload.ai_data.is_some(),
-                    "raindrop: dropping finalized track_partial with empty ai_input and ai_output \
-                     (logged at most once per 30s). Populate input/output via \
-                     BeginOptions/FinishOptions/AiEvent, or record errored generations via \
-                     `LlmSpan::set_error`."
+                    "raindrop: event finished with no input, output or attachments; sending it \
+                     anyway. Populate input/output via BeginOptions/FinishOptions/AiEvent \
+                     (logged at most once per 30s)"
                 );
             }
-            let mut state = self.state.lock().await;
-            if !state.buffers.contains_key(event_id) {
-                state.sticky.remove(event_id);
-                client.app_git_operations.remove(event_id);
-            }
-            return Ok(());
+        }
+        if payload.user_id.is_none() && crate::helpers::should_log_rate_limited("resumed_no_user") {
+            // Still sent: ingest uses the user it stored for the event (CONTRACT 9.2).
+            tracing::warn!(
+                event_id,
+                "raindrop: sending an update for a resumed event without a user_id; ingest uses \
+                 the user it already has for this event (logged at most once per 30s)"
+            );
         }
 
         match client
@@ -251,6 +327,24 @@ impl EventBuffer {
                 }
                 let mut state = self.state.lock().await;
                 if !state.buffers.contains_key(event_id) {
+                    state.sticky.remove(event_id);
+                    client.app_git_operations.remove(event_id);
+                }
+                Ok(())
+            }
+            Err(err) if crate::http::is_permanent_rejection(&err) => {
+                // Never retried or restored: ingest refused the payload for
+                // good (CONTRACT 3, 15.1).
+                if crate::helpers::should_log_rate_limited("partial_rejected") {
+                    tracing::warn!(
+                        event_id,
+                        error = %err,
+                        "raindrop: ingest rejected an event update; dropping it (logged at most \
+                         once per 30s)"
+                    );
+                }
+                let mut state = self.state.lock().await;
+                if !payload.is_pending && !state.buffers.contains_key(event_id) {
                     state.sticky.remove(event_id);
                     client.app_git_operations.remove(event_id);
                 }
@@ -333,6 +427,7 @@ pub(crate) fn merge_event_patches(target: EventPatch, source: EventPatch) -> Eve
     if out.app_git_snapshot.is_none() {
         out.app_git_snapshot = source.app_git_snapshot;
     }
+    out.resumed |= source.resumed;
     if !source.properties.is_empty() {
         for (k, v) in source.properties {
             out.properties.insert(k, v);
@@ -375,19 +470,23 @@ fn build_track_partial_payload(
     } else {
         sticky.user_id.clone()
     };
-    if user_id.is_empty() {
+    if user_id.is_empty() && !sticky.resumed {
         if client.debug {
             tracing::debug!(event_id, "skipping track_partial: missing user_id");
         }
         return None;
     }
 
+    // A resumed event carries only what this process supplied, so the
+    // identity stored where it began is never overwritten (CONTRACT 9.2).
     let event_name = if !patch.event_name.is_empty() {
-        patch.event_name.clone()
+        Some(patch.event_name.clone())
     } else if !sticky.event_name.is_empty() {
-        sticky.event_name.clone()
+        Some(sticky.event_name.clone())
+    } else if sticky.resumed {
+        None
     } else {
-        crate::DEFAULT_EVENT_NAME.to_string()
+        Some(crate::DEFAULT_EVENT_NAME.to_string())
     };
 
     let convo_id = if !patch.convo_id.is_empty() {
@@ -412,9 +511,9 @@ fn build_track_partial_payload(
 
     let mut payload = TrackPartialPayload {
         event_id: event_id.to_string(),
-        user_id,
+        user_id: (!user_id.is_empty()).then_some(user_id),
         event: event_name,
-        timestamp: iso8601_timestamp(patch.timestamp),
+        timestamp: sticky.started_at.map(crate::helpers::iso8601_millis),
         ai_data: None,
         properties,
         attachments,
@@ -437,45 +536,26 @@ fn build_track_partial_payload(
     Some(payload)
 }
 
-/// Whether to silently drop a built payload because it would be a phantom
-/// finalized AI event with no prompt or response text. These are the events
-/// that show up in the dashboard with empty `ai_input` / `ai_output` and
-/// confuse users.
-///
-/// We only drop *finalized* (`is_pending=false`) payloads so that legitimate
-/// in-flight interactions (pending patches that will be completed by a later
-/// `finish` / `patch` call) still ship. Pending intermediates can have empty
-/// text and that is expected.
-///
-/// Two shapes get dropped:
-///   * `ai_data` is attached but both `input` and `output` are empty AND
-///     there are no attachments — the wrapper recorded model / convo_id /
-///     token usage but never the prompt or response. To record an errored
-///     generation instead, attach an `LlmSpan` and call `set_error(...)`
-///     on it; Dawn will associate the error span with this event by
-///     `event_id`.
-///   * No `ai_data` was attached, the event name resolved to
-///     `ai_generation`, and there are no attachments. The gate cannot tell
-///     whether the caller passed an empty `event` (and it defaulted) or
-///     explicitly passed `event: "ai_generation"` — in both cases an
-///     empty-bodied `ai_generation` event is the bug we're guarding against,
-///     so both get dropped.
-///
-/// Attachment-only events (image upload with no text) always ship, even
-/// when `ai_data` was attached because the caller set `model` or `convo_id`
-/// — attachments are real payload regardless of whether the AI text fields
-/// are populated.
-fn should_drop_empty_ai_event(payload: &TrackPartialPayload) -> bool {
-    if payload.is_pending {
-        return false;
+/// Keep the event's start (CONTRACT 9.1). The first value wins: the caller's
+/// timestamp, else the clock when the event was begun here. A later explicit
+/// timestamp is honoured only when it is earlier. A resumed event gets no
+/// clock start: its start was recorded where it began.
+fn record_start(sticky: &mut StickyEventData, explicit: Option<OffsetDateTime>) {
+    match (sticky.started_at, explicit) {
+        (None, Some(at)) => sticky.started_at = Some(at),
+        (None, None) if !sticky.resumed => sticky.started_at = Some(OffsetDateTime::now_utc()),
+        (Some(current), Some(at)) if at < current => sticky.started_at = Some(at),
+        _ => {}
     }
-    if !payload.attachments.is_empty() {
-        return false;
-    }
-    match &payload.ai_data {
-        Some(data) => data.input.is_empty() && data.output.is_empty(),
-        None => payload.event == crate::DEFAULT_EVENT_NAME,
-    }
+}
+
+/// Whether a payload carries any input, output or attachments.
+fn payload_has_content(payload: &TrackPartialPayload) -> bool {
+    !payload.attachments.is_empty()
+        || payload
+            .ai_data
+            .as_ref()
+            .is_some_and(|d| !d.input.is_empty() || !d.output.is_empty())
 }
 
 #[cfg(test)]

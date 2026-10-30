@@ -12,11 +12,21 @@ use crate::events::Attachment;
 /// `_TRUNCATION_MARKER` so downstream consumers detect truncation uniformly.
 pub(crate) const TRUNCATION_MARKER: &str = "...[truncated by raindrop]";
 
-/// Format an `OffsetDateTime` as RFC3339 (with sub-second precision when present).
-/// Returns the current UTC time in ISO 8601 if the input is `None`.
-pub(crate) fn iso8601_timestamp(at: Option<OffsetDateTime>) -> String {
-    let at = at.unwrap_or_else(OffsetDateTime::now_utc);
-    at.format(&Rfc3339).unwrap_or_default()
+/// Format an instant as ISO-8601 UTC with milliseconds
+/// (`2026-10-01T14:00:00.000Z`), the form every SDK sends for an event's start
+/// (CONTRACT 9.1), so a caller-supplied value in that form goes out unchanged.
+pub(crate) fn iso8601_millis(at: OffsetDateTime) -> String {
+    let at = at.to_offset(time::UtcOffset::UTC);
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+        at.year(),
+        u8::from(at.month()),
+        at.day(),
+        at.hour(),
+        at.minute(),
+        at.second(),
+        at.millisecond()
+    )
 }
 
 /// Format an `OffsetDateTime` as RFC3339, returning an empty string if `None`.

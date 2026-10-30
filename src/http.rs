@@ -1,13 +1,13 @@
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 use rand::Rng;
 use reqwest::header::HeaderMap;
 use reqwest::Client as ReqwestClient;
-use reqwest::StatusCode;
 use serde::Serialize;
+use serde_json::Value;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
@@ -17,11 +17,153 @@ use crate::error::{Error, Result};
 /// because a missing daemon must not delay the cloud retry loop.
 const LOCAL_MIRROR_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Maximum payload size accepted by the ingestion gateway (1 MiB). Mirrors the JS SDK's
-/// `MAX_INGEST_SIZE_BYTES` and the Python SDK's `max_ingest_size_bytes`. Oversized payloads
-/// are silently dropped client-side; this matches the behavior of the other SDKs and avoids
-/// a 413 on the gateway.
-pub(crate) const MAX_INGEST_SIZE_BYTES: usize = 1024 * 1024;
+/// Longest `Retry-After` wait honored (CONTRACT 3 norm).
+pub(crate) const MAX_RETRY_AFTER: Duration = Duration::from_secs(30);
+
+/// Overload pauses (CONTRACT 15.2): a 429 or 503 with `Retry-After` pauses
+/// ALL sending to that server until the time it names, not just the retry of
+/// the rejected request. Process-wide, keyed by base URL, like the other SDKs.
+fn send_pauses() -> &'static std::sync::Mutex<std::collections::HashMap<String, Instant>> {
+    static PAUSES: OnceLock<std::sync::Mutex<std::collections::HashMap<String, Instant>>> =
+        OnceLock::new();
+    PAUSES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn note_send_pause(base_url: &str, status: u16, retry_after: Option<Duration>) {
+    let Some(wait) = retry_after else { return };
+    if wait.is_zero() || !(status == 429 || status == 503) {
+        return;
+    }
+    let until = Instant::now() + wait;
+    let mut pauses = match send_pauses().lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let entry = pauses.entry(base_url.to_string()).or_insert(until);
+    if until > *entry {
+        *entry = until;
+    }
+}
+
+fn send_pause_remaining(base_url: &str) -> Option<Duration> {
+    let pauses = match send_pauses().lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    pauses
+        .get(base_url)
+        .and_then(|until| until.checked_duration_since(Instant::now()))
+}
+
+/// 408 and 429 are the transient 4xx; every other 4xx is a permanent
+/// rejection that must not be retried (CONTRACT 3, 15.2).
+pub(crate) fn is_retryable_status(status: u16) -> bool {
+    status == 408 || status == 429 || status >= 500
+}
+
+/// Whether an error is a permanent rejection by ingest (a non-transient 4xx).
+pub(crate) fn is_permanent_rejection(err: &Error) -> bool {
+    matches!(err, Error::HttpStatus { status, .. } if (400..500).contains(status) && !is_retryable_status(*status))
+}
+
+/// Warn about what ingest rejected or changed in an accepted request.
+///
+/// A 2xx is delivered whatever its body says (CONTRACT 7.1). Ingest lists
+/// invalid items it did not store under `rejected` and input it accepted with
+/// changes (such as ignored fields) under `warnings`; both warn, rate-limited
+/// (CONTRACT 14.2). An empty, non-JSON or unexpected body is ignored.
+pub(crate) fn report_ingest_response(path: &str, body: &str) {
+    let Ok(Value::Object(map)) = serde_json::from_str::<Value>(body) else {
+        return;
+    };
+    let label = |item: &Value| -> String {
+        match (
+            item.get("event_id").and_then(Value::as_str),
+            item.get("index").and_then(Value::as_u64),
+        ) {
+            (Some(id), _) if !id.is_empty() => format!("event {id}"),
+            (_, Some(i)) => format!("item {i}"),
+            _ => "item".to_string(),
+        }
+    };
+    if let Some(rejected) = map.get("rejected").and_then(Value::as_array) {
+        let rejected: Vec<&Value> = rejected.iter().filter(|v| v.is_object()).collect();
+        if !rejected.is_empty() && crate::helpers::should_log_rate_limited("ingest_rejected") {
+            let quoted: Vec<String> = rejected
+                .iter()
+                .take(3)
+                .map(|item| {
+                    let issues: Vec<String> = item
+                        .get("issues")
+                        .and_then(Value::as_array)
+                        .map(|list| {
+                            list.iter()
+                                .map(|i| {
+                                    let path = i.get("path").and_then(Value::as_str).unwrap_or("");
+                                    let msg = i
+                                        .get("message")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("invalid");
+                                    if path.is_empty() {
+                                        msg.to_string()
+                                    } else {
+                                        format!("{path}: {msg}")
+                                    }
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    format!(
+                        "{} ({})",
+                        label(item),
+                        if issues.is_empty() {
+                            "invalid".to_string()
+                        } else {
+                            issues.join("; ")
+                        }
+                    )
+                })
+                .collect();
+            tracing::warn!(
+                path,
+                count = rejected.len(),
+                "raindrop: ingest rejected {} item(s), which were not stored: {} (logged at most \
+                 once per 30s)",
+                rejected.len(),
+                quoted.join(" | ")
+            );
+        }
+    }
+    if let Some(warnings) = map.get("warnings").and_then(Value::as_array) {
+        let warnings: Vec<&Value> = warnings.iter().filter(|v| v.is_object()).collect();
+        if !warnings.is_empty() && crate::helpers::should_log_rate_limited("ingest_warnings") {
+            let quoted: Vec<String> = warnings
+                .iter()
+                .take(3)
+                .map(|item| {
+                    let message = item.get("message").and_then(Value::as_str).unwrap_or("");
+                    if message.is_empty() {
+                        let fields: Vec<&str> = item
+                            .get("fields")
+                            .and_then(Value::as_array)
+                            .map(|f| f.iter().filter_map(Value::as_str).collect())
+                            .unwrap_or_default();
+                        format!("{}: ignored {}", label(item), fields.join(", "))
+                    } else {
+                        format!("{}: {message}", label(item))
+                    }
+                })
+                .collect();
+            tracing::warn!(
+                path,
+                count = warnings.len(),
+                "raindrop: ingest accepted {} item(s) with changes: {} (logged at most once per 30s)",
+                warnings.len(),
+                quoted.join(" | ")
+            );
+        }
+    }
+}
 
 /// Configuration for the retrying HTTP transport.
 #[derive(Clone)]
@@ -91,28 +233,8 @@ impl RetryingHttpClient {
     ) -> Result<()> {
         let payload = serde_json::to_vec(body)?;
 
-        // Drop oversized payloads on the floor to match the Python and JS SDKs
-        // (`MAX_INGEST_SIZE_BYTES` and Python's `max_ingest_size_bytes` of ~1 MiB).
-        // The ingestion gateway enforces a similar cap and would return 413 otherwise.
-        // Returning `Ok(())` here keeps SDK calls non-fatal — losing one payload is
-        // strictly better than blocking the host application on a serialization disaster.
-        // The warning is NOT gated on `debug` so production callers without verbose
-        // logging can still detect accidental oversize streams — but it is
-        // rate-limited so a sustained stream of oversized events can't flood the
-        // host's log output with one line per drop.
-        if payload.len() > MAX_INGEST_SIZE_BYTES {
-            if crate::helpers::should_log_rate_limited("oversized_payload_dropped") {
-                tracing::warn!(
-                    path,
-                    bytes = payload.len(),
-                    max = MAX_INGEST_SIZE_BYTES,
-                    "raindrop: dropping oversized payload (> 1 MiB); \
-                     further drops are logged at most once per 30s"
-                );
-            }
-            return Ok(());
-        }
-
+        // No client-side size cap: whether a payload is too large is ingest's
+        // decision, and a 413 is a permanent rejection (CONTRACT 15.1).
         if let Some(local_url) = &self.cfg.local_workshop_url {
             self.spawn_local_mirror(local_url.clone(), path.to_string(), payload.clone());
         }
@@ -130,15 +252,20 @@ impl RetryingHttpClient {
         let mut last_err: Option<Error> = None;
 
         for attempt in 1..=self.cfg.max_attempts {
-            if attempt > 1 {
-                let delay = self.retry_delay(attempt - 1, last_err.as_ref()).await;
-                if delay > Duration::ZERO {
-                    let sleep = {
-                        let guard = self.sleep.lock().await;
-                        guard.clone()
-                    };
-                    sleep(delay).await;
-                }
+            let mut delay = if attempt > 1 {
+                self.retry_delay(attempt - 1, last_err.as_ref()).await
+            } else {
+                Duration::ZERO
+            };
+            if let Some(pause) = send_pause_remaining(&self.cfg.base_url) {
+                delay = delay.max(pause);
+            }
+            if delay > Duration::ZERO {
+                let sleep = {
+                    let guard = self.sleep.lock().await;
+                    guard.clone()
+                };
+                sleep(delay).await;
             }
 
             let mut req = self
@@ -170,10 +297,13 @@ impl RetryingHttpClient {
 
             let status = resp.status();
             if status.is_success() {
+                let body = resp.text().await.unwrap_or_default();
+                report_ingest_response(path, &body);
                 return Ok(());
             }
 
-            let retry_after = parse_retry_after(resp.headers());
+            let retry_after = parse_retry_after(resp.headers()).map(|d| d.min(MAX_RETRY_AFTER));
+            note_send_pause(&self.cfg.base_url, status.as_u16(), retry_after);
             let body = resp.text().await.unwrap_or_default();
             let truncated_body = if body.len() > 4096 {
                 body[..4096].to_string()
@@ -186,8 +316,9 @@ impl RetryingHttpClient {
                 body: truncated_body,
             };
 
-            // Non-retryable client errors: don't retry, return immediately.
-            if status.as_u16() < 500 && status != StatusCode::TOO_MANY_REQUESTS {
+            // A permanent rejection is never retried; the caller drops the
+            // payload with a warning (CONTRACT 3, 15.1).
+            if !is_retryable_status(status.as_u16()) {
                 return Err(err);
             }
 

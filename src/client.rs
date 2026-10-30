@@ -14,11 +14,14 @@ use crate::app_git::{
 };
 use crate::buffer::{EventBuffer, EventPatch};
 use crate::error::{Error, Result};
-use crate::events::{AiEvent, BeginOptions, Event, FinishOptions, Interaction, PatchOptions};
-use crate::helpers::new_event_id;
+use crate::events::{
+    AiEvent, BeginOptions, Event, FinishOptions, Interaction, PatchOptions, ResumeOptions,
+};
+use crate::helpers::{new_event_id, truncate_text_in_place};
 use crate::http::{format_endpoint, RetryingHttpClient, TransportConfig};
 use crate::local_debugger::{resolve_local_workshop_url, LocalWorkshopUrlConfig};
 use crate::otlp::{create_span_ids, Attribute, OtlpKeyValue, OtlpSpan, OtlpStatus};
+use crate::outbox::Outbox;
 use crate::signals::{track_signal, Signal};
 use crate::trace_buffer::TraceBuffer;
 use crate::traces::{
@@ -42,6 +45,10 @@ const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// or slow network must never wedge the host process's exit).
 const DEFAULT_CLOSE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Default deadline for an explicit `flush()` (CONTRACT 1.2): durable on
+/// return, within a bounded time.
+const DEFAULT_FLUSH_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Default cap on distinct buffered event ids (matches the trace buffer's
 /// `trace_max_queue_size` default).
 const DEFAULT_EVENT_MAX_QUEUE_SIZE: usize = 5000;
@@ -58,8 +65,11 @@ pub(crate) struct ClientInner {
     pub(crate) app_git_operations: AppGitOperationRegistry,
     pub(crate) event_buffer: Arc<EventBuffer>,
     pub(crate) trace_buffer: Arc<TraceBuffer>,
+    /// Complete events, signals and identify calls awaiting delivery.
+    pub(crate) outbox: Arc<Outbox>,
     pub(crate) max_text_field_chars: usize,
     pub(crate) close_timeout: Duration,
+    pub(crate) flush_timeout: Duration,
     pub(crate) closed: AtomicBool,
     /// One-shot fire-and-forget tasks (span enqueues). Drained by `flush()`.
     pub(crate) flush_tasks: std::sync::Mutex<Vec<JoinHandle<()>>>,
@@ -104,6 +114,7 @@ pub struct ClientBuilder {
     jitter_fraction: f64,
     request_timeout: Duration,
     close_timeout: Duration,
+    flush_timeout: Duration,
     max_text_field_chars: usize,
     service_name: String,
     library_name: String,
@@ -132,6 +143,7 @@ impl Default for ClientBuilder {
             jitter_fraction: 0.2,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             close_timeout: DEFAULT_CLOSE_TIMEOUT,
+            flush_timeout: DEFAULT_FLUSH_TIMEOUT,
             max_text_field_chars: DEFAULT_MAX_TEXT_FIELD_CHARS,
             service_name: crate::DEFAULT_SERVICE_NAME.to_string(),
             library_name: crate::DEFAULT_LIBRARY_NAME.to_string(),
@@ -260,6 +272,16 @@ impl ClientBuilder {
         self
     }
 
+    /// Deadline for an explicit [`Client::flush`] (default 10s). Within it,
+    /// `flush()` retries failed sends and waits for sends already in progress,
+    /// so every payload enqueued before the call is handed to ingest when it
+    /// returns (CONTRACT 1.2). Payloads still unsent at the deadline are
+    /// dropped with a warning. `Duration::ZERO` disables the deadline.
+    pub fn flush_timeout(mut self, timeout: Duration) -> Self {
+        self.flush_timeout = timeout;
+        self
+    }
+
     /// Overall deadline for [`Client::close`] (default 10s): stop signals,
     /// in-flight task draining, and the final flush all share this budget, so
     /// a dead or slow network can never wedge the host process's shutdown.
@@ -375,6 +397,10 @@ impl ClientBuilder {
             self.trace_max_batch_size,
             self.trace_max_queue_size,
         ));
+        let outbox = Arc::new(Outbox::new(
+            self.partial_flush_interval,
+            self.event_max_queue_size,
+        ));
 
         let context_data = json!({
             "library": { "name": self.library_name, "version": self.library_version },
@@ -401,8 +427,10 @@ impl ClientBuilder {
             app_git_operations: AppGitOperationRegistry::new(10_000),
             event_buffer,
             trace_buffer,
+            outbox,
             max_text_field_chars: effective_text_field_limit(self.max_text_field_chars),
             close_timeout: self.close_timeout,
+            flush_timeout: self.flush_timeout,
             closed: AtomicBool::new(false),
             flush_tasks: std::sync::Mutex::new(Vec::new()),
             periodic_tasks: std::sync::Mutex::new(Vec::new()),
@@ -443,6 +471,11 @@ impl Client {
     }
 
     /// Track a non-AI event.
+    ///
+    /// Returns once the event is queued: delivery happens on a background
+    /// ticker or the next [`Client::flush`] / [`Client::close`], batched with
+    /// other events to `events/track` (CONTRACT 1.1, 7.2). An event without a
+    /// `user_id` is not sent, with a warning (CONTRACT 10.1).
     pub async fn track_event(&self, event: Event) -> Result<()> {
         if !self.inner.enabled {
             return Ok(());
@@ -452,28 +485,29 @@ impl Client {
         } else {
             event.event_id
         };
+        if event.user_id.is_empty() {
+            warn_missing_user(&event_id);
+            return Ok(());
+        }
         let app_git_snapshot = self.app_git_context_for_patch(&event_id, &event.properties);
-        let patch = EventPatch {
-            event_name: event.event,
+        let item = self.track_item(TrackItem {
+            event_id: &event_id,
             user_id: event.user_id,
-            convo_id: String::new(),
-            input: String::new(),
-            output: String::new(),
-            model: String::new(),
+            event: event.event,
+            timestamp: event.timestamp,
             properties: event.properties,
             attachments: event.attachments,
-            is_pending: Some(false),
-            timestamp: event.timestamp,
-            app_git_snapshot: Some(app_git_snapshot),
-        };
-        self.inner
-            .event_buffer
-            .clone()
-            .patch(&self.inner, &event_id, patch)
-            .await
+            ai: None,
+            app_git_snapshot,
+        });
+        self.inner.app_git_operations.remove(&event_id);
+        self.inner.outbox.push("events/track", item);
+        Ok(())
     }
 
     /// Track an AI event in one shot (no interaction lifecycle).
+    ///
+    /// Returns once the event is queued; see [`Client::track_event`].
     pub async fn track_ai(&self, event: AiEvent) -> Result<()> {
         if !self.inner.enabled {
             return Ok(());
@@ -483,25 +517,65 @@ impl Client {
         } else {
             event.event_id
         };
+        if event.user_id.is_empty() {
+            warn_missing_user(&event_id);
+            return Ok(());
+        }
         let app_git_snapshot = self.app_git_context_for_patch(&event_id, &event.properties);
-        let patch = EventPatch {
-            event_name: event.event,
+        let mut input = event.input;
+        let mut output = event.output;
+        truncate_text_in_place(&mut input, self.inner.max_text_field_chars);
+        truncate_text_in_place(&mut output, self.inner.max_text_field_chars);
+        let item = self.track_item(TrackItem {
+            event_id: &event_id,
             user_id: event.user_id,
-            convo_id: event.convo_id,
-            input: event.input,
-            output: event.output,
-            model: event.model,
+            event: event.event,
+            timestamp: event.timestamp,
             properties: event.properties,
             attachments: event.attachments,
-            is_pending: Some(false),
-            timestamp: event.timestamp,
-            app_git_snapshot: Some(app_git_snapshot),
+            ai: Some(json!({
+                "input": input,
+                "output": output,
+                "model": event.model,
+                "convo_id": event.convo_id,
+            })),
+            app_git_snapshot,
+        });
+        self.inner.app_git_operations.remove(&event_id);
+        self.inner.outbox.push("events/track", item);
+        Ok(())
+    }
+
+    /// One `events/track` item, in the shape every SDK sends.
+    fn track_item(&self, item: TrackItem<'_>) -> Value {
+        let mut properties = item.properties;
+        item.app_git_snapshot.enrich_properties(&mut properties);
+        properties.insert("$context".to_string(), self.inner.context_data.clone());
+        let event_name = if item.event.is_empty() {
+            crate::DEFAULT_EVENT_NAME.to_string()
+        } else {
+            item.event
         };
-        self.inner
-            .event_buffer
-            .clone()
-            .patch(&self.inner, &event_id, patch)
-            .await
+        let mut out = json!({
+            "event_id": item.event_id,
+            "user_id": item.user_id,
+            "event": event_name,
+            "timestamp": crate::helpers::iso8601_millis(
+                item.timestamp.unwrap_or_else(OffsetDateTime::now_utc)
+            ),
+            "properties": properties,
+        });
+        if !item.attachments.is_empty() {
+            out["attachments"] = json!(item.attachments);
+        }
+        if let Some(mut ai) = item.ai {
+            // Empty AI fields are omitted, as on the partial route.
+            if let Some(map) = ai.as_object_mut() {
+                map.retain(|_, v| !matches!(v, Value::String(s) if s.is_empty()));
+            }
+            out["ai_data"] = ai;
+        }
+        out
     }
 
     /// Begin a new in-progress interaction. The returned [`Interaction`] can accumulate further
@@ -535,6 +609,7 @@ impl Client {
             is_pending: Some(true),
             timestamp: opts.timestamp,
             app_git_snapshot: Some(app_git_snapshot),
+            resumed: false,
         };
         let _ = self
             .inner
@@ -554,13 +629,27 @@ impl Client {
 
     /// Resume a previously-started interaction by event id. The returned `Interaction` shares the
     /// same buffer state, so subsequent patches are merged with the in-flight payload.
+    ///
+    /// Works in any process: when this client never saw the event begin, its
+    /// updates are sent without a user, name or start time, and ingest keeps
+    /// the ones it stored (CONTRACT 9.2).
     pub fn resume_interaction(&self, event_id: impl Into<String>) -> Interaction {
+        self.resume_interaction_with(event_id, ResumeOptions::default())
+    }
+
+    /// Resume an interaction by event id, attaching identity this process
+    /// knows. Fields left empty are never sent.
+    pub fn resume_interaction_with(
+        &self,
+        event_id: impl Into<String>,
+        identity: ResumeOptions,
+    ) -> Interaction {
         if !self.inner.enabled {
             return Interaction::noop();
         }
         let event_id = event_id.into();
         let app_git_context = self.app_git_context_handle_for_event(&event_id);
-        Interaction::new(self.clone(), event_id, app_git_context)
+        Interaction::resumed(self.clone(), event_id, identity, app_git_context)
     }
 
     /// Apply a patch directly to a buffered interaction by id.
@@ -568,14 +657,18 @@ impl Client {
         if !self.inner.enabled {
             return Ok(());
         }
-        self.patch_with_app_git_context(event_id, opts, None).await
+        self.patch_with_app_git_context(event_id, opts, None, true)
+            .await
     }
 
+    /// `resumed` marks an update for an event this process may not have
+    /// begun; it only takes effect when the event is unknown here.
     pub(crate) async fn patch_with_app_git_context(
         &self,
         event_id: &str,
         opts: PatchOptions,
         app_git_context: Option<AppGitOperationContext>,
+        resumed: bool,
     ) -> Result<()> {
         if !self.inner.enabled {
             return Ok(());
@@ -596,6 +689,7 @@ impl Client {
             is_pending: opts.is_pending,
             timestamp: opts.timestamp,
             app_git_snapshot: Some(app_git_snapshot),
+            resumed,
         };
         self.inner
             .event_buffer
@@ -606,7 +700,7 @@ impl Client {
 
     /// Finalize an interaction directly (rarely used; prefer [`Interaction::finish`]).
     pub async fn finish(&self, event_id: &str, opts: FinishOptions) -> Result<()> {
-        self.finish_with_context(event_id, opts, "", "", "", None)
+        self.finish_with_context(event_id, opts, "", "", "", None, true)
             .await
     }
 
@@ -615,6 +709,7 @@ impl Client {
     /// shippable even when the sticky-context entry for this event id was
     /// evicted under the queue bound; otherwise the patch would restore
     /// forever on the missing-user_id path and occupy a buffer slot.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn finish_with_context(
         &self,
         event_id: &str,
@@ -623,6 +718,7 @@ impl Client {
         convo_id: &str,
         event_name: &str,
         app_git_context: Option<AppGitOperationContext>,
+        resumed: bool,
     ) -> Result<()> {
         if !self.inner.enabled {
             return Ok(());
@@ -642,6 +738,7 @@ impl Client {
             is_pending: Some(false),
             timestamp: opts.timestamp,
             app_git_snapshot: Some(app_git_snapshot),
+            resumed,
             ..Default::default()
         };
         self.inner
@@ -822,6 +919,7 @@ impl Client {
         event_id: &str,
         opts: TrackToolOptions,
         app_git_snapshot: AppGitSnapshot,
+        extra_attributes: &[Attribute],
     ) {
         if !self.inner.enabled {
             return;
@@ -858,7 +956,7 @@ impl Client {
                 event_id,
             )));
         }
-        for a in attrs {
+        for a in attrs.into_iter().chain(extra_attributes.iter().cloned()) {
             otlp_attrs.push(OtlpKeyValue::from(a));
         }
         let mut status = OtlpStatus {
@@ -883,7 +981,7 @@ impl Client {
     }
 
     pub(crate) fn track_tool_standalone(&self, opts: TrackToolOptions) {
-        self.track_tool_for_interaction("", opts, self.inner.app_git.snapshot())
+        self.track_tool_for_interaction("", opts, self.inner.app_git.snapshot(), &[])
     }
 
     pub(crate) fn enqueue_span(&self, span: OtlpSpan) {
@@ -925,11 +1023,34 @@ impl Client {
         }
     }
 
-    /// Force-flush all buffered events and traces.
+    /// Force-flush all buffered events, signals and traces.
+    ///
+    /// Durable on return (CONTRACT 1.2): every payload enqueued before the
+    /// call, including sends already in progress on the background ticker, is
+    /// handed to ingest, with retries, within [`ClientBuilder::flush_timeout`]
+    /// (default 10s). Payloads still unsent at the deadline are dropped with a
+    /// warning.
     pub async fn flush(&self) -> Result<()> {
         if !self.inner.enabled {
             return Ok(());
         }
+        let deadline = self.inner.flush_timeout;
+        if deadline.is_zero() {
+            return self.flush_all().await;
+        }
+        match tokio::time::timeout(deadline, self.flush_all()).await {
+            Ok(res) => res,
+            Err(_) => {
+                tracing::warn!(
+                    timeout_secs = deadline.as_secs_f64(),
+                    "raindrop: flush() deadline exceeded; dropping telemetry that was not yet sent"
+                );
+                Ok(())
+            }
+        }
+    }
+
+    async fn flush_all(&self) -> Result<()> {
         // Drain any pending fire-and-forget tasks so spans/events have actually been enqueued.
         let pending_tasks: Vec<JoinHandle<()>> = {
             let mut guard = self
@@ -943,6 +1064,7 @@ impl Client {
             let _ = task.await;
         }
 
+        self.inner.outbox.flush(&self.inner).await;
         let event_res = self.inner.event_buffer.clone().flush(&self.inner).await;
         let trace_res = self.inner.trace_buffer.clone().flush(&self.inner).await;
         // Drain after the buffer flush so any mirror POSTs spawned from inside
@@ -969,15 +1091,16 @@ impl Client {
         }
         self.inner.event_buffer.stop();
         self.inner.trace_buffer.stop();
+        self.inner.outbox.stop();
 
         let deadline = self.inner.close_timeout;
         if deadline.is_zero() {
             self.drain_periodic_tasks().await;
-            return self.flush().await;
+            return self.flush_all().await;
         }
         match tokio::time::timeout(deadline, async {
             self.drain_periodic_tasks().await;
-            self.flush().await
+            self.flush_all().await
         })
         .await
         {
@@ -1042,6 +1165,26 @@ impl Client {
             }
         }
 
+        let outbox = self.inner.outbox.clone();
+        let outbox_interval = outbox.flush_every();
+        if outbox_interval > Duration::ZERO {
+            let stop = outbox.stop_notify();
+            let inner_outbox = inner.clone();
+            let task = tokio::spawn(async move {
+                periodic_flush(stop, outbox_interval, move || {
+                    let inner = inner_outbox.clone();
+                    let outbox = inner.outbox.clone();
+                    async move {
+                        outbox.flush(&inner).await;
+                    }
+                })
+                .await;
+            });
+            if let Ok(mut tasks) = self.inner.periodic_tasks.lock() {
+                tasks.push(task);
+            }
+        }
+
         if trace_interval > Duration::ZERO {
             let stop = trace_buffer.stop_notify();
             let inner_trace = inner.clone();
@@ -1060,6 +1203,29 @@ impl Client {
                 tasks.push(task);
             }
         }
+    }
+}
+
+/// Fields of one `events/track` item, before enrichment.
+struct TrackItem<'a> {
+    event_id: &'a str,
+    user_id: String,
+    event: String,
+    timestamp: Option<OffsetDateTime>,
+    properties: BTreeMap<String, Value>,
+    attachments: Vec<crate::events::Attachment>,
+    ai: Option<Value>,
+    app_git_snapshot: AppGitSnapshot,
+}
+
+/// A complete event without a user is not sent (CONTRACT 10.1).
+fn warn_missing_user(event_id: &str) {
+    if crate::helpers::should_log_rate_limited("track_missing_user") {
+        tracing::warn!(
+            event_id,
+            "raindrop: dropping an event without a user_id; set user_id on the event (logged at \
+             most once per 30s)"
+        );
     }
 }
 
