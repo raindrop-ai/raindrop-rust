@@ -218,13 +218,13 @@ impl EventBuffer {
         }
 
         if flush_now {
-            let undelivered = self.flush_one(client, event_id, None).await;
-            if !undelivered.is_empty() {
-                return Err(crate::error::Error::Undelivered {
-                    count: undelivered.kept + undelivered.dropped,
-                    dropped: undelivered.dropped,
-                });
-            }
+            // A finish sends its final update inline. If it isn't delivered,
+            // flush_one has already warned and kept or dropped it; the caller
+            // learns nothing through the return value, so a `?` on `finish`
+            // can never fail the caller's own work over telemetry
+            // (CONTRACT 1.2.1: reporting is safe to ignore). `flush()` is the
+            // call that reports undelivered payloads.
+            let _ = self.flush_one(client, event_id, None).await;
         }
         Ok(())
     }

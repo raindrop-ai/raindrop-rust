@@ -41,8 +41,10 @@ conformance harness.
   A request cut off mid-flight is dropped, not resent. `close()` drops what is
   left at its deadline, with a warning, and still returns `Ok(())`. A payload
   ingest rejects permanently is not a flush error.
-- `Interaction::finish` returns `Err(Error::Undelivered { .. })` when its
-  final update could not be delivered (it stays queued); safe to ignore.
+- `Interaction::finish` keeps returning `Ok(())` when its final update could
+  not be delivered: it logs a warning and the update stays queued (or is
+  dropped if it was cut off mid-request). Only `flush()` reports undelivered
+  payloads in its return value.
 - README and examples log `flush()`/`close()` errors instead of propagating
   them with `?`.
 - `track_event`, `track_ai`, `track_signal` and `identify` queue and return

@@ -131,7 +131,12 @@ async fn event_flush_retains_buffered_patch_when_request_fails() {
             ..Default::default()
         })
         .await;
-    assert!(first.is_err(), "expected first flush to fail with 500");
+    // The inline send fails with 500, but finish() never reports delivery
+    // problems (CONTRACT 1.2.1): it warns and keeps the update queued.
+    assert!(
+        first.is_ok(),
+        "finish() must not report delivery failures: {first:?}"
+    );
 
     client.flush().await.expect("retry flush should succeed");
     let _ = client.close().await;
