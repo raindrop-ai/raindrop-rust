@@ -689,3 +689,167 @@ async fn subagent_without_a_carrier_runs_unlinked() {
     let span = spans.iter().find(|s| s["name"] == "work").expect("span");
     assert!(string_attr(span, "raindrop.handoff.parentEventId").is_none());
 }
+
+// ======================================================================
+// CONTRACT 1.2.1: one deadline, and what happens when it passes
+// ======================================================================
+
+fn track(event: &str) -> Event {
+    Event {
+        user_id: "user-123".into(),
+        event: event.into(),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn flush_keeps_unsent_payloads_queued_at_its_deadline() {
+    let logs = capture_warn_logs(|| async {
+        let server = MockServer::start().await;
+        let recorder = Recorder::new()
+            .push_response(ResponseTemplate::new(503).insert_header("Retry-After", "1"));
+        Mock::given(method("POST"))
+            .and(path("/events/track"))
+            .respond_with(recorder.clone())
+            .mount(&server)
+            .await;
+        let client = fast_client_builder(&server)
+            .max_attempts(3)
+            .flush_timeout(Duration::from_millis(300))
+            .build()
+            .expect("build");
+        client
+            .track_event(track("kept"))
+            .await
+            .expect("track_event");
+
+        let start = std::time::Instant::now();
+        match client.flush().await {
+            Err(raindrop::Error::Undelivered { count, dropped }) => {
+                assert_eq!((count, dropped), (1, 0), "the event stays queued");
+            }
+            other => panic!("flush() = {other:?}, want Error::Undelivered"),
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "flush outlived its deadline"
+        );
+        assert_eq!(recorder.count(), 1);
+
+        // It waited out the Retry-After in the queue, and goes out now.
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        client.flush().await.expect("second flush delivers it");
+        let requests = recorder.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[0].json(),
+            requests[1].json(),
+            "the same batch is resent"
+        );
+        let _ = client.close().await;
+    });
+    assert!(
+        logs.contains("flush() returned before all telemetry was delivered"),
+        "no warning: {logs}"
+    );
+}
+
+#[tokio::test]
+async fn a_request_cut_off_at_the_deadline_is_dropped_not_resent() {
+    let server = MockServer::start().await;
+    let recorder =
+        Recorder::new().push_response(ResponseTemplate::new(204).set_delay(Duration::from_secs(5)));
+    Mock::given(method("POST"))
+        .and(path("/events/track"))
+        .respond_with(recorder.clone())
+        .mount(&server)
+        .await;
+    let client = fast_client_builder(&server)
+        .flush_timeout(Duration::from_millis(300))
+        .build()
+        .expect("build");
+    client
+        .track_event(track("cut-off"))
+        .await
+        .expect("track_event");
+
+    match client.flush().await {
+        Err(raindrop::Error::Undelivered { count, dropped }) => {
+            assert_eq!((count, dropped), (1, 1))
+        }
+        other => panic!("flush() = {other:?}, want Error::Undelivered"),
+    }
+    // It may already have reached ingest, so it is not sent again.
+    client.flush().await.expect("nothing left to send");
+    assert_eq!(recorder.count(), 1);
+    let _ = client.close().await;
+}
+
+#[test]
+fn close_drops_what_is_left_at_the_deadline_and_returns_ok() {
+    let logs = capture_warn_logs(|| async {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(503).insert_header("Retry-After", "5"))
+            .mount(&server)
+            .await;
+        // Only flush_timeout is set: it governs close() too.
+        let client = fast_client_builder(&server)
+            .max_attempts(3)
+            .flush_timeout(Duration::from_millis(300))
+            .build()
+            .expect("build");
+        client
+            .track_event(track("left"))
+            .await
+            .expect("track_event");
+
+        let start = std::time::Instant::now();
+        client.close().await.expect("close() returns Ok");
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "close outlived the deadline"
+        );
+    });
+    assert!(logs.contains("dropp"), "no drop warning: {logs}");
+}
+
+#[tokio::test]
+async fn close_timeout_still_overrides_the_close_deadline() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(204).set_delay(Duration::from_secs(30)))
+        .mount(&server)
+        .await;
+    let client = fast_client_builder(&server)
+        .flush_timeout(Duration::from_secs(20))
+        .close_timeout(Duration::from_millis(300))
+        .build()
+        .expect("build");
+    client
+        .track_event(track("override"))
+        .await
+        .expect("track_event");
+    let start = std::time::Instant::now();
+    client.close().await.expect("close");
+    assert!(
+        start.elapsed() < Duration::from_secs(3),
+        "close_timeout was ignored"
+    );
+}
+
+#[tokio::test]
+async fn a_permanent_rejection_is_not_a_flush_failure() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(400))
+        .mount(&server)
+        .await;
+    let client = fast_client_builder(&server).build().expect("build");
+    client.track_event(track("bad")).await.expect("track_event");
+    client
+        .flush()
+        .await
+        .expect("delivered and rejected is not a flush failure");
+    let _ = client.close().await;
+}

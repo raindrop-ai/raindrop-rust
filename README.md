@@ -41,7 +41,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ..Default::default()
     }).await?;
 
-    client.close().await?;
+    // Telemetry errors are safe to ignore: log them, don't fail your program on them.
+    if let Err(err) = client.close().await {
+        eprintln!("raindrop: {err}");
+    }
     Ok(())
 }
 ```
@@ -357,9 +360,36 @@ let client = raindrop::Client::builder()
 
 A stricter `OTEL_SPAN_ATTRIBUTE_VALUE_LENGTH_LIMIT` env var (read once at
 build time) is also honored. All outbound HTTP carries finite per-request
-timeouts (even with a caller-injected `http_client`), and `close()` runs under
-a 10s deadline (`close_timeout`) so a dead network can never wedge your
-process exit.
+timeouts (even with a caller-injected `http_client`), and `flush()` and
+`close()` share one 10s deadline (`flush_timeout`) so a dead network can never
+wedge your process exit.
+
+### Flush and close
+
+`flush()` returns once everything queued before it was handed to Raindrop, or
+when `flush_timeout` passes. Each request's timeout is clamped to what is left
+of the deadline. When the deadline passes first:
+
+- payloads that were never sent, or were waiting on a retry or a `Retry-After`
+  pause, stay queued and go out on a later flush;
+- a request cut off mid-flight is dropped rather than resent, since it may
+  already have reached Raindrop;
+- `flush()` logs a warning and returns `Err(Error::Undelivered { count, dropped })`.
+
+That error is safe to ignore, and ignoring it changes nothing. Log it rather
+than propagating it with `?`, so a slow network never fails your own work:
+
+```rust
+if let Err(err) = client.flush().await {
+    eprintln!("raindrop: {err}");
+}
+```
+
+A payload Raindrop rejected permanently (a 4xx other than 408 and 429) was
+delivered: it is logged and dropped, but not reported as a flush error.
+
+`close()` uses the same deadline, drops whatever is still unsent when it
+passes (with a warning), and returns `Ok(())`.
 
 ## Known Limitations
 
@@ -383,8 +413,8 @@ process exit.
 | `base_delay`             | `1s`                          | Backoff base (exponential, ±20% jitter)           |
 | `jitter_fraction`        | `0.2`                         | Backoff jitter fraction (0.0–1.0)                 |
 | `request_timeout`        | `30s`                         | Per-attempt bound on every cloud POST             |
-| `flush_timeout`          | `10s`                         | Overall `flush()` deadline                        |
-| `close_timeout`          | `10s`                         | Overall `close()` deadline. `0` disables          |
+| `flush_timeout`          | `10s`                         | The one `flush()` and `close()` deadline. `0` disables |
+| `close_timeout`          | `flush_timeout`               | Overrides the `close()` deadline alone. `0` disables |
 | `max_text_field_chars`   | `1_000_000`                   | Per-field cap on AI text content                  |
 | `service_name`           | `raindrop.rust-sdk`           | OTLP `resource.service.name`                      |
 | `library_name`           | `raindrop-rust`               | `$context.library.name`                           |
@@ -454,7 +484,8 @@ still pass through.
 - **Send queue**: `track_event`, `track_ai`, `track_signal` and `identify` only queue; they never
   wait for the network. The queue (bounded by `event_max_queue_size`) is sent in batches of up to
   500 per request (`events/track`, `signals/track`) at `partial_flush_interval`, on `flush()`
-  (bounded by `flush_timeout`) and on `close()` (bounded by `close_timeout`).
+  and on `close()`, both bounded by `flush_timeout`. Batches not sent before a `flush()` deadline
+  stay queued; `close()` drops them.
 - **Interactions**: per-event-id map with sticky state. Every update carries the event's start
   time. Patches with `is_pending=false` flush immediately; periodic ticker flushes pending patches
   at `partial_flush_interval`. A pending patch without a `user_id` is held (with a warning) until

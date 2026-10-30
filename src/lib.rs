@@ -29,7 +29,10 @@
 //!     })
 //!     .await?;
 //!
-//! client.close().await?;
+//! // Telemetry errors are safe to ignore: log them, don't fail on them.
+//! if let Err(err) = client.close().await {
+//!     eprintln!("raindrop: {err}");
+//! }
 //! # Ok(())
 //! # }
 //! ```

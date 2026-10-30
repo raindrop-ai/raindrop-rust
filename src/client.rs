@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use time::OffsetDateTime;
@@ -21,7 +21,7 @@ use crate::helpers::{new_event_id, truncate_text_in_place};
 use crate::http::{format_endpoint, RetryingHttpClient, TransportConfig};
 use crate::local_debugger::{resolve_local_workshop_url, LocalWorkshopUrlConfig};
 use crate::otlp::{create_span_ids, Attribute, OtlpKeyValue, OtlpSpan, OtlpStatus};
-use crate::outbox::Outbox;
+use crate::outbox::{Outbox, Undelivered};
 use crate::signals::{track_signal, Signal};
 use crate::trace_buffer::TraceBuffer;
 use crate::traces::{
@@ -41,13 +41,15 @@ const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Default connect-phase bound for the SDK-built `reqwest::Client`.
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Default overall deadline for `close()` (python-sdk shutdown parity: a dead
-/// or slow network must never wedge the host process's exit).
-const DEFAULT_CLOSE_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Default deadline for an explicit `flush()` (CONTRACT 1.2): durable on
-/// return, within a bounded time.
+/// Default for the one deadline of `flush()` and `close()` (CONTRACT 1.2.1):
+/// durable on return, within a bounded time, and a dead or slow network must
+/// never wedge the host process's exit.
 const DEFAULT_FLUSH_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The instant a deadline of `timeout` ends; `None` when it is disabled.
+fn deadline_after(timeout: Duration) -> Option<Instant> {
+    (!timeout.is_zero()).then(|| Instant::now() + timeout)
+}
 
 /// Default cap on distinct buffered event ids (matches the trace buffer's
 /// `trace_max_queue_size` default).
@@ -113,7 +115,7 @@ pub struct ClientBuilder {
     base_delay: Duration,
     jitter_fraction: f64,
     request_timeout: Duration,
-    close_timeout: Duration,
+    close_timeout: Option<Duration>,
     flush_timeout: Duration,
     max_text_field_chars: usize,
     service_name: String,
@@ -142,7 +144,7 @@ impl Default for ClientBuilder {
             base_delay: Duration::from_secs(1),
             jitter_fraction: 0.2,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
-            close_timeout: DEFAULT_CLOSE_TIMEOUT,
+            close_timeout: None,
             flush_timeout: DEFAULT_FLUSH_TIMEOUT,
             max_text_field_chars: DEFAULT_MAX_TEXT_FIELD_CHARS,
             service_name: crate::DEFAULT_SERVICE_NAME.to_string(),
@@ -272,23 +274,25 @@ impl ClientBuilder {
         self
     }
 
-    /// Deadline for an explicit [`Client::flush`] (default 10s). Within it,
-    /// `flush()` retries failed sends and waits for sends already in progress,
-    /// so every payload enqueued before the call is handed to ingest when it
-    /// returns (CONTRACT 1.2). Payloads still unsent at the deadline are
-    /// dropped with a warning. `Duration::ZERO` disables the deadline.
+    /// The one deadline for [`Client::flush`] and [`Client::close`] (default
+    /// 10s; CONTRACT 1.2.1). Within it, they retry failed sends and wait for
+    /// sends already in progress, so every payload enqueued before the call is
+    /// handed to ingest when they return; each request's timeout is clamped to
+    /// what is left of it. When it passes, `flush()` keeps payloads that were
+    /// never sent queued for a later send and `close()` drops them, both with
+    /// a warning; a request cut off mid-flight is dropped, not resent.
+    /// `Duration::ZERO` disables the deadline.
     pub fn flush_timeout(mut self, timeout: Duration) -> Self {
         self.flush_timeout = timeout;
         self
     }
 
-    /// Overall deadline for [`Client::close`] (default 10s): stop signals,
-    /// in-flight task draining, and the final flush all share this budget, so
-    /// a dead or slow network can never wedge the host process's shutdown.
-    /// Payloads that don't make it out before the deadline are dropped with a
-    /// warning. `Duration::ZERO` disables the deadline.
+    /// Overrides the deadline for [`Client::close`] alone. Without it,
+    /// `close()` uses [`ClientBuilder::flush_timeout`], the one setting for
+    /// both calls (CONTRACT 1.2.1); prefer that. `Duration::ZERO` disables
+    /// the deadline.
     pub fn close_timeout(mut self, timeout: Duration) -> Self {
-        self.close_timeout = timeout;
+        self.close_timeout = Some(timeout);
         self
     }
 
@@ -429,7 +433,7 @@ impl ClientBuilder {
             trace_buffer,
             outbox,
             max_text_field_chars: effective_text_field_limit(self.max_text_field_chars),
-            close_timeout: self.close_timeout,
+            close_timeout: self.close_timeout.unwrap_or(self.flush_timeout),
             flush_timeout: self.flush_timeout,
             closed: AtomicBool::new(false),
             flush_tasks: std::sync::Mutex::new(Vec::new()),
@@ -1028,30 +1032,40 @@ impl Client {
     /// Durable on return (CONTRACT 1.2): every payload enqueued before the
     /// call, including sends already in progress on the background ticker, is
     /// handed to ingest, with retries, within [`ClientBuilder::flush_timeout`]
-    /// (default 10s). Payloads still unsent at the deadline are dropped with a
-    /// warning.
+    /// (default 10s).
+    ///
+    /// When the deadline passes first, payloads that were never sent, or were
+    /// waiting on a retry or a `Retry-After` pause, stay queued for a later
+    /// send; a request cut off mid-flight is dropped, since it may already
+    /// have reached ingest (CONTRACT 1.2.1). `flush()` then logs a warning and
+    /// returns [`Error::Undelivered`](crate::Error::Undelivered). That error
+    /// is safe to ignore: log it rather than propagating it with `?`, since
+    /// your own work did not fail. A payload ingest rejected permanently was
+    /// delivered and is not reported.
     pub async fn flush(&self) -> Result<()> {
         if !self.inner.enabled {
             return Ok(());
         }
-        let deadline = self.inner.flush_timeout;
-        if deadline.is_zero() {
-            return self.flush_all().await;
+        let deadline = deadline_after(self.inner.flush_timeout);
+        let undelivered = self.flush_all(deadline).await;
+        if undelivered.is_empty() {
+            return Ok(());
         }
-        match tokio::time::timeout(deadline, self.flush_all()).await {
-            Ok(res) => res,
-            Err(_) => {
-                tracing::warn!(
-                    timeout_secs = deadline.as_secs_f64(),
-                    "raindrop: flush() deadline exceeded; dropping telemetry that was not yet sent"
-                );
-                Ok(())
-            }
-        }
+        tracing::warn!(
+            kept = undelivered.kept,
+            dropped = undelivered.dropped,
+            "raindrop: flush() returned before all telemetry was delivered; unsent items stay \
+             queued for a later send"
+        );
+        Err(Error::Undelivered {
+            count: undelivered.kept + undelivered.dropped,
+            dropped: undelivered.dropped,
+        })
     }
 
-    async fn flush_all(&self) -> Result<()> {
-        // Drain any pending fire-and-forget tasks so spans/events have actually been enqueued.
+    async fn flush_all(&self, deadline: Option<Instant>) -> Undelivered {
+        // Drain any pending fire-and-forget tasks so spans/events have
+        // actually been enqueued, without waiting past the deadline.
         let pending_tasks: Vec<JoinHandle<()>> = {
             let mut guard = self
                 .inner
@@ -1061,27 +1075,53 @@ impl Client {
             std::mem::take(&mut *guard)
         };
         for task in pending_tasks {
-            let _ = task.await;
+            match deadline {
+                Some(at) => {
+                    let _ = tokio::time::timeout_at(at.into(), task).await;
+                }
+                None => {
+                    let _ = task.await;
+                }
+            }
         }
 
-        self.inner.outbox.flush(&self.inner).await;
-        let event_res = self.inner.event_buffer.clone().flush(&self.inner).await;
-        let trace_res = self.inner.trace_buffer.clone().flush(&self.inner).await;
+        let mut undelivered = self.inner.outbox.flush_until(&self.inner, deadline).await;
+        undelivered.add(
+            self.inner
+                .event_buffer
+                .clone()
+                .flush_until(&self.inner, deadline)
+                .await,
+        );
+        undelivered.add(
+            self.inner
+                .trace_buffer
+                .clone()
+                .flush_until(&self.inner, deadline)
+                .await,
+        );
         // Drain after the buffer flush so any mirror POSTs spawned from inside
         // `flush_one` / `trace_buffer.flush` are observable to the caller.
-        self.inner.transport.await_pending_mirrors().await;
-        match (event_res, trace_res) {
-            (Ok(_), Ok(_)) => Ok(()),
-            (Err(e), _) => Err(e),
-            (_, Err(e)) => Err(e),
+        match deadline {
+            Some(at) => {
+                let _ = tokio::time::timeout_at(
+                    at.into(),
+                    self.inner.transport.await_pending_mirrors(),
+                )
+                .await;
+            }
+            None => self.inner.transport.await_pending_mirrors().await,
         }
+        undelivered
     }
 
-    /// Close the client. Cancels periodic timers, awaits any in-flight tasks, and force-flushes
-    /// remaining buffers — all under the [`ClientBuilder::close_timeout`]
-    /// deadline (default 10s), so a dead or slow network can never wedge the
-    /// host process's shutdown. Payloads that don't make it out before the
-    /// deadline are dropped with a warning and `Ok(())` is returned.
+    /// Close the client. Cancels periodic timers, awaits any in-flight tasks,
+    /// and force-flushes remaining buffers, all under the same deadline as
+    /// `flush()` ([`ClientBuilder::flush_timeout`], default 10s), so a dead
+    /// or slow network can never wedge the host process's shutdown. Payloads
+    /// that don't make it out before the deadline are dropped with a warning,
+    /// and `Ok(())` is returned: at shutdown there is nothing for the caller
+    /// to do about them (CONTRACT 1.2.1).
     pub async fn close(&self) -> Result<()> {
         if self.inner.closed.swap(true, Ordering::SeqCst) {
             return Ok(());
@@ -1093,27 +1133,24 @@ impl Client {
         self.inner.trace_buffer.stop();
         self.inner.outbox.stop();
 
-        let deadline = self.inner.close_timeout;
-        if deadline.is_zero() {
-            self.drain_periodic_tasks().await;
-            return self.flush_all().await;
-        }
-        match tokio::time::timeout(deadline, async {
-            self.drain_periodic_tasks().await;
-            self.flush_all().await
-        })
-        .await
-        {
-            Ok(res) => res,
-            Err(_) => {
-                tracing::warn!(
-                    timeout_secs = deadline.as_secs_f64(),
-                    "raindrop: close() deadline exceeded; dropping remaining buffered telemetry \
-                     so process shutdown is not blocked"
-                );
-                Ok(())
+        let deadline = deadline_after(self.inner.close_timeout);
+        match deadline {
+            Some(at) => {
+                let _ = tokio::time::timeout_at(at.into(), self.drain_periodic_tasks()).await;
             }
+            None => self.drain_periodic_tasks().await,
         }
+        let undelivered = self.flush_all(deadline).await;
+        let left = self.inner.outbox.drop_all()
+            + self.inner.event_buffer.drop_all().await
+            + self.inner.trace_buffer.drop_all().await;
+        if !undelivered.is_empty() || left > 0 {
+            tracing::warn!(
+                dropped = undelivered.dropped + left,
+                "raindrop: close() deadline passed; dropped telemetry that was not delivered"
+            );
+        }
+        Ok(())
     }
 
     /// Await the periodic flusher tasks. Called after the buffers' stop

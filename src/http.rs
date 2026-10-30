@@ -11,7 +11,7 @@ use serde_json::Value;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
-use crate::error::{Error, Result};
+use crate::error::Error;
 
 /// Per-request timeout for fire-and-forget local Workshop mirror POSTs. Short
 /// because a missing daemon must not delay the cloud retry loop.
@@ -186,6 +186,36 @@ pub(crate) struct TransportConfig {
     pub debug: bool,
 }
 
+/// Why a deadline-bounded send did not deliver (see `post_json_until`).
+#[derive(Debug)]
+pub(crate) enum SendFailure {
+    /// The deadline passed before the payload went out: before its first
+    /// attempt, or while it waited on a retry or an overload pause.
+    Unsent,
+    /// The deadline ended a request mid-flight; it may have reached ingest.
+    CutOff,
+    /// Every attempt failed (retries ran out), or ingest rejected it.
+    Failed(Error),
+}
+
+impl SendFailure {
+    /// The failure as the public error type, for logging.
+    pub(crate) fn into_error(self) -> Error {
+        match self {
+            SendFailure::Unsent => {
+                Error::Http("deadline passed before the request was sent".into())
+            }
+            SendFailure::CutOff => Error::Http("request cut off at the deadline".into()),
+            SendFailure::Failed(err) => err,
+        }
+    }
+
+    /// Ingest received the payload and rejected it for good.
+    pub(crate) fn is_permanent_rejection(&self) -> bool {
+        matches!(self, SendFailure::Failed(err) if is_permanent_rejection(err))
+    }
+}
+
 /// Hooks for tests to override sleep / jitter without monkey-patching.
 type SleepFn =
     Arc<dyn Fn(Duration) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> + Send + Sync>;
@@ -226,12 +256,22 @@ impl RetryingHttpClient {
         }
     }
 
-    pub(crate) async fn post_json<T: Serialize + ?Sized>(
+    /// POST a JSON body with retries, bounded by a caller deadline (CONTRACT 1.2.1): no retry
+    /// delay or overload pause runs past it, and each request's timeout is
+    /// clamped to what is left of it. The failure says whether the payload
+    /// was never sent (it can stay queued) or was cut off mid-request (it may
+    /// already have reached ingest, so it must not be resent).
+    pub(crate) async fn post_json_until<T: Serialize + ?Sized>(
         &self,
         path: &str,
         body: &T,
-    ) -> Result<()> {
-        let payload = serde_json::to_vec(body)?;
+        deadline: Option<Instant>,
+    ) -> std::result::Result<(), SendFailure> {
+        let remaining = || deadline.map(|d| d.saturating_duration_since(Instant::now()));
+        if remaining() == Some(Duration::ZERO) {
+            return Err(SendFailure::Unsent);
+        }
+        let payload = serde_json::to_vec(body).map_err(|e| SendFailure::Failed(e.into()))?;
 
         // No client-side size cap: whether a payload is too large is ingest's
         // decision, and a 413 is a permanent rejection (CONTRACT 15.1).
@@ -260,6 +300,13 @@ impl RetryingHttpClient {
             if let Some(pause) = send_pause_remaining(&self.cfg.base_url) {
                 delay = delay.max(pause);
             }
+            if let Some(left) = remaining() {
+                if delay >= left {
+                    // Waiting on a retry or a Retry-After pause that outlasts
+                    // the deadline: not sent, so it can stay queued.
+                    return Err(SendFailure::Unsent);
+                }
+            }
             if delay > Duration::ZERO {
                 let sleep = {
                     let guard = self.sleep.lock().await;
@@ -267,16 +314,23 @@ impl RetryingHttpClient {
                 };
                 sleep(delay).await;
             }
+            // Telemetry must never wedge the host: bound every attempt even
+            // when the reqwest client itself has no timeout configured (e.g.
+            // caller-injected via `http_client`), and never past the deadline.
+            let mut attempt_timeout = self.cfg.request_timeout;
+            if let Some(left) = remaining() {
+                if left.is_zero() {
+                    return Err(SendFailure::Unsent);
+                }
+                attempt_timeout = attempt_timeout.min(left);
+            }
 
             let mut req = self
                 .http
                 .post(&url)
                 .header("Authorization", format!("Bearer {}", self.cfg.write_key))
                 .header("Content-Type", "application/json")
-                // Telemetry must never wedge the host: bound every attempt
-                // even when the reqwest client itself has no timeout
-                // configured (e.g. caller-injected via `http_client`).
-                .timeout(self.cfg.request_timeout)
+                .timeout(attempt_timeout)
                 .body(payload.clone());
 
             if let Some(project_id) = &self.cfg.project_id {
@@ -290,6 +344,10 @@ impl RetryingHttpClient {
             let resp = match req.send().await {
                 Ok(r) => r,
                 Err(err) => {
+                    if remaining() == Some(Duration::ZERO) {
+                        // The deadline ended this request mid-flight.
+                        return Err(SendFailure::CutOff);
+                    }
                     last_err = Some(Error::Http(err.to_string()));
                     continue;
                 }
@@ -319,14 +377,16 @@ impl RetryingHttpClient {
             // A permanent rejection is never retried; the caller drops the
             // payload with a warning (CONTRACT 3, 15.1).
             if !is_retryable_status(status.as_u16()) {
-                return Err(err);
+                return Err(SendFailure::Failed(err));
             }
 
             // Retryable: retain retry_after for the next iteration's backoff.
             last_err = Some(WithRetryAfter::wrap(err, retry_after));
         }
 
-        Err(last_err.unwrap_or_else(|| Error::Http("unknown error".into())))
+        Err(SendFailure::Failed(
+            last_err.unwrap_or_else(|| Error::Http("unknown error".into())),
+        ))
     }
 
     fn spawn_local_mirror(&self, base_url: String, path: String, payload: Vec<u8>) {

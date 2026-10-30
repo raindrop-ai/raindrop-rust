@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use serde_json::Value;
@@ -12,6 +12,8 @@ use crate::client::ClientInner;
 use crate::error::Result;
 use crate::events::Attachment;
 use crate::helpers::{clone_map, merge_attachments, truncate_text_in_place};
+use crate::http::SendFailure;
+use crate::outbox::Undelivered;
 
 /// In-flight patch state for a single event id.
 #[derive(Debug, Default, Clone)]
@@ -216,32 +218,72 @@ impl EventBuffer {
         }
 
         if flush_now {
-            self.flush_one(client, event_id).await?;
+            let undelivered = self.flush_one(client, event_id, None).await;
+            if !undelivered.is_empty() {
+                return Err(crate::error::Error::Undelivered {
+                    count: undelivered.kept + undelivered.dropped,
+                    dropped: undelivered.dropped,
+                });
+            }
         }
         Ok(())
     }
 
-    /// Flush every buffered event (used on close + periodic timer).
+    /// Flush every buffered event (periodic timer): no deadline.
     pub(crate) async fn flush(self: &Arc<Self>, client: &Arc<ClientInner>) -> Result<()> {
+        let undelivered = self.flush_until(client, None).await;
+        if undelivered.is_empty() {
+            Ok(())
+        } else {
+            Err(crate::error::Error::Undelivered {
+                count: undelivered.kept + undelivered.dropped,
+                dropped: undelivered.dropped,
+            })
+        }
+    }
+
+    /// Flush every buffered event, bounded by `deadline` (CONTRACT 1.2.1).
+    /// Updates never sent before it stay buffered; one cut off mid-request
+    /// is dropped with a warning, since it may already have reached ingest.
+    pub(crate) async fn flush_until(
+        self: &Arc<Self>,
+        client: &Arc<ClientInner>,
+        deadline: Option<Instant>,
+    ) -> Undelivered {
         let ids: Vec<String> = {
             let state = self.state.lock().await;
             state.buffers.keys().cloned().collect()
         };
-        let mut first_err: Option<crate::error::Error> = None;
+        let mut tally = Undelivered::default();
         for id in ids {
-            if let Err(err) = self.flush_one(client, &id).await {
-                if first_err.is_none() {
-                    first_err = Some(err);
-                }
-            }
+            tally.add(self.flush_one(client, &id, deadline).await);
         }
-        match first_err {
-            Some(err) => Err(err),
-            None => Ok(()),
-        }
+        tally
     }
 
-    async fn flush_one(self: &Arc<Self>, client: &Arc<ClientInner>, event_id: &str) -> Result<()> {
+    /// Drop every buffered update (end of `close()`), with a warning.
+    pub(crate) async fn drop_all(self: &Arc<Self>) -> usize {
+        let left = {
+            let mut state = self.state.lock().await;
+            let n = state.buffers.len();
+            state.buffers.clear();
+            n
+        };
+        if left > 0 {
+            tracing::warn!(
+                events = left,
+                "raindrop: close() deadline passed; dropping interaction updates that were not sent"
+            );
+        }
+        left
+    }
+
+    async fn flush_one(
+        self: &Arc<Self>,
+        client: &Arc<ClientInner>,
+        event_id: &str,
+        deadline: Option<Instant>,
+    ) -> Undelivered {
         let (patch, sticky) = {
             let mut state = self.state.lock().await;
             match state.buffers.remove(event_id) {
@@ -249,7 +291,7 @@ impl EventBuffer {
                     let sticky = state.sticky.get(event_id).cloned().unwrap_or_default();
                     (p, sticky)
                 }
-                None => return Ok(()),
+                None => return Undelivered::default(),
             }
         };
 
@@ -270,7 +312,7 @@ impl EventBuffer {
                     state.sticky.remove(event_id);
                     client.app_git_operations.remove(event_id);
                 }
-                return Ok(());
+                return Undelivered::default();
             }
             None => {
                 // Cannot ship yet (missing user_id): restore until a user
@@ -283,7 +325,7 @@ impl EventBuffer {
                     );
                 }
                 self.restore(client, event_id, patch).await;
-                return Ok(());
+                return Undelivered::default();
             }
         };
 
@@ -318,27 +360,28 @@ impl EventBuffer {
 
         match client
             .transport
-            .post_json("events/track_partial", &payload)
+            .post_json_until("events/track_partial", &payload, deadline)
             .await
         {
-            Ok(_) => {
+            Ok(()) => {
                 if payload.is_pending {
-                    return Ok(());
+                    return Undelivered::default();
                 }
                 let mut state = self.state.lock().await;
                 if !state.buffers.contains_key(event_id) {
                     state.sticky.remove(event_id);
                     client.app_git_operations.remove(event_id);
                 }
-                Ok(())
+                Undelivered::default()
             }
-            Err(err) if crate::http::is_permanent_rejection(&err) => {
+            Err(failure) if failure.is_permanent_rejection() => {
                 // Never retried or restored: ingest refused the payload for
-                // good (CONTRACT 3, 15.1).
+                // good (CONTRACT 3, 15.1). Delivered and rejected, so not a
+                // flush failure.
                 if crate::helpers::should_log_rate_limited("partial_rejected") {
                     tracing::warn!(
                         event_id,
-                        error = %err,
+                        error = %failure.into_error(),
                         "raindrop: ingest rejected an event update; dropping it (logged at most \
                          once per 30s)"
                     );
@@ -348,11 +391,30 @@ impl EventBuffer {
                     state.sticky.remove(event_id);
                     client.app_git_operations.remove(event_id);
                 }
-                Ok(())
+                Undelivered::default()
             }
-            Err(err) => {
+            Err(SendFailure::CutOff) => {
+                // It may already have reached ingest: dropped, not resent
+                // (CONTRACT 1.2.1).
+                if crate::helpers::should_log_rate_limited("partial_cut_off") {
+                    tracing::warn!(
+                        event_id,
+                        "raindrop: an event update was cut off at the deadline; dropping it \
+                         (logged at most once per 30s)"
+                    );
+                }
+                Undelivered {
+                    kept: 0,
+                    dropped: 1,
+                }
+            }
+            Err(_) => {
+                // Never sent, or retries ran out: kept for a later flush.
                 self.restore(client, event_id, patch).await;
-                Err(err)
+                Undelivered {
+                    kept: 1,
+                    dropped: 0,
+                }
             }
         }
     }

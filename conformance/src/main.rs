@@ -36,7 +36,7 @@ use raindrop::{
     ToolOptions, TrackToolOptions, User,
 };
 
-const DRIVER_VERSION: &str = "1.1.0";
+const DRIVER_VERSION: &str = "1.2.0";
 const PROTOCOL: u64 = 1;
 const SDK_NAME: &str = "raindrop-rust";
 
@@ -78,6 +78,12 @@ const CAPABILITIES: &[&str] = &[
     "traces.span_parent",
     "subagents.detached_dispatch",
     "subagents.detached_child",
+    // init.flush_timeout_ms -> ClientBuilder::flush_timeout, the one
+    // flush()/close() deadline (CONTRACT 1.2.1).
+    "lifecycle.flush_timeout",
+    // `wait`: sleep without an SDK call, so background delivery is
+    // observable without an explicit flush.
+    "timing.wait",
 ];
 const NOT_APPLICABLE: &[&str] = &["wrapper.capture", "events.track_ai_partial"];
 // A not_applicable claim must argue "not fixable" (README policy).
@@ -252,6 +258,7 @@ impl Driver {
             "signal" => self.step_signal(&args).await.map_err(StepError::from),
             "flush" => self.step_flush().await.map_err(StepError::from),
             "close" => self.step_close().await.map_err(StepError::from),
+            "wait" => step_wait(&args).await.map_err(StepError::from),
             // Anything unknown takes the exit-3 unsupported path.
             other => Err(Unsupported(other.to_string()).into()),
         }
@@ -294,6 +301,14 @@ impl Driver {
             }
         }
         builder = configure_app_git(builder, args)?;
+        if let Some(raw) = args.get("flush_timeout_ms") {
+            let ms = raw.as_u64().filter(|ms| *ms > 0).ok_or_else(|| {
+                Failure(format!(
+                    "init: flush_timeout_ms must be a positive integer, got {raw}"
+                ))
+            })?;
+            builder = builder.flush_timeout(std::time::Duration::from_millis(ms));
+        }
         let client = builder
             .build()
             .map_err(|e| Failure(format!("init: cannot build client: {e}")))?;
@@ -302,10 +317,7 @@ impl Driver {
     }
 
     async fn step_flush(&self) -> Result<(), Failure> {
-        self.client()?
-            .flush()
-            .await
-            .map_err(|e| Failure(format!("flush: {e}")))
+        ignore_undelivered(self.client()?.flush().await).map_err(|e| Failure(format!("flush: {e}")))
     }
 
     async fn step_close(&self) -> Result<(), Failure> {
@@ -574,10 +586,28 @@ impl Driver {
             properties: properties(args, "properties"),
             attachments: attachments(args, "finish")?,
         };
-        interaction
-            .finish(opts)
-            .await
+        ignore_undelivered(interaction.finish(opts).await)
             .map_err(|e| Failure(format!("finish: {e}")))
+    }
+}
+
+/// Hold the process for `ms` milliseconds without an SDK call.
+async fn step_wait(args: &Map<String, Value>) -> Result<(), Failure> {
+    let ms = args
+        .get("ms")
+        .and_then(Value::as_f64)
+        .filter(|ms| *ms > 0.0)
+        .ok_or_else(|| Failure("wait: arg \"ms\" must be a positive number".into()))?;
+    tokio::time::sleep(std::time::Duration::from_secs_f64(ms / 1000.0)).await;
+    Ok(())
+}
+
+/// `Error::Undelivered` is safe to ignore by contract (CONTRACT 1.2.1): the
+/// SDK has warned, and the scenario asserts what reached the wire.
+fn ignore_undelivered(result: raindrop::Result<()>) -> raindrop::Result<()> {
+    match result {
+        Err(raindrop::Error::Undelivered { .. }) => Ok(()),
+        other => other,
     }
 }
 
@@ -652,6 +682,7 @@ fn configure_app_git(
 /// `RAINDROP_HARNESS_LOG`.
 struct HarnessLog {
     path: String,
+    lock: std::sync::Mutex<()>,
 }
 
 #[derive(Default)]
@@ -696,14 +727,21 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for HarnessLog {
         if !visitor.fields.is_empty() {
             message = format!("{message} ({})", visitor.fields.join(", "));
         }
-        let line = json!({ "level": level, "message": message }).to_string();
+        let mut line = json!({ "level": level, "message": message }).to_string();
+        line.push('\n');
+        // One locked write per record: events from several threads must not
+        // interleave inside a line, or the runner cannot parse it.
+        let _guard = self
+            .lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Ok(mut file) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&self.path)
         {
             use std::io::Write;
-            let _ = writeln!(file, "{line}");
+            let _ = file.write_all(line.as_bytes());
         }
     }
 }
@@ -712,7 +750,10 @@ fn capture_sdk_logs() {
     use tracing_subscriber::layer::SubscriberExt;
     if let Ok(path) = std::env::var("RAINDROP_HARNESS_LOG") {
         if !path.trim().is_empty() {
-            let subscriber = tracing_subscriber::registry().with(HarnessLog { path });
+            let subscriber = tracing_subscriber::registry().with(HarnessLog {
+                path,
+                lock: std::sync::Mutex::new(()),
+            });
             let _ = tracing::subscriber::set_global_default(subscriber);
         }
     }

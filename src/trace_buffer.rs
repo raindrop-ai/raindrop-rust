@@ -1,12 +1,14 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::{Mutex, Notify};
 
 use crate::client::ClientInner;
 use crate::error::Result;
+use crate::http::SendFailure;
 use crate::otlp::{build_export_request, OtlpSpan};
+use crate::outbox::Undelivered;
 
 /// Bounded, batched OTLP/JSON span buffer.
 pub(crate) struct TraceBuffer {
@@ -65,21 +67,91 @@ impl TraceBuffer {
     }
 
     pub(crate) async fn flush(self: &Arc<Self>, client: &Arc<ClientInner>) -> Result<()> {
+        let undelivered = self.flush_until(client, None).await;
+        if undelivered.is_empty() {
+            Ok(())
+        } else {
+            Err(crate::error::Error::Undelivered {
+                count: undelivered.kept + undelivered.dropped,
+                dropped: undelivered.dropped,
+            })
+        }
+    }
+
+    /// Send queued spans, bounded by `deadline` (CONTRACT 1.2.1). A batch
+    /// never sent stays queued; one cut off mid-request, or permanently
+    /// rejected, is dropped.
+    pub(crate) async fn flush_until(
+        self: &Arc<Self>,
+        client: &Arc<ClientInner>,
+        deadline: Option<Instant>,
+    ) -> Undelivered {
         loop {
             let batch = self.take_batch().await;
             if batch.is_empty() {
-                return Ok(());
+                return Undelivered::default();
             }
             let payload =
                 build_export_request(batch.clone(), &client.service_name, &client.version);
-            match client.transport.post_json("traces", &payload).await {
-                Ok(_) => continue,
-                Err(err) => {
+            match client
+                .transport
+                .post_json_until("traces", &payload, deadline)
+                .await
+            {
+                Ok(()) => continue,
+                Err(failure) if failure.is_permanent_rejection() => {
+                    // Resending would fail the same way forever, so drop it
+                    // rather than block later spans. Delivered and rejected:
+                    // not a flush failure.
+                    if crate::helpers::should_log_rate_limited("traces_rejected") {
+                        tracing::warn!(
+                            spans = batch.len(),
+                            error = %failure.into_error(),
+                            "raindrop: ingest rejected a trace batch; dropping it (logged at most \
+                             once per 30s)"
+                        );
+                    }
+                    continue;
+                }
+                Err(SendFailure::CutOff) => {
+                    if crate::helpers::should_log_rate_limited("traces_cut_off") {
+                        tracing::warn!(
+                            spans = batch.len(),
+                            "raindrop: a trace batch was cut off at the deadline; dropping it \
+                             (logged at most once per 30s)"
+                        );
+                    }
+                    let kept = self.state.lock().await.len();
+                    return Undelivered {
+                        kept,
+                        dropped: batch.len(),
+                    };
+                }
+                Err(_) => {
+                    let n = batch.len();
                     self.restore_batch(batch).await;
-                    return Err(err);
+                    let kept = self.state.lock().await.len().max(n);
+                    return Undelivered { kept, dropped: 0 };
                 }
             }
         }
+    }
+
+    /// Drop every queued span (end of `close()`), with a warning.
+    pub(crate) async fn drop_all(&self) -> usize {
+        let left = {
+            let mut queue = self.state.lock().await;
+            let n = queue.len();
+            queue.clear();
+            n
+        };
+        if left > 0 {
+            tracing::warn!(
+                spans = left,
+                "raindrop: close() deadline passed; dropping spans that were not sent"
+            );
+        }
+        left
     }
 
     async fn take_batch(&self) -> Vec<OtlpSpan> {

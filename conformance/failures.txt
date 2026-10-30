@@ -1,3 +1,0 @@
-hang-request-deadline@fault: missing_feature  # flush() is bounded by its 10 s deadline (ClientBuilder::flush_timeout, the CONTRACT 1.2 default), longer than this scenario's 3 s budget, so the driver is killed first.
-retry-after-cap@fault: missing_feature  # Retry-After is capped at 30 s (the CONTRACT 3 norm, same as raindrop-swift and python-sdk); the retry waits past this scenario's 2 s budget.
-shutdown-drain-hang-deadline@fault: missing_feature  # close() is bounded by its 10 s deadline (ClientBuilder::close_timeout, the CONTRACT 1.2 default), longer than this scenario's 3 s budget.

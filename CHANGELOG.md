@@ -14,7 +14,12 @@ conformance harness.
   identity this process knows. `resume_interaction` still works and now sends
   updates without a `user_id`; ingest keeps the user it already has (a warning
   is logged).
-- **`ClientBuilder::flush_timeout`** (default 10s) bounds `flush()`.
+- **`ClientBuilder::flush_timeout`** (default 10s) is the one deadline for
+  `flush()` and `close()`; each request's timeout is clamped to what is left
+  of it. `close_timeout` still works and now defaults to `flush_timeout`.
+- **`Error::Undelivered { count, dropped }`**: `flush()` returns it when
+  something enqueued before the call was not delivered by the deadline. It is
+  safe to ignore; log it rather than propagating it with `?`.
 - **`Span::from_saved_ids(trace_id, span_id)`** turns saved hex ids into a
   parent for new spans, so tool spans recorded later (or in another process)
   attach to the right trace.
@@ -28,6 +33,18 @@ conformance harness.
 
 ### Changed
 
+- **`Error` is now `#[non_exhaustive]`.** Code that matches it exhaustively
+  needs a wildcard arm.
+- When the `flush()` deadline passes, payloads that were never sent (or were
+  waiting on a retry or `Retry-After`) stay queued instead of being dropped,
+  and `flush()` returns `Err(Error::Undelivered { .. })` instead of `Ok(())`.
+  A request cut off mid-flight is dropped, not resent. `close()` drops what is
+  left at its deadline, with a warning, and still returns `Ok(())`. A payload
+  ingest rejects permanently is not a flush error.
+- `Interaction::finish` returns `Err(Error::Undelivered { .. })` when its
+  final update could not be delivered (it stays queued); safe to ignore.
+- README and examples log `flush()`/`close()` errors instead of propagating
+  them with `?`.
 - `track_event`, `track_ai`, `track_signal` and `identify` queue and return
   immediately instead of waiting for delivery. Events and AI events are sent
   in batches to `events/track`, signals to `signals/track`; the queue is sent
