@@ -113,6 +113,10 @@ jobs:
           HEAD_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
+          if [ -z "${SLACK_WEBHOOK_URL}" ]; then
+            echo "::error::Repository secret SLACK_CODEQL_WEBHOOK_URL is empty or not set; cannot post alerts to Slack."
+            exit 1
+          fi
           while IFS= read -r alert; do
             payload="$(jq -n --argjson a "$alert" --arg repo "$REPO" --arg sha "$HEAD_SHA" '{
               text: (
@@ -138,6 +142,16 @@ jobs:
           HEAD_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
+          missing=0
+          if [ -z "${DEVIN_WEBHOOK_URL}" ]; then
+            echo "::error::Repository secret DEVIN_CODEQL_WEBHOOK_URL is empty or not set; cannot notify the Devin triage webhook."
+            missing=1
+          fi
+          if [ -z "${DEVIN_WEBHOOK_SECRET}" ]; then
+            echo "::error::Repository secret DEVIN_CODEQL_WEBHOOK_SECRET is empty or not set; cannot notify the Devin triage webhook."
+            missing=1
+          fi
+          [ "$missing" -eq 0 ] || exit 1
           while IFS= read -r alert; do
             payload="$(jq -n --argjson a "$alert" --arg repo "$REPO" --arg sha "$HEAD_SHA" '{
               source: "codeql",
@@ -156,3 +170,21 @@ jobs:
               -H "Authorization: Bearer ${DEVIN_WEBHOOK_SECRET}" \
               --data "$payload" "$DEVIN_WEBHOOK_URL" > /dev/null
           done < <(jq -c '.[]' alerts.json)
+
+      - name: Check relay secrets
+        # Runs on every push, not only when alerts exist, so a missing secret surfaces before an alert is dropped.
+        if: ${{ !cancelled() }}
+        env:
+          SLACK_CODEQL_WEBHOOK_URL: ${{ secrets.SLACK_CODEQL_WEBHOOK_URL }}
+          DEVIN_CODEQL_WEBHOOK_URL: ${{ secrets.DEVIN_CODEQL_WEBHOOK_URL }}
+          DEVIN_CODEQL_WEBHOOK_SECRET: ${{ secrets.DEVIN_CODEQL_WEBHOOK_SECRET }}
+        run: |
+          set -euo pipefail
+          missing=0
+          for name in SLACK_CODEQL_WEBHOOK_URL DEVIN_CODEQL_WEBHOOK_URL DEVIN_CODEQL_WEBHOOK_SECRET; do
+            if [ -z "${!name}" ]; then
+              echo "::error::Repository secret ${name} is empty or not set; the CodeQL alert relay cannot deliver alerts."
+              missing=1
+            fi
+          done
+          exit "$missing"
