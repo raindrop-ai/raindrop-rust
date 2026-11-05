@@ -4,6 +4,66 @@ All notable changes to this crate are documented here. Format follows [Keep a Ch
 
 ## [Unreleased]
 
+Brings the SDK in line with the cross-SDK behaviour contract checked by the
+conformance harness.
+
+### Added
+
+- **`Client::resume_interaction_with(event_id, ResumeOptions)`** continues an
+  event begun elsewhere (for example in another process) with whatever
+  identity this process knows. `resume_interaction` still works and now sends
+  updates without a `user_id`; ingest keeps the user it already has (a warning
+  is logged).
+- **`ClientBuilder::flush_timeout`** (default 10s) is the one deadline for
+  `flush()` and `close()`; each request's timeout is clamped to what is left
+  of it. `close_timeout` still works and now defaults to `flush_timeout`.
+- **`Error::Undelivered { count, dropped }`**: `flush()` returns it when
+  something enqueued before the call was not delivered by the deadline. It is
+  safe to ignore; log it rather than propagating it with `?`.
+- **`Span::from_saved_ids(trace_id, span_id)`** turns saved hex ids into a
+  parent for new spans, so tool spans recorded later (or in another process)
+  attach to the right trace.
+- **Detached sub-agents.** `Interaction::subagent(SubagentOptions)` records a
+  dispatch span on the launcher's event and returns the carrier headers
+  (`x-raindrop-handoff`, `baggage`, `traceparent`) for the child;
+  `Client::resume_subagent(headers, ResumeSubagentOptions)` opens the child's
+  own event from those headers (from any Raindrop SDK), and every span it
+  records links back to the launcher. A missing or unreadable carrier never
+  fails the child: it runs unlinked.
+
+### Changed
+
+- **`Error` is now `#[non_exhaustive]`.** Code that matches it exhaustively
+  needs a wildcard arm.
+- When the `flush()` deadline passes, payloads that were never sent (or were
+  waiting on a retry or `Retry-After`) stay queued instead of being dropped,
+  and `flush()` returns `Err(Error::Undelivered { .. })` instead of `Ok(())`.
+  A request cut off mid-flight is dropped, not resent. `close()` drops what is
+  left at its deadline, with a warning, and still returns `Ok(())`. A payload
+  ingest rejects permanently is not a flush error.
+- `Interaction::finish` keeps returning `Ok(())` when its final update could
+  not be delivered: it logs a warning and the update stays queued (or is
+  dropped if it was cut off mid-request). Only `flush()` reports undelivered
+  payloads in its return value.
+- README and examples log `flush()`/`close()` errors instead of propagating
+  them with `?`.
+- `track_event`, `track_ai`, `track_signal` and `identify` queue and return
+  immediately instead of waiting for delivery. Events and AI events are sent
+  in batches to `events/track`, signals to `signals/track`; the queue is sent
+  periodically, on `flush()` and on `close()`.
+- Every interaction update carries the event's start time (first value wins;
+  an earlier explicit timestamp replaces it) instead of the send time.
+- Retries cover `408`, `429` and `5xx`. `Retry-After` is capped at 30s, and a
+  `429`/`503` with `Retry-After` pauses all sends for that long. Other `4xx`
+  responses are dropped with a warning instead of being retried later.
+- The client-side 1 MiB request limit is removed; ingest decides.
+- Finished events with no input or output are sent (with a rate-limited
+  warning) instead of being dropped. Finishing an event twice and items ingest
+  reports as `rejected` or with `warnings` are logged as warnings.
+- Events without a `user_id` are dropped with a warning (`track_event`,
+  `track_ai`, finished interactions) or held until one is set (pending
+  interactions).
+
 ## [0.0.8] - 2026-06-26
 
 ### Added

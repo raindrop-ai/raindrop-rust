@@ -29,7 +29,10 @@
 //!     })
 //!     .await?;
 //!
-//! client.close().await?;
+//! // Telemetry errors are safe to ignore: log them, don't fail on them.
+//! if let Err(err) = client.close().await {
+//!     eprintln!("raindrop: {err}");
+//! }
 //! # Ok(())
 //! # }
 //! ```
@@ -46,8 +49,10 @@ mod helpers;
 mod http;
 mod local_debugger;
 mod otlp;
+mod outbox;
 mod project_id;
 mod signals;
+mod subagent;
 mod trace_buffer;
 mod traces;
 mod users;
@@ -57,6 +62,7 @@ pub use client::{Client, ClientBuilder};
 pub use error::{Error, Result};
 pub use events::{
     AiEvent, Attachment, BeginOptions, Event, FinishOptions, Interaction, PatchOptions,
+    ResumeOptions,
 };
 pub use local_debugger::{
     resolve_local_workshop_url, LocalWorkshopUrlConfig, DEFAULT_LOCAL_WORKSHOP_URL,
@@ -64,6 +70,7 @@ pub use local_debugger::{
 };
 pub use otlp::{Attribute, AttributeValue, SpanStatusCode};
 pub use signals::{Signal, SignalKind};
+pub use subagent::{ResumeSubagentOptions, SubagentDispatch, SubagentOptions, HANDOFF_HEADER};
 pub use traces::{
     with_tool, with_tool_async, LlmMessage, LlmOptions, LlmSpan, Span, SpanOptions, ToolOptions,
     ToolSpan, Tracer, TrackToolOptions,

@@ -3,8 +3,8 @@
 //! Class A — payload caps BEFORE serialization: AI input/output, tool span
 //! I/O, and LLM span content are truncated (marker within the limit) before
 //! they are buffered or serialized, so oversized payloads cost the cap — not
-//! the payload — and land truncated instead of being silently dropped at the
-//! 1 MiB ingest limit.
+//! the payload — and land truncated. The SDK applies no request size limit of
+//! its own; ingest decides what it accepts.
 //!
 //! Class B — bounded outbound HTTP and shutdown: every cloud POST carries a
 //! per-request timeout (even for caller-injected reqwest clients), `flush()`
@@ -12,8 +12,8 @@
 //! `close()` runs under a hard deadline so a dead network can never wedge
 //! process exit.
 //!
-//! Class D — log hygiene: per-event failure warnings (oversized drops,
-//! empty-event drops) are rate-limited to one line per family per interval.
+//! Class D — log hygiene: per-event warnings (for example empty finished
+//! events) are rate-limited to one line per family per interval.
 
 mod common;
 
@@ -26,7 +26,7 @@ use wiremock::MockServer;
 
 use raindrop::{AiEvent, BeginOptions, FinishOptions, LlmMessage, LlmOptions, ToolOptions};
 
-use crate::common::{fast_client_builder, mount_path, span_attr, spans_of};
+use crate::common::{fast_client_builder, items, mount_path, span_attr, spans_of};
 
 const MARKER: &str = "...[truncated by raindrop]";
 
@@ -49,7 +49,7 @@ fn attr_str(span: &Value, key: &str) -> String {
 #[tokio::test]
 async fn track_ai_caps_huge_input_and_output_with_marker() {
     let server = MockServer::start().await;
-    let recorder = mount_path(&server, "POST", "/events/track_partial").await;
+    let recorder = mount_path(&server, "POST", "/events/track").await;
     let client = fast_client_builder(&server)
         .max_text_field_chars(1_000)
         .build()
@@ -67,8 +67,9 @@ async fn track_ai_caps_huge_input_and_output_with_marker() {
         .expect("track_ai");
     let _ = client.close().await;
 
-    assert_eq!(recorder.count(), 1, "capped event must still ship");
-    let payload = recorder.requests()[0].json();
+    let sent = items(&recorder);
+    assert_eq!(sent.len(), 1, "capped event must still ship");
+    let payload = sent[0].clone();
     let input = payload["ai_data"]["input"].as_str().unwrap();
     let output = payload["ai_data"]["output"].as_str().unwrap();
     assert_eq!(chars(input), 1_000, "marker must fit WITHIN the cap");
@@ -116,7 +117,7 @@ async fn begin_finish_caps_output_before_buffering() {
 #[tokio::test]
 async fn cap_smaller_than_marker_hard_slices_without_marker() {
     let server = MockServer::start().await;
-    let recorder = mount_path(&server, "POST", "/events/track_partial").await;
+    let recorder = mount_path(&server, "POST", "/events/track").await;
     let client = fast_client_builder(&server)
         .max_text_field_chars(10)
         .build()
@@ -134,7 +135,7 @@ async fn cap_smaller_than_marker_hard_slices_without_marker() {
         .expect("track_ai");
     let _ = client.close().await;
 
-    let payload = recorder.requests()[0].json();
+    let payload = items(&recorder)[0].clone();
     assert_eq!(payload["ai_data"]["input"], "x".repeat(10));
     assert_eq!(payload["ai_data"]["output"], "y".repeat(10));
 }
@@ -142,7 +143,7 @@ async fn cap_smaller_than_marker_hard_slices_without_marker() {
 #[tokio::test]
 async fn small_payloads_round_trip_unchanged() {
     let server = MockServer::start().await;
-    let recorder = mount_path(&server, "POST", "/events/track_partial").await;
+    let recorder = mount_path(&server, "POST", "/events/track").await;
     let client = fast_client_builder(&server).build().expect("build");
 
     client
@@ -157,7 +158,7 @@ async fn small_payloads_round_trip_unchanged() {
         .expect("track_ai");
     let _ = client.close().await;
 
-    let payload = recorder.requests()[0].json();
+    let payload = items(&recorder)[0].clone();
     assert_eq!(payload["ai_data"]["input"], "What is 2+2?");
     assert_eq!(payload["ai_data"]["output"], "The answer is 4.");
 }
@@ -165,7 +166,7 @@ async fn small_payloads_round_trip_unchanged() {
 #[tokio::test]
 async fn multibyte_payloads_cap_on_char_boundaries() {
     let server = MockServer::start().await;
-    let recorder = mount_path(&server, "POST", "/events/track_partial").await;
+    let recorder = mount_path(&server, "POST", "/events/track").await;
     let client = fast_client_builder(&server)
         .max_text_field_chars(100)
         .build()
@@ -183,7 +184,7 @@ async fn multibyte_payloads_cap_on_char_boundaries() {
         .expect("track_ai");
     let _ = client.close().await;
 
-    let payload = recorder.requests()[0].json();
+    let payload = items(&recorder)[0].clone();
     let input = payload["ai_data"]["input"].as_str().unwrap();
     assert_eq!(chars(input), 100);
     assert!(input.ends_with(MARKER));
@@ -525,22 +526,25 @@ async fn request_timeout_bounds_caller_injected_client_without_timeouts() {
         .build()
         .expect("build");
 
-    let start = std::time::Instant::now();
-    let res = tokio::time::timeout(
-        Duration::from_secs(10),
-        client.track_ai(AiEvent {
+    client
+        .track_ai(AiEvent {
             event_id: "evt_timeout".into(),
             user_id: "user-123".into(),
             input: "hi".into(),
             output: "ok".into(),
             ..Default::default()
-        }),
-    )
-    .await;
+        })
+        .await
+        .expect("track_ai only queues");
+
+    let start = std::time::Instant::now();
+    let res = tokio::time::timeout(Duration::from_secs(10), client.flush()).await;
     let elapsed = start.elapsed();
 
-    let send_result = res.expect("send must not hang: per-request timeout applies");
-    assert!(send_result.is_err(), "hung server must surface as an error");
+    assert!(
+        res.is_ok(),
+        "flush must not hang: per-request timeout applies"
+    );
     assert!(
         elapsed < Duration::from_secs(5),
         "2 attempts with a 200ms request timeout took {elapsed:?}"
@@ -679,52 +683,43 @@ where
     String::from_utf8(captured).expect("utf8 logs")
 }
 
-#[test]
-fn oversized_payload_drop_warning_is_rate_limited() {
-    // Oversized payloads are dropped in post_json BEFORE any HTTP request, so
-    // no mock server is needed. Properties are deliberately uncapped (parity
-    // with the python-sdk), which is exactly how a payload still exceeds the
-    // 1 MiB ingest limit after text-field caps.
-    let logs = capture_warn_logs(|| async {
-        let client = raindrop::Client::builder()
-            .write_key("rk_test")
-            .disable_local_workshop()
-            .partial_flush_interval(Duration::ZERO)
-            .trace_flush_interval(Duration::ZERO)
-            .build()
-            .expect("build");
-        for i in 0..5 {
-            let mut props = BTreeMap::new();
-            props.insert("blob".to_string(), json!("x".repeat(2 * 1024 * 1024)));
-            client
-                .track_ai(AiEvent {
-                    event_id: format!("evt_oversized_{i}"),
-                    user_id: "user-123".into(),
-                    input: "hi".into(),
-                    output: "ok".into(),
-                    properties: props,
-                    ..Default::default()
-                })
-                .await
-                .expect("oversized payloads are dropped, not errors");
-        }
-    });
+#[tokio::test]
+async fn large_payloads_are_sent_without_a_client_size_cap() {
+    // The SDK applies no request size limit of its own; ingest decides.
+    // Properties are uncapped, so this body is well over 1 MiB.
+    let server = MockServer::start().await;
+    let recorder = mount_path(&server, "POST", "/events/track").await;
+    let client = fast_client_builder(&server).build().expect("build");
+    let mut props = BTreeMap::new();
+    props.insert("blob".to_string(), json!("x".repeat(2 * 1024 * 1024)));
+    client
+        .track_ai(AiEvent {
+            event_id: "evt_large".into(),
+            user_id: "user-123".into(),
+            input: "hi".into(),
+            output: "ok".into(),
+            properties: props,
+            ..Default::default()
+        })
+        .await
+        .expect("track_ai");
+    let _ = client.close().await;
 
+    let sent = items(&recorder);
+    assert_eq!(sent.len(), 1, "large payload must be sent");
     assert_eq!(
-        logs.matches("dropping oversized payload").count(),
-        1,
-        "expected exactly one rate-limited warning for 5 drops, logs: {logs}"
+        sent[0]["properties"]["blob"].as_str().map(str::len),
+        Some(2 * 1024 * 1024)
     );
 }
 
 #[test]
-fn empty_ai_event_drop_warning_is_rate_limited() {
-    // Empty finalized events are dropped at the buffer BEFORE any HTTP
-    // request, so no mock server is needed.
+fn empty_finish_warning_is_rate_limited() {
+    // Empty finished events are still sent, with one rate-limited warning.
     let logs = capture_warn_logs(|| async {
-        let client = raindrop::Client::builder()
-            .write_key("rk_test")
-            .disable_local_workshop()
+        let server = MockServer::start().await;
+        let _recorder = mount_path(&server, "POST", "/events/track_partial").await;
+        let client = fast_client_builder(&server)
             .partial_flush_interval(Duration::ZERO)
             .trace_flush_interval(Duration::ZERO)
             .build()
@@ -740,14 +735,15 @@ fn empty_ai_event_drop_warning_is_rate_limited() {
             interaction
                 .finish(FinishOptions::default())
                 .await
-                .expect("empty events are dropped, not errors");
+                .expect("empty events are sent");
         }
     });
 
     assert_eq!(
-        logs.matches("empty ai_input and ai_output").count(),
+        logs.matches("event finished with no input, output or attachments")
+            .count(),
         1,
-        "expected exactly one rate-limited warning for 5 drops, logs: {logs}"
+        "expected exactly one rate-limited warning for 5 empty finishes, logs: {logs}"
     );
 }
 

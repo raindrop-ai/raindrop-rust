@@ -9,12 +9,12 @@ use wiremock::MockServer;
 
 use raindrop::{AiEvent, Attribute, SpanOptions};
 
-use crate::common::{fast_client_builder, mount_path, spans_of};
+use crate::common::{fast_client_builder, items, mount_path, spans_of};
 
 #[tokio::test]
 async fn concurrent_track_ai_calls_are_thread_safe() {
     let server = MockServer::start().await;
-    let recorder = mount_path(&server, "POST", "/events/track_partial").await;
+    let recorder = mount_path(&server, "POST", "/events/track").await;
     let client = Arc::new(fast_client_builder(&server).build().expect("build"));
 
     let mut handles = Vec::new();
@@ -36,7 +36,16 @@ async fn concurrent_track_ai_calls_are_thread_safe() {
         h.await.expect("task");
     }
     client.close().await.expect("close");
-    assert_eq!(recorder.count(), 32, "expected 32 distinct flushes");
+    // Concurrent calls are queued and coalesce into one events/track array.
+    let events = items(&recorder);
+    assert_eq!(events.len(), 32, "expected all 32 events");
+    let mut ids: Vec<&str> = events
+        .iter()
+        .filter_map(|e| e["event_id"].as_str())
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    assert_eq!(ids.len(), 32, "expected 32 distinct event ids");
 }
 
 #[tokio::test]
@@ -139,7 +148,7 @@ async fn signals_skip_when_disabled() {
 #[tokio::test]
 async fn json_property_values_pass_through_unchanged() {
     let server = MockServer::start().await;
-    let recorder = mount_path(&server, "POST", "/events/track_partial").await;
+    let recorder = mount_path(&server, "POST", "/events/track").await;
     let client = fast_client_builder(&server).build().expect("build");
 
     let mut props = BTreeMap::new();
@@ -162,7 +171,7 @@ async fn json_property_values_pass_through_unchanged() {
         .expect("track_ai");
     let _ = client.close().await;
 
-    let payload = recorder.requests().last().cloned().unwrap().json();
+    let payload = items(&recorder).last().cloned().unwrap();
     assert_eq!(payload["properties"]["metadata"]["tier"], "pro");
     assert_eq!(payload["properties"]["metadata"]["tokens"], 10);
     assert_eq!(payload["properties"]["metadata"]["active"], true);

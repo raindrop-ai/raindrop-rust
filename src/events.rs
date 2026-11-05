@@ -167,6 +167,25 @@ pub struct Interaction {
     /// matching the Python/Go/JS SDK shape that exposes interaction metadata to spans.
     pub(crate) event: String,
     pub(crate) app_git_context: Option<AppGitOperationContext>,
+    /// Continued by id ([`Client::resume_interaction`]): the event began
+    /// elsewhere, so updates carry only the identity supplied here.
+    pub(crate) resumed: bool,
+    /// Attributes added to every span this interaction records, such as the
+    /// hand-off link of a detached sub-agent's run (CONTRACT 13.2).
+    pub(crate) span_attributes: Vec<crate::otlp::Attribute>,
+}
+
+/// Identity to attach when continuing an event begun elsewhere, via
+/// [`Client::resume_interaction_with`]. Every field is optional: whatever is
+/// left empty is never sent, so ingest keeps the value it already stored.
+#[derive(Debug, Default, Clone)]
+pub struct ResumeOptions {
+    /// User id, when this process knows it.
+    pub user_id: String,
+    /// Conversation id, when this process knows it.
+    pub convo_id: String,
+    /// Event name, when this process knows it.
+    pub event: String,
 }
 
 impl Interaction {
@@ -179,22 +198,27 @@ impl Interaction {
             convo_id: String::new(),
             event: String::new(),
             app_git_context: None,
+            resumed: false,
+            span_attributes: Vec::new(),
         }
     }
 
-    /// Internal constructor for resumed/standalone interactions where only `event_id` is known.
-    pub(crate) fn new(
+    /// Internal constructor for interactions continued by id (CONTRACT 9.2).
+    pub(crate) fn resumed(
         client: Client,
         event_id: String,
+        identity: ResumeOptions,
         app_git_context: AppGitOperationContext,
     ) -> Self {
         Self {
             client: Some(client),
             event_id,
-            user_id: String::new(),
-            convo_id: String::new(),
-            event: String::new(),
+            user_id: identity.user_id,
+            convo_id: identity.convo_id,
+            event: identity.event,
             app_git_context: Some(app_git_context),
+            resumed: true,
+            span_attributes: Vec::new(),
         }
     }
 
@@ -215,6 +239,8 @@ impl Interaction {
             convo_id,
             event,
             app_git_context: Some(app_git_context),
+            resumed: false,
+            span_attributes: Vec::new(),
         }
     }
 
@@ -231,8 +257,27 @@ impl Interaction {
     /// Apply a patch to this interaction.
     pub async fn patch(&self, opts: PatchOptions) -> Result<()> {
         if let Some(client) = &self.client {
+            let mut opts = opts;
+            if self.resumed {
+                // Identity given at resume rides on the first update this
+                // process sends; empty fields are never sent.
+                if opts.user_id.is_empty() {
+                    opts.user_id = self.user_id.clone();
+                }
+                if opts.convo_id.is_empty() {
+                    opts.convo_id = self.convo_id.clone();
+                }
+                if opts.event.is_empty() {
+                    opts.event = self.event.clone();
+                }
+            }
             client
-                .patch_with_app_git_context(&self.event_id, opts, self.app_git_context.clone())
+                .patch_with_app_git_context(
+                    &self.event_id,
+                    opts,
+                    self.app_git_context.clone(),
+                    self.resumed,
+                )
                 .await
         } else {
             Ok(())
@@ -296,6 +341,7 @@ impl Interaction {
                     &self.convo_id,
                     &self.event,
                     self.app_git_context.clone(),
+                    self.resumed,
                 )
                 .await;
             res
@@ -316,10 +362,12 @@ impl Interaction {
             opts.event_id = self.event_id.clone();
         }
         self.inject_association_properties(&mut opts.properties);
-        match &self.client {
+        let span = match &self.client {
             Some(client) => client.start_span_with_app_git(opts, self.app_git_snapshot()),
             None => Span::noop(),
-        }
+        };
+        self.apply_span_attributes(&span);
+        span
     }
 
     /// Start a manually-managed tool span linked to this interaction's event id.
@@ -328,7 +376,7 @@ impl Interaction {
     /// `user_id` and `convo_id` association properties.
     pub fn start_tool_span(&self, name: impl Into<String>, mut opts: ToolOptions) -> ToolSpan {
         self.inject_association_properties(&mut opts.properties);
-        match &self.client {
+        let span = match &self.client {
             Some(client) => client.start_tool_span_with_app_git(
                 name,
                 opts,
@@ -336,7 +384,9 @@ impl Interaction {
                 self.app_git_snapshot(),
             ),
             None => ToolSpan::noop(),
-        }
+        };
+        self.apply_span_attributes(span.span());
+        span
     }
 
     /// Start a manually-managed LLM span linked to this interaction's event id.
@@ -345,7 +395,7 @@ impl Interaction {
     /// `user_id` and `convo_id` association properties.
     pub fn start_llm_span(&self, name: impl Into<String>, mut opts: LlmOptions) -> LlmSpan {
         self.inject_association_properties(&mut opts.properties);
-        match &self.client {
+        let span = match &self.client {
             Some(client) => client.start_llm_span_with_app_git(
                 name,
                 opts,
@@ -353,7 +403,9 @@ impl Interaction {
                 self.app_git_snapshot(),
             ),
             None => LlmSpan::noop(),
-        }
+        };
+        self.apply_span_attributes(span.span());
+        span
     }
 
     /// Inject the interaction's sticky `user_id`, `convo_id`, and `event` into a properties
@@ -375,6 +427,12 @@ impl Interaction {
             properties
                 .entry("event".to_string())
                 .or_insert_with(|| Value::String(self.event.clone()));
+        }
+    }
+
+    fn apply_span_attributes(&self, span: &Span) {
+        if !self.span_attributes.is_empty() {
+            span.set_attributes(self.span_attributes.iter().cloned());
         }
     }
 
@@ -414,7 +472,12 @@ impl Interaction {
     pub fn track_tool(&self, mut opts: TrackToolOptions) {
         if let Some(client) = &self.client {
             self.inject_association_properties(&mut opts.properties);
-            client.track_tool_for_interaction(&self.event_id, opts, self.app_git_snapshot());
+            client.track_tool_for_interaction(
+                &self.event_id,
+                opts,
+                self.app_git_snapshot(),
+                &self.span_attributes,
+            );
         }
     }
 }

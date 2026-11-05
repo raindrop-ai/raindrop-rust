@@ -145,3 +145,17 @@ pub fn spans_of(payload: &Value) -> Vec<Value> {
     }
     out
 }
+
+/// Every item recorded on an array route (`events/track`, `signals/track`),
+/// flattened in send order.
+#[allow(dead_code)]
+pub fn items(recorder: &Recorder) -> Vec<Value> {
+    recorder
+        .requests()
+        .iter()
+        .flat_map(|c| match c.json() {
+            Value::Array(list) => list,
+            other => vec![other],
+        })
+        .collect()
+}

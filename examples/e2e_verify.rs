@@ -172,7 +172,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     // Flush and close
-    client.close().await?;
+    // Telemetry errors are safe to ignore: log them, don't fail your program on them.
+    if let Err(err) = client.close().await {
+        eprintln!("raindrop: {err}");
+    }
     println!("Telemetry shipped. Polling dashboard...");
 
     // Verify Dashboard

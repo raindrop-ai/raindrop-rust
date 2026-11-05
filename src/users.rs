@@ -32,5 +32,10 @@ pub(crate) async fn identify(client: &ClientInner, user: User) -> Result<()> {
         user_id: user.user_id,
         traits: user.traits,
     };
-    client.transport.post_json("users/identify", &payload).await
+    // A hot-path call (CONTRACT 1.1): queued, sent batched on the next
+    // background cycle or flush.
+    client
+        .outbox
+        .push("users/identify", serde_json::to_value(payload)?);
+    Ok(())
 }

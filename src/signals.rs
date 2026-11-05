@@ -96,7 +96,7 @@ pub(crate) async fn track_signal(client: &ClientInner, signal: Signal) -> Result
         signal.kind
     };
 
-    let payload = vec![SignalPayload {
+    let payload = SignalPayload {
         event_id: signal.event_id,
         signal_name: signal.name,
         signal_type: kind,
@@ -104,7 +104,12 @@ pub(crate) async fn track_signal(client: &ClientInner, signal: Signal) -> Result
         sentiment: signal.sentiment,
         attachment_id: signal.attachment_id,
         properties,
-    }];
+    };
 
-    client.transport.post_json("signals/track", &payload).await
+    // A hot-path call (CONTRACT 1.1): queued, sent batched with other
+    // signals on the next background cycle or flush.
+    client
+        .outbox
+        .push("signals/track", serde_json::to_value(payload)?);
+    Ok(())
 }
