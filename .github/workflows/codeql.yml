@@ -115,7 +115,10 @@ jobs:
           HEAD_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
+          sent=0
           failed=0
+          sent_urls=""
+          failed_urls=""
           while IFS= read -r alert; do
             payload="$(jq -n --argjson a "$alert" --arg repo "$REPO" --arg sha "$HEAD_SHA" '{
               source: "codeql",
@@ -133,10 +136,17 @@ jobs:
               -H 'Content-Type: application/json' \
               -H "Authorization: Bearer ${DEVIN_WEBHOOK_SECRET}" \
               --data "$payload" "$DEVIN_WEBHOOK_URL" > /dev/null; then
-              echo "::warning::Failed to relay CodeQL alert $(jq -r '.number' <<< "$alert")"
               failed=$((failed+1))
+              failed_urls+=" $(jq -r '.url' <<< "$alert")"
+            else
+              sent=$((sent+1))
+              sent_urls+=" $(jq -r '.url' <<< "$alert")"
             fi
           done < <(jq -c '.[]' alerts.json)
+          if [ "$sent" -ne 0 ]; then
+            echo "::notice title=codeql-relay-sent::sent=${sent}${sent_urls}"
+          fi
           if [ "$failed" -ne 0 ]; then
+            echo "::warning title=codeql-relay-failed::failed=${failed}${failed_urls}"
             exit 1
           fi
