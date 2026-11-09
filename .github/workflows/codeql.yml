@@ -119,8 +119,8 @@ jobs:
           set -euo pipefail
           count="$(jq 'length' alerts.json)"
           prior_runs="$(gh api --paginate -X GET "repos/${REPO}/actions/workflows/codeql.yml/runs" \
-            -f branch="$DEFAULT_BRANCH" -f status=success -f per_page=100 \
-            | jq -s --arg id "$RUN_ID" '[.[].workflow_runs[] | select((.id | tostring) != $id)] | length')"
+            -f branch="$DEFAULT_BRANCH" -f status=completed -f per_page=100 \
+            | jq -s --arg id "$RUN_ID" '[.[].workflow_runs[] | select((.id | tostring) != $id) | select(.conclusion == "success" or .conclusion == "failure")] | length')"
           if [ "$prior_runs" -eq 0 ]; then
             echo "::notice title=codeql-relay-baselined::baselined=${count}"
             exit 0
@@ -133,7 +133,7 @@ jobs:
               repository: $repo,
               commit: $sha,
               count: length,
-              alerts: map({alert_number: .number, rule, severity, file, line, url})
+              alerts: map({alert_number: .number, rule, description, severity, file, line, url})
             }' alerts.json)"
             urls="$(jq -r 'map(.url) | join(" ")' alerts.json)"
             if ! curl -sSf --max-time 20 --retry 2 -X POST \
