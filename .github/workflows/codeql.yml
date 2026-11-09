@@ -46,7 +46,7 @@ jobs:
         with:
           languages: ${{ matrix.language }}
           build-mode: ${{ matrix.build-mode }}
-          # Default (high-precision) suite; the relay only forwards High/Critical.
+          # Default (high-precision) suite; the relay only forwards Medium and above.
           config: |
             paths-ignore:
               - "tests/**"
@@ -59,7 +59,7 @@ jobs:
           category: "/language:${{ matrix.language }}"
 
   relay-alerts:
-    name: Relay new High/Critical alerts
+    name: Relay new Medium/High/Critical alerts
     needs: analyze
     # Run even if one language's scan failed, so alerts the other languages uploaded still go out.
     if: ${{ !cancelled() && github.event_name == 'push' }}
@@ -88,7 +88,7 @@ jobs:
               [ .[][]
                 | select(.created_at >= $since)
                 | select(.most_recent_instance.commit_sha == $sha)
-                | select((.rule.security_severity_level // "") | ascii_downcase | IN("high", "critical"))
+                | select((.rule.security_severity_level // "") | ascii_downcase | IN("medium", "high", "critical"))
                 | {
                     number,
                     rule: (.rule.id // .rule.name),
@@ -102,35 +102,11 @@ jobs:
 
           count="$(jq 'length' alerts.json)"
           echo "count=${count}" >> "$GITHUB_OUTPUT"
-          echo "${count} new High/Critical alert(s) from this run"
+          echo "${count} new Medium/High/Critical alert(s) from this run"
           jq -r '.[] | "- [\(.severity)] \(.rule) \(.file):\(.line) \(.url)"' alerts.json
 
-      - name: Notify Slack
-        if: steps.collect.outputs.count != '0'
-        env:
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_CODEQL_WEBHOOK_URL }}
-          REPO: ${{ github.repository }}
-          HEAD_SHA: ${{ github.sha }}
-        run: |
-          set -euo pipefail
-          while IFS= read -r alert; do
-            payload="$(jq -n --argjson a "$alert" --arg repo "$REPO" --arg sha "$HEAD_SHA" '{
-              text: (
-                ":rotating_light: New CodeQL *\($a.severity | ascii_upcase)* alert in \($repo)\n"
-                + "*Rule:* \($a.rule)"
-                + (if $a.description != "" then " — \($a.description)" else "" end) + "\n"
-                + "*File:* `\($a.file):\($a.line)`\n"
-                + "*Commit:* \($sha[0:12])\n"
-                + "<\($a.url)|View alert #\($a.number)>"
-              )
-            }')"
-            curl -sSf -X POST -H 'Content-Type: application/json' \
-              --data "$payload" "$SLACK_WEBHOOK_URL" > /dev/null
-          done < <(jq -c '.[]' alerts.json)
-
       - name: Notify Devin triage webhook
-        # Independent of the Slack step, so a Slack outage doesn't block triage.
-        if: ${{ !cancelled() && steps.collect.outcome == 'success' && steps.collect.outputs.count != '0' }}
+        if: ${{ steps.collect.outputs.count != '0' }}
         env:
           DEVIN_WEBHOOK_URL: ${{ secrets.DEVIN_CODEQL_WEBHOOK_URL }}
           DEVIN_WEBHOOK_SECRET: ${{ secrets.DEVIN_CODEQL_WEBHOOK_SECRET }}
