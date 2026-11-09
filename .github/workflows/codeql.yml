@@ -107,14 +107,46 @@ jobs:
           jq -r '.[] | "- [\(.severity)] \(.rule) \(.file):\(.line) \(.url)"' alerts.json
 
       - name: Notify Devin triage webhook
-        if: ${{ steps.collect.outputs.count != '0' }}
         env:
+          GH_TOKEN: ${{ github.token }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          RUN_ID: ${{ github.run_id }}
           DEVIN_WEBHOOK_URL: ${{ secrets.DEVIN_CODEQL_WEBHOOK_URL }}
           DEVIN_WEBHOOK_SECRET: ${{ secrets.DEVIN_CODEQL_WEBHOOK_SECRET }}
           REPO: ${{ github.repository }}
           HEAD_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
+          count="$(jq 'length' alerts.json)"
+          prior_runs="$(gh api --paginate -X GET "repos/${REPO}/actions/workflows/codeql.yml/runs" \
+            -f branch="$DEFAULT_BRANCH" -f status=success -f per_page=100 \
+            | jq -s --arg id "$RUN_ID" '[.[].workflow_runs[] | select((.id | tostring) != $id)] | length')"
+          if [ "$prior_runs" -eq 0 ]; then
+            echo "::notice title=codeql-relay-baselined::baselined=${count}"
+            exit 0
+          fi
+
+          if [ "$count" -gt 20 ]; then
+            payload="$(jq -c --arg repo "$REPO" --arg sha "$HEAD_SHA" '{
+              source: "codeql",
+              batch: true,
+              repository: $repo,
+              commit: $sha,
+              count: length,
+              alerts: map({alert_number: .number, rule, severity, file, line, url})
+            }' alerts.json)"
+            urls="$(jq -r 'map(.url) | join(" ")' alerts.json)"
+            if ! curl -sSf --max-time 20 --retry 2 -X POST \
+              -H 'Content-Type: application/json' \
+              -H "Authorization: Bearer ${DEVIN_WEBHOOK_SECRET}" \
+              --data "$payload" "$DEVIN_WEBHOOK_URL" > /dev/null; then
+              echo "::warning title=codeql-relay-failed::failed=${count} batched ${urls}"
+              exit 1
+            fi
+            echo "::notice title=codeql-relay-sent::sent=${count} batched ${urls}"
+            exit 0
+          fi
+
           sent=0
           failed=0
           sent_urls=""
