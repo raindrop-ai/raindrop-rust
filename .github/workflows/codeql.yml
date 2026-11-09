@@ -94,6 +94,7 @@ jobs:
                     number,
                     rule: (.rule.id // .rule.name),
                     description: (.rule.description // ""),
+                    category: .most_recent_instance.category,
                     severity: ((.rule.security_severity_level // "") | ascii_downcase),
                     file: (.most_recent_instance.location.path // ""),
                     line: (.most_recent_instance.location.start_line // 0),
@@ -117,14 +118,28 @@ jobs:
           HEAD_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          count="$(jq 'length' alerts.json)"
-          prior_runs="$(gh api --paginate -X GET "repos/${REPO}/actions/workflows/codeql.yml/runs" \
-            -f branch="$DEFAULT_BRANCH" -f status=completed -f per_page=100 \
-            | jq -s --arg id "$RUN_ID" '[.[].workflow_runs[] | select((.id | tostring) != $id) | select(.conclusion == "success" or .conclusion == "failure")] | length')"
-          if [ "$prior_runs" -eq 0 ]; then
-            echo "::notice title=codeql-relay-baselined::baselined=${count}"
-            exit 0
+          run_started_at="$(gh api "repos/${REPO}/actions/runs/${RUN_ID}" --jq '.run_started_at')"
+          prior_categories="$(gh api --paginate -X GET "repos/${REPO}/code-scanning/analyses" \
+            -f ref="refs/heads/${DEFAULT_BRANCH}" -f tool_name=CodeQL -f per_page=100 \
+            | jq -sc --arg since "$run_started_at" '
+              [ .[][]
+                | select((.analysis_key // "") | startswith(".github/workflows/codeql.yml"))
+                | select(.created_at < $since)
+                | .category
+                | select(type == "string" and length > 0)
+              ] | unique')"
+          baselined="$(jq --argjson prior "$prior_categories" '
+            [.[] | select(.category as $category | $prior | index($category) | not)]
+          ' alerts.json)"
+          baseline_count="$(jq 'length' <<< "$baselined")"
+          if [ "$baseline_count" -gt 0 ]; then
+            categories="$(jq -r 'map(.category // "") | unique | join(",")' <<< "$baselined")"
+            echo "::notice title=codeql-relay-baselined::baselined=${baseline_count} categories=${categories}"
           fi
+          jq --argjson prior "$prior_categories" '
+            [.[] | select(.category as $category | $prior | index($category))]
+          ' alerts.json > relay-alerts.json
+          count="$(jq 'length' relay-alerts.json)"
 
           if [ "$count" -gt 20 ]; then
             payload="$(jq -c --arg repo "$REPO" --arg sha "$HEAD_SHA" '{
@@ -134,8 +149,8 @@ jobs:
               commit: $sha,
               count: length,
               alerts: map({alert_number: .number, rule, description, severity, file, line, url})
-            }' alerts.json)"
-            urls="$(jq -r 'map(.url) | join(" ")' alerts.json)"
+            }' relay-alerts.json)"
+            urls="$(jq -r 'map(.url) | join(" ")' relay-alerts.json)"
             if ! curl -sSf --max-time 20 --retry 2 -X POST \
               -H 'Content-Type: application/json' \
               -H "Authorization: Bearer ${DEVIN_WEBHOOK_SECRET}" \
@@ -174,7 +189,7 @@ jobs:
               sent=$((sent+1))
               sent_urls+=" $(jq -r '.url' <<< "$alert")"
             fi
-          done < <(jq -c '.[]' alerts.json)
+          done < <(jq -c '.[]' relay-alerts.json)
           if [ "$sent" -ne 0 ]; then
             echo "::notice title=codeql-relay-sent::sent=${sent}${sent_urls}"
           fi
