@@ -2,7 +2,7 @@
 
 All notable changes to this crate are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versioning follows [SemVer](https://semver.org).
 
-## [Unreleased]
+## [0.0.10] - unreleased
 
 Brings the SDK in line with the cross-SDK behaviour contract checked by the
 conformance harness.
