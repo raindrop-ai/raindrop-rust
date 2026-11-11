@@ -4,7 +4,7 @@ The official Rust SDK for [Raindrop AI](https://raindrop.ai) — track AI events
 
 📖 **Full documentation:** [docs.raindrop.ai/sdk/rust](https://docs.raindrop.ai/sdk/rust). This README is the quick reference; the docs page is the canonical narrative tour.
 
-> **Beta.** The crate is `0.0.9`. The wire contract against the Raindrop ingestion API is stable and verified end-to-end against the live backend on every push, but the crate API may still change in minor ways before `0.1.0`. We recommend pinning the git revision in your `Cargo.toml` and reviewing the [Known Limitations](#known-limitations) before using it in production.
+> **Beta.** The crate is `0.0.10`. The wire contract against the Raindrop ingestion API is stable and verified end-to-end against the live backend on every push, but the crate API may still change in minor ways before `0.1.0`. We recommend pinning the git revision in your `Cargo.toml` and reviewing the [Known Limitations](#known-limitations) before using it in production.
 
 ## Installation
 
@@ -12,14 +12,14 @@ The official Rust SDK for [Raindrop AI](https://raindrop.ai) — track AI events
 
 ```toml
 [dependencies]
-raindrop-ai = { git = "https://github.com/raindrop-ai/raindrop-rust", tag = "v0.0.9" }
+raindrop-ai = { git = "https://github.com/raindrop-ai/raindrop-rust", tag = "v0.0.10" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 serde_json = "1"
 ```
 
 Track the latest tagged release at [github.com/raindrop-ai/raindrop-rust/releases](https://github.com/raindrop-ai/raindrop-rust/releases). For development against the bleeding edge, drop the `tag` field to follow `main`.
 
-The Rust SDK requires **Rust 1.88+** (MSRV). It is `async`-first and uses `tokio`. Most fallible methods return `Result<_, Error>` — `track_ai`, `track_event`, `identify`, `track_signal`, the `Interaction` mutators (`set_input`, `set_property`, `set_properties`, `add_attachments`, `patch`, `finish`), and `Client::flush` / `Client::close`. Propagate errors with `?` as you would for any fallible call. The two constructors — `Client::begin(...).await` and `Client::resume_interaction(...)` — are **infallible**: they always return an `Interaction` (a no-op handle when the client is disabled), so don't put a `?` on those.
+The Rust SDK requires **Rust 1.88+** (MSRV). It is `async`-first and uses `tokio`. Most fallible methods return `Result<_, Error>` — `track_ai`, `track_event`, `identify`, `track_signal`, the `Interaction` mutators (`set_input`, `set_property`, `set_properties`, `add_attachments`, `patch`, `finish`), and `Client::flush` / `Client::close`. Propagate errors with `?` as you would for any fallible call. The two constructors — `Client::begin(...).await` and `Client::resume_interaction(...)` / `resume_interaction_with(...)` — are **infallible**: they always return an `Interaction` (a no-op handle when the client is disabled), so don't put a `?` on those.
 
 ## Quick start
 
@@ -41,7 +41,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ..Default::default()
     }).await?;
 
-    client.close().await?;
+    // Telemetry errors are safe to ignore: log them, don't fail your program on them.
+    if let Err(err) = client.close().await {
+        eprintln!("raindrop: {err}");
+    }
     Ok(())
 }
 ```
@@ -316,15 +319,37 @@ OpenTelemetry GenAI semantic-convention attributes (`gen_ai.response.model`,
 correctly populates per-span and per-event token totals on the dashboard. Pass `0` for
 either count or an empty `model` to omit the corresponding attribute.
 
+## Detached sub-agents
+
+Work launched from one event that reports as its own event (possibly in
+another process or service) is linked by a carrier passed with the launch:
+
+```rust
+// Launcher: records a dispatch span and returns headers for the child.
+let dispatch = interaction.subagent(raindrop::SubagentOptions {
+    name: "researcher".into(),
+    child_event_id: job_id.clone(), // optional; generated when empty
+    ..Default::default()
+});
+enqueue_job(job_id, dispatch.headers);
+
+// Child: its own event, whose spans link back to the launcher.
+let run = client
+    .resume_subagent(&headers, raindrop::ResumeSubagentOptions::default())
+    .await;
+// ... do the work, record spans via `run` ...
+run.finish(raindrop::FinishOptions { output: answer, ..Default::default() }).await?;
+```
+
 ## Payload size limits
 
 As of `0.0.7`, text fields (AI input/output, tool span I/O, LLM span content)
 are capped at **1,000,000 characters per field by default** and truncated with a
 `...[truncated by raindrop]` marker (the marker fits within the cap). The cap
 is enforced before (or during) serialization, so oversized payloads cost the
-cap — not the payload — on your calling task, and large events now land
-truncated instead of being silently dropped at the 1 MiB ingest limit. Tune it
-via:
+cap — not the payload — on your calling task, and large events land
+truncated. The SDK applies no request size limit of its own: ingest decides
+what it accepts and reports anything it rejects. Tune the cap via:
 
 ```rust
 let client = raindrop::Client::builder()
@@ -335,15 +360,41 @@ let client = raindrop::Client::builder()
 
 A stricter `OTEL_SPAN_ATTRIBUTE_VALUE_LENGTH_LIMIT` env var (read once at
 build time) is also honored. All outbound HTTP carries finite per-request
-timeouts (even with a caller-injected `http_client`), and `close()` runs under
-a 10s deadline (`close_timeout`) so a dead network can never wedge your
-process exit.
+timeouts (even with a caller-injected `http_client`), and `flush()` and
+`close()` share one 10s deadline (`flush_timeout`) so a dead network can never
+wedge your process exit.
+
+### Flush and close
+
+`flush()` returns once everything queued before it was handed to Raindrop, or
+when `flush_timeout` passes. Each request's timeout is clamped to what is left
+of the deadline. When the deadline passes first:
+
+- payloads that were never sent, or were waiting on a retry or a `Retry-After`
+  pause, stay queued and go out on a later flush;
+- a request cut off mid-flight is dropped rather than resent, since it may
+  already have reached Raindrop;
+- `flush()` logs a warning and returns `Err(Error::Undelivered { count, dropped })`.
+
+That error is safe to ignore, and ignoring it changes nothing. Log it rather
+than propagating it with `?`, so a slow network never fails your own work:
+
+```rust
+if let Err(err) = client.flush().await {
+    eprintln!("raindrop: {err}");
+}
+```
+
+A payload Raindrop rejected permanently (a 4xx other than 408 and 429) was
+delivered: it is logged and dropped, but not reported as a flush error.
+
+`close()` uses the same deadline, drops whatever is still unsent when it
+passes (with a warning), and returns `Ok(())`.
 
 ## Known Limitations
 
 - **Nested Trace Spans:** The Rust SDK currently provides manual span instrumentation (`start_span`, `start_llm_span`, `start_tool_span`). It does not yet automatically hook into Rust LLM frameworks (like `async-openai` or `langchain-rust`) to produce nested trace spans automatically. You must create spans manually.
 - **PII Redaction:** Automatic PII redaction (which is available in the Python SDK via `set_redact_pii` and the JS SDK via `redactPii`) is not yet implemented in the Rust SDK. If your application logs PII into events, redact at the call site or upstream of `track_ai` / `track_event`.
-- **Oversized payload guard:** Payloads larger than 1 MiB after JSON serialization are dropped client-side (matching the JS / Python SDKs' `MAX_INGEST_SIZE_BYTES` / `max_ingest_size_bytes`) to avoid 413s on the gateway. With the default text-field caps this only triggers for oversized non-text content (e.g. huge property maps or attachments). Each drop emits a rate-limited `tracing::warn!` event so production callers can detect it without enabling `debug=true`.
 
 ## Configuration
 
@@ -357,12 +408,13 @@ process exit.
 | `trace_flush_interval`   | `1s`                          | Periodic span flush. `0` disables periodic flush  |
 | `trace_max_batch_size`   | `50`                          | Max spans per export request                      |
 | `trace_max_queue_size`   | `5000`                        | Backpressure threshold for spans                  |
-| `event_max_queue_size`   | `5000`                        | Max distinct buffered event ids                   |
+| `event_max_queue_size`   | `5000`                        | Max buffered event ids and queued sends           |
 | `max_attempts`           | `3`                           | HTTP retries (1 = no retries)                     |
 | `base_delay`             | `1s`                          | Backoff base (exponential, ±20% jitter)           |
 | `jitter_fraction`        | `0.2`                         | Backoff jitter fraction (0.0–1.0)                 |
 | `request_timeout`        | `30s`                         | Per-attempt bound on every cloud POST             |
-| `close_timeout`          | `10s`                         | Overall `close()` deadline. `0` disables          |
+| `flush_timeout`          | `10s`                         | The one `flush()` and `close()` deadline. `0` disables |
+| `close_timeout`          | `flush_timeout`               | Overrides the `close()` deadline alone. `0` disables |
 | `max_text_field_chars`   | `1_000_000`                   | Per-field cap on AI text content                  |
 | `service_name`           | `raindrop.rust-sdk`           | OTLP `resource.service.name`                      |
 | `library_name`           | `raindrop-rust`               | `$context.library.name`                           |
@@ -429,14 +481,25 @@ still pass through.
 
 ## Architecture
 
-- **Buffering**: per-event-id map with sticky state. Patches with `is_pending=false` flush
-  immediately; periodic ticker flushes pending patches at `partial_flush_interval`. If a payload
-  cannot be built (no `user_id` yet), the patch is buffered and retried on the next flush.
+- **Send queue**: `track_event`, `track_ai`, `track_signal` and `identify` only queue; they never
+  wait for the network. The queue (bounded by `event_max_queue_size`) is sent in batches of up to
+  500 per request (`events/track`, `signals/track`) at `partial_flush_interval`, on `flush()`
+  and on `close()`, both bounded by `flush_timeout`. Batches not sent before a `flush()` deadline
+  stay queued; `close()` drops them.
+- **Interactions**: per-event-id map with sticky state. Every update carries the event's start
+  time. Patches with `is_pending=false` flush immediately; periodic ticker flushes pending patches
+  at `partial_flush_interval`. A pending patch without a `user_id` is held (with a warning) until
+  one is set; a finished event without one is dropped with a warning. Handles from
+  `resume_interaction` / `resume_interaction_with` continue an event begun elsewhere (another
+  process, for example) and send only the identity they were given.
 - **Tracing**: bounded queue (`trace_max_queue_size`) with size-triggered (`trace_max_batch_size`)
   and time-triggered (`trace_flush_interval`) export. Spans are restored to the queue on transient
   failure.
-- **HTTP**: retry on `5xx` and `429` only; `Retry-After` header is honored. Non-retryable `4xx`
-  fail fast. Exponential backoff with ±20% jitter by default.
+- **HTTP**: retry on `408`, `429` and `5xx`; `Retry-After` is honored up to 30s, and a `429` or
+  `503` with `Retry-After` pauses all sends to that endpoint for that long. Other `4xx` responses
+  are permanent: the data is dropped with a warning. Exponential backoff with ±20% jitter by
+  default. Items ingest reports as `rejected` (or `warnings` about) in a successful response are
+  logged as warnings.
 - **Crash protection**: every public method returns `Result` or is infallible. Telemetry calls
   never panic; serialization failures fall back to `String`/empty representations.
 

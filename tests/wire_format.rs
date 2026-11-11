@@ -24,18 +24,19 @@ use raindrop::{
     PatchOptions, Signal, SignalKind, SpanOptions, ToolOptions, TrackToolOptions, User,
 };
 
-use crate::common::{fast_client_builder, mount_any_post, mount_path, span_attr, spans_of};
+use crate::common::{fast_client_builder, items, mount_any_post, mount_path, span_attr, spans_of};
 
 // ────────────────────────────────────────────────────────────────────────────────────
-// /events/track_partial wire format (AiTrackEventSchema)
+// /events/track wire format (AiTrackEventSchema)
 // ────────────────────────────────────────────────────────────────────────────────────
 
-/// Canonical track_ai payload shape: snake_case keys, ai_data sub-object, is_pending=false,
-/// $context auto-injected with library + metadata. See `AiTrackEventSchema`.
+/// Canonical track_ai payload shape: one item of the events/track array, snake_case keys,
+/// ai_data sub-object, no pending state, $context auto-injected with library + metadata.
+/// See `AiTrackEventSchema`.
 #[tokio::test]
 async fn track_ai_payload_uses_canonical_snake_case_shape() {
     let server = MockServer::start().await;
-    let recorder = mount_path(&server, "POST", "/events/track_partial").await;
+    let recorder = mount_path(&server, "POST", "/events/track").await;
     let client = fast_client_builder(&server).build().expect("build");
 
     client
@@ -53,15 +54,11 @@ async fn track_ai_payload_uses_canonical_snake_case_shape() {
         .expect("track_ai");
     client.close().await.expect("close");
 
-    let payload = recorder.requests()[0].json();
+    let payload = items(&recorder)[0].clone();
     // Top-level keys must be snake_case
     assert!(payload.get("event_id").is_some(), "event_id (snake_case)");
     assert!(payload.get("user_id").is_some(), "user_id (snake_case)");
     assert!(payload.get("ai_data").is_some(), "ai_data (snake_case)");
-    assert!(
-        payload.get("is_pending").is_some(),
-        "is_pending (snake_case)"
-    );
     assert_eq!(payload.get("eventId"), None, "MUST NOT use camelCase");
     assert_eq!(payload.get("aiData"), None, "MUST NOT use camelCase");
 
@@ -85,8 +82,8 @@ async fn track_ai_payload_uses_canonical_snake_case_shape() {
     );
     assert_eq!(context["metadata"]["language"], "rust");
 
-    // is_pending must be a boolean false (NOT the string "false" — Tinybird casts strictly)
-    assert_eq!(payload["is_pending"], Value::Bool(false));
+    // The complete-event route has no pending state.
+    assert!(payload.get("is_pending").is_none());
 }
 
 /// `event` defaults to `ai_generation` when not provided. The default value is owned by the
@@ -94,7 +91,7 @@ async fn track_ai_payload_uses_canonical_snake_case_shape() {
 #[tokio::test]
 async fn track_ai_default_event_name_is_ai_generation() {
     let server = MockServer::start().await;
-    let recorder = mount_path(&server, "POST", "/events/track_partial").await;
+    let recorder = mount_path(&server, "POST", "/events/track").await;
     let client = fast_client_builder(&server).build().expect("build");
 
     client
@@ -108,7 +105,7 @@ async fn track_ai_default_event_name_is_ai_generation() {
         .expect("track_ai");
     client.close().await.expect("close");
 
-    let payload = recorder.requests()[0].json();
+    let payload = items(&recorder)[0].clone();
     assert_eq!(payload["event"], "ai_generation");
 }
 
@@ -117,7 +114,7 @@ async fn track_ai_default_event_name_is_ai_generation() {
 #[tokio::test]
 async fn track_ai_attachments_serialize_with_type_role_and_optional_fields() {
     let server = MockServer::start().await;
-    let recorder = mount_path(&server, "POST", "/events/track_partial").await;
+    let recorder = mount_path(&server, "POST", "/events/track").await;
     let client = fast_client_builder(&server).build().expect("build");
 
     client
@@ -161,7 +158,7 @@ async fn track_ai_attachments_serialize_with_type_role_and_optional_fields() {
         .expect("track_ai");
     client.close().await.expect("close");
 
-    let payload = recorder.requests()[0].json();
+    let payload = items(&recorder)[0].clone();
     let atts = payload["attachments"]
         .as_array()
         .expect("attachments array");
@@ -271,7 +268,7 @@ async fn interaction_lifecycle_merges_all_patches_into_final_payload() {
 #[tokio::test]
 async fn multiple_track_ai_calls_share_convo_id() {
     let server = MockServer::start().await;
-    let recorder = mount_path(&server, "POST", "/events/track_partial").await;
+    let recorder = mount_path(&server, "POST", "/events/track").await;
     let client = fast_client_builder(&server).build().expect("build");
 
     for i in 0..3 {
@@ -288,10 +285,11 @@ async fn multiple_track_ai_calls_share_convo_id() {
     }
     client.close().await.expect("close");
 
-    let reqs = recorder.requests();
-    assert_eq!(reqs.len(), 3);
-    for r in &reqs {
-        let payload = r.json();
+    // Calls made together go out as one events/track array (CONTRACT 7.2).
+    assert_eq!(recorder.count(), 1);
+    let events = items(&recorder);
+    assert_eq!(events.len(), 3);
+    for payload in &events {
         assert_eq!(payload["ai_data"]["convo_id"], "shared_convo");
     }
 }
@@ -381,17 +379,17 @@ async fn track_signal_accepts_all_canonical_signal_types() {
     }
     client.close().await.expect("close");
 
-    let signal_requests: Vec<_> = recorder
+    // Signals queued together go out as one signals/track array.
+    let signals: Vec<Value> = recorder
         .requests()
         .into_iter()
         .filter(|r| r.path == "/signals/track")
+        .flat_map(|r| r.json().as_array().cloned().unwrap_or_default())
         .collect();
-    assert_eq!(signal_requests.len(), kinds.len());
+    assert_eq!(signals.len(), kinds.len());
 
     let mut seen = std::collections::HashSet::new();
-    for req in &signal_requests {
-        let arr = req.json();
-        let sig = &arr[0];
+    for sig in &signals {
         let signal_type = sig["signal_type"]
             .as_str()
             .expect("signal_type string")
@@ -964,7 +962,7 @@ async fn span_status_codes_match_otlp_status_enum() {
 #[tokio::test]
 async fn track_event_non_ai_omits_ai_data() {
     let server = MockServer::start().await;
-    let recorder = mount_path(&server, "POST", "/events/track_partial").await;
+    let recorder = mount_path(&server, "POST", "/events/track").await;
     let client = fast_client_builder(&server).build().expect("build");
 
     let mut props = BTreeMap::new();
@@ -981,7 +979,7 @@ async fn track_event_non_ai_omits_ai_data() {
         .expect("track_event");
     client.close().await.expect("close");
 
-    let payload = recorder.requests()[0].json();
+    let payload = items(&recorder)[0].clone();
     assert_eq!(payload["event"], "session_started");
     assert!(
         payload.get("ai_data").is_none() || payload["ai_data"].is_null(),
@@ -1184,7 +1182,7 @@ async fn manual_span_emits_traceloop_event_id_exactly_once() {
 #[tokio::test]
 async fn attachment_with_caller_supplied_attachment_id_round_trips_on_the_wire() {
     let server = MockServer::start().await;
-    let recorder = mount_path(&server, "POST", "/events/track_partial").await;
+    let recorder = mount_path(&server, "POST", "/events/track").await;
     let client = fast_client_builder(&server).build().expect("build");
 
     client
@@ -1215,7 +1213,7 @@ async fn attachment_with_caller_supplied_attachment_id_round_trips_on_the_wire()
         .expect("track_ai");
     client.close().await.expect("close");
 
-    let payload = recorder.requests()[0].json();
+    let payload = items(&recorder)[0].clone();
     let atts = payload["attachments"].as_array().expect("attachments");
     assert_eq!(
         atts[0]["attachment_id"].as_str().unwrap_or(""),
@@ -1737,7 +1735,7 @@ async fn track_partial_without_user_id_is_buffered_and_flushes_on_later_user_id(
 #[tokio::test]
 async fn track_event_preserves_user_properties_verbatim() {
     let server = MockServer::start().await;
-    let recorder = mount_path(&server, "POST", "/events/track_partial").await;
+    let recorder = mount_path(&server, "POST", "/events/track").await;
     let client = fast_client_builder(&server).build().expect("build");
 
     let mut props = BTreeMap::new();
@@ -1762,7 +1760,7 @@ async fn track_event_preserves_user_properties_verbatim() {
         .expect("track_event");
     client.close().await.expect("close");
 
-    let payload = recorder.requests()[0].json();
+    let payload = items(&recorder)[0].clone();
     let p = &payload["properties"];
     assert_eq!(p["source"], "dashboard");
     assert_eq!(p["buildVersion"], "3.1.157");
@@ -1786,7 +1784,7 @@ async fn track_event_preserves_user_properties_verbatim() {
 #[tokio::test]
 async fn track_ai_user_properties_and_context_coexist() {
     let server = MockServer::start().await;
-    let recorder = mount_path(&server, "POST", "/events/track_partial").await;
+    let recorder = mount_path(&server, "POST", "/events/track").await;
     let client = fast_client_builder(&server).build().expect("build");
 
     let mut props = BTreeMap::new();
@@ -1805,7 +1803,7 @@ async fn track_ai_user_properties_and_context_coexist() {
         .expect("track_ai");
     client.close().await.expect("close");
 
-    let p = &recorder.requests()[0].json()["properties"];
+    let p = &items(&recorder)[0].clone()["properties"];
     assert_eq!(p["temperature"], 0.7);
     assert_eq!(p["organizationId"], "org_123");
     assert!(p["$context"].is_object());
@@ -1818,7 +1816,7 @@ async fn track_ai_user_properties_and_context_coexist() {
 async fn identify_does_not_leak_traits_into_subsequent_track_ai() {
     let server = MockServer::start().await;
     let identify_recorder = mount_path(&server, "POST", "/users/identify").await;
-    let track_recorder = mount_path(&server, "POST", "/events/track_partial").await;
+    let track_recorder = mount_path(&server, "POST", "/events/track").await;
     let client = fast_client_builder(&server).build().expect("build");
 
     client
@@ -1844,7 +1842,7 @@ async fn identify_does_not_leak_traits_into_subsequent_track_ai() {
 
     assert_eq!(identify_recorder.count(), 1);
     assert_eq!(track_recorder.count(), 1);
-    let track_payload = track_recorder.requests()[0].json();
+    let track_payload = items(&track_recorder)[0].clone();
     let p = &track_payload["properties"];
     assert!(
         p.get("plan").is_none(),
@@ -1909,7 +1907,7 @@ async fn manual_span_with_workflow_or_task_kind_attribute_survives_filter() {
 #[tokio::test]
 async fn oversized_track_ai_payload_ships_truncated_under_default_cap() {
     let server = MockServer::start().await;
-    let recorder = mount_path(&server, "POST", "/events/track_partial").await;
+    let recorder = mount_path(&server, "POST", "/events/track").await;
     let client = fast_client_builder(&server).build().expect("build");
 
     let huge_input: String = "x".repeat(2 * 1024 * 1024);
@@ -1925,7 +1923,7 @@ async fn oversized_track_ai_payload_ships_truncated_under_default_cap() {
     client.close().await.expect("close");
 
     assert_eq!(recorder.count(), 1, "capped payload must ship");
-    let payload = recorder.requests()[0].json();
+    let payload = items(&recorder)[0].clone();
     let input = payload["ai_data"]["input"].as_str().unwrap();
     // Mirrors DEFAULT_MAX_TEXT_FIELD_CHARS (pub(crate), not importable here).
     assert_eq!(input.chars().count(), 1_000_000, "default cap applied");

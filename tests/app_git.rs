@@ -11,7 +11,7 @@ use raindrop::{
     AiEvent, AppGitConfig, Event, LlmOptions, SpanOptions, ToolOptions, TrackToolOptions,
 };
 
-use crate::common::{fast_client_builder, mount_path, span_attr, spans_of, Captured};
+use crate::common::{fast_client_builder, items, mount_path, span_attr, spans_of, Captured};
 
 const SHA_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const SHA_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -102,6 +102,7 @@ async fn mount_blocking_path(
 #[tokio::test]
 async fn application_git_is_observable_on_plain_ai_and_partial_events() {
     let server = MockServer::start().await;
+    let track = mount_path(&server, "POST", "/events/track").await;
     let recorder = mount_path(&server, "POST", "/events/track_partial").await;
     let client = fast_client_builder(&server)
         .app_git(configured_git(SHA_A))
@@ -143,20 +144,23 @@ async fn application_git_is_observable_on_plain_ai_and_partial_events() {
         .await
         .expect("finish partial event");
 
-    for request in recorder.requests() {
-        let payload = request.json();
+    client.flush().await.expect("flush");
+
+    let mut payloads = items(&track);
+    payloads.extend(recorder.requests().iter().map(|r| r.json()));
+    for payload in &payloads {
         assert_eq!(payload["properties"]["raindrop.app.commit_sha"], SHA_A);
         assert_eq!(payload["properties"]["raindrop.app.commit_dirty"], false);
         assert_eq!(payload["properties"]["raindrop.app.branch"], "main");
     }
-    assert_eq!(recorder.count(), 3);
+    assert_eq!(payloads.len(), 3);
     client.close().await.expect("close");
 }
 
 #[tokio::test]
 async fn canonical_event_properties_win_even_when_empty_null_or_invalid() {
     let server = MockServer::start().await;
-    let recorder = mount_path(&server, "POST", "/events/track_partial").await;
+    let recorder = mount_path(&server, "POST", "/events/track").await;
     let client = fast_client_builder(&server)
         .app_git(configured_git(SHA_A))
         .build()
@@ -177,7 +181,8 @@ async fn canonical_event_properties_win_even_when_empty_null_or_invalid() {
         .await
         .expect("track ai event");
 
-    let payload = recorder.requests()[0].json();
+    client.flush().await.expect("flush");
+    let payload = items(&recorder)[0].clone();
     assert!(payload["properties"]["raindrop.app.commit_sha"].is_null());
     assert_eq!(
         payload["properties"]["raindrop.app.commit_dirty"],
@@ -252,7 +257,7 @@ async fn application_git_is_on_every_public_otlp_span_path_and_properties_overri
 #[tokio::test]
 async fn app_git_is_isolated_per_client_and_can_be_disabled() {
     let server = MockServer::start().await;
-    let recorder = mount_path(&server, "POST", "/events/track_partial").await;
+    let recorder = mount_path(&server, "POST", "/events/track").await;
     let client_a = fast_client_builder(&server)
         .app_git(configured_git(SHA_A))
         .build()
@@ -280,17 +285,12 @@ async fn app_git_is_isolated_per_client_and_can_be_disabled() {
             })
             .await
             .expect("track event");
+        client.flush().await.expect("flush");
     }
-    let requests = recorder.requests();
-    assert_eq!(
-        requests[0].json()["properties"]["raindrop.app.commit_sha"],
-        SHA_A
-    );
-    assert_eq!(
-        requests[1].json()["properties"]["raindrop.app.commit_sha"],
-        SHA_B
-    );
-    assert!(requests[2].json()["properties"]
+    let events = items(&recorder);
+    assert_eq!(events[0]["properties"]["raindrop.app.commit_sha"], SHA_A);
+    assert_eq!(events[1]["properties"]["raindrop.app.commit_sha"], SHA_B);
+    assert!(events[2]["properties"]
         .get("raindrop.app.commit_sha")
         .is_none());
     client_a.close().await.expect("close a");

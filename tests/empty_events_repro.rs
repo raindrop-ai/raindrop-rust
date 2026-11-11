@@ -1,11 +1,9 @@
-//! Wire-level regression tests for the "empty `ai_generation` events" bug.
+//! Wire-level tests for events with no `ai_input` / `ai_output`.
 //!
-//! Each test exercises a code path that used to ship a phantom
-//! `ai_generation` track_partial payload with no `ai_input` / `ai_output`,
-//! and asserts that after the buffer-level drop in
-//! `should_drop_empty_ai_event` no such payload reaches the network.
-//! Legitimate non-AI events and partial in-flight interactions are
-//! exercised here too to guarantee the drop does not over-fire.
+//! Whether an empty event is kept is ingest's decision (decision D6): the SDK
+//! sends it, and warns when an interaction is finished with no input, output
+//! or attachments (CONTRACT 14.2, rule C5). Complete events (`track_ai`,
+//! `track_event`) go to `events/track`; interactions to `events/track_partial`.
 
 mod common;
 
@@ -16,16 +14,15 @@ use wiremock::MockServer;
 
 use raindrop::{AiEvent, Attachment, BeginOptions, Event, FinishOptions, PatchOptions};
 
-use crate::common::{fast_client_builder, mount_path};
+use crate::common::{fast_client_builder, items, mount_path};
 
-/// The actual production failure mode (chisel/1.0.0): a wrapper that records
-/// `model`, `convo_id`, and token usage in `properties` but never populates
-/// `input` / `output`. Before the fix this shipped a finalized event with
-/// `ai_data` attached but `ai_input`/`ai_output` empty.
+/// A wrapper that records `model`, `convo_id`, and token usage in
+/// `properties` but never populates `input` / `output`: the event is still
+/// sent, and ingest decides whether to keep it.
 #[tokio::test]
-async fn chisel_style_track_ai_with_metadata_only_is_dropped() {
+async fn chisel_style_track_ai_with_metadata_only_ships() {
     let server = MockServer::start().await;
-    let recorder = mount_path(&server, "POST", "/events/track_partial").await;
+    let recorder = mount_path(&server, "POST", "/events/track").await;
 
     let client = fast_client_builder(&server).build().expect("build client");
 
@@ -51,19 +48,18 @@ async fn chisel_style_track_ai_with_metadata_only_is_dropped() {
 
     let _ = client.close().await;
 
-    assert!(
-        recorder.requests().is_empty(),
-        "chisel-style empty-text track_ai must be dropped"
-    );
+    let events = items(&recorder);
+    assert_eq!(events.len(), 1, "ingest decides whether to keep it (D6)");
+    assert_eq!(events[0]["ai_data"]["model"], "swe-1-6-slow");
+    assert!(events[0]["ai_data"].get("input").is_none());
 }
 
-/// `track_event` called with an empty `event` name silently defaults to
-/// `ai_generation`. With no AI text fields populated, this used to ship as a
-/// phantom event. The fix drops it.
+/// `track_event` called with an empty `event` name defaults to
+/// `ai_generation` and is still sent.
 #[tokio::test]
-async fn track_event_with_empty_event_name_is_dropped() {
+async fn track_event_with_empty_event_name_ships_with_default_name() {
     let server = MockServer::start().await;
-    let recorder = mount_path(&server, "POST", "/events/track_partial").await;
+    let recorder = mount_path(&server, "POST", "/events/track").await;
 
     let client = fast_client_builder(&server).build().expect("build client");
 
@@ -79,14 +75,16 @@ async fn track_event_with_empty_event_name_is_dropped() {
 
     let _ = client.close().await;
 
-    assert!(recorder.requests().is_empty());
+    let events = items(&recorder);
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["event"], "ai_generation");
 }
 
 /// `track_ai` with every text field blank.
 #[tokio::test]
-async fn track_ai_with_all_empty_fields_is_dropped() {
+async fn track_ai_with_all_empty_fields_ships() {
     let server = MockServer::start().await;
-    let recorder = mount_path(&server, "POST", "/events/track_partial").await;
+    let recorder = mount_path(&server, "POST", "/events/track").await;
 
     let client = fast_client_builder(&server).build().expect("build client");
 
@@ -106,15 +104,18 @@ async fn track_ai_with_all_empty_fields_is_dropped() {
 
     let _ = client.close().await;
 
-    assert!(recorder.requests().is_empty());
+    assert_eq!(
+        items(&recorder).len(),
+        1,
+        "ingest decides whether to keep it (D6)"
+    );
 }
 
-/// `begin()` + `finish()` lifecycle with every field defaulted. The pending
-/// `begin` patch is buffered, the `finish` patch merges and flushes; before
-/// the fix the single merged shipment was a phantom `ai_generation`. With
-/// the fix it is dropped at flush time.
+/// `begin()` + `finish()` lifecycle with every field defaulted. The merged
+/// finish is sent (with a warning, see tests/hardening.rs); ingest decides
+/// whether to keep it.
 #[tokio::test]
-async fn begin_finish_with_no_input_or_output_is_dropped() {
+async fn begin_finish_with_no_input_or_output_still_ships() {
     let server = MockServer::start().await;
     let recorder = mount_path(&server, "POST", "/events/track_partial").await;
 
@@ -142,7 +143,13 @@ async fn begin_finish_with_no_input_or_output_is_dropped() {
 
     let _ = client.close().await;
 
-    assert!(recorder.requests().is_empty());
+    let requests = recorder.requests();
+    assert_eq!(
+        requests.len(),
+        1,
+        "sent with a warning; ingest decides (C5, D6)"
+    );
+    assert_eq!(requests[0].json()["is_pending"], false);
 }
 
 /// Non-AI `track_event` calls with an explicit event name and no AI fields are
@@ -150,7 +157,7 @@ async fn begin_finish_with_no_input_or_output_is_dropped() {
 #[tokio::test]
 async fn non_ai_track_event_with_custom_name_still_ships() {
     let server = MockServer::start().await;
-    let recorder = mount_path(&server, "POST", "/events/track_partial").await;
+    let recorder = mount_path(&server, "POST", "/events/track").await;
 
     let client = fast_client_builder(&server).build().expect("build client");
 
@@ -170,11 +177,10 @@ async fn non_ai_track_event_with_custom_name_still_ships() {
 
     let _ = client.close().await;
 
-    let requests = recorder.requests();
+    let requests = items(&recorder);
     assert_eq!(requests.len(), 1, "non-AI events must still ship");
-    let payload = requests[0].json();
+    let payload = requests[0].clone();
     assert_eq!(payload["event"], "page_view");
-    assert_eq!(payload["is_pending"], false);
     assert!(payload.get("ai_data").is_none() || payload["ai_data"].is_null());
 }
 
@@ -185,7 +191,7 @@ async fn non_ai_track_event_with_custom_name_still_ships() {
 #[tokio::test]
 async fn attachment_only_event_with_default_name_still_ships() {
     let server = MockServer::start().await;
-    let recorder = mount_path(&server, "POST", "/events/track_partial").await;
+    let recorder = mount_path(&server, "POST", "/events/track").await;
 
     let client = fast_client_builder(&server).build().expect("build client");
 
@@ -207,13 +213,13 @@ async fn attachment_only_event_with_default_name_still_ships() {
 
     let _ = client.close().await;
 
-    let requests = recorder.requests();
+    let requests = items(&recorder);
     assert_eq!(
         requests.len(),
         1,
         "attachment-only event must still ship even with default event name"
     );
-    let payload = requests[0].json();
+    let payload = requests[0].clone();
     assert_eq!(payload["attachments"][0]["type"], "image");
     assert_eq!(
         payload["attachments"][0]["value"],
@@ -236,7 +242,7 @@ async fn attachment_only_event_with_default_name_still_ships() {
 #[tokio::test]
 async fn attachment_only_ai_event_with_model_set_still_ships() {
     let server = MockServer::start().await;
-    let recorder = mount_path(&server, "POST", "/events/track_partial").await;
+    let recorder = mount_path(&server, "POST", "/events/track").await;
 
     let client = fast_client_builder(&server).build().expect("build client");
 
@@ -262,14 +268,14 @@ async fn attachment_only_ai_event_with_model_set_still_ships() {
 
     let _ = client.close().await;
 
-    let requests = recorder.requests();
+    let requests = items(&recorder);
     assert_eq!(
         requests.len(),
         1,
         "vision/image-only AI event must ship even though ai_data is attached \
          (model+convo_id set) and input/output are both empty — attachments are payload"
     );
-    let payload = requests[0].json();
+    let payload = requests[0].clone();
     assert_eq!(payload["ai_data"]["model"], "gpt-4o");
     assert_eq!(payload["ai_data"]["convo_id"], "conv-vision");
     assert_eq!(payload["attachments"][0]["type"], "image");
@@ -277,7 +283,6 @@ async fn attachment_only_ai_event_with_model_set_still_ships() {
         payload["attachments"][0]["value"],
         "https://example.com/screenshot.png"
     );
-    assert_eq!(payload["is_pending"], false);
 }
 
 /// A wrapper that captures the prompt but the model returned an empty
@@ -288,7 +293,7 @@ async fn attachment_only_ai_event_with_model_set_still_ships() {
 #[tokio::test]
 async fn errored_generation_with_input_only_still_ships() {
     let server = MockServer::start().await;
-    let recorder = mount_path(&server, "POST", "/events/track_partial").await;
+    let recorder = mount_path(&server, "POST", "/events/track").await;
 
     let client = fast_client_builder(&server).build().expect("build client");
 
@@ -307,11 +312,10 @@ async fn errored_generation_with_input_only_still_ships() {
 
     let _ = client.close().await;
 
-    let requests = recorder.requests();
+    let requests = items(&recorder);
     assert_eq!(requests.len(), 1);
-    let payload = requests[0].json();
+    let payload = requests[0].clone();
     assert_eq!(payload["ai_data"]["input"], "Hello");
-    assert_eq!(payload["is_pending"], false);
 }
 
 /// In-flight `begin()` whose flush ships an `is_pending=true` patch must NOT
@@ -383,7 +387,7 @@ async fn patch_only_user_id_still_ships_as_pending() {
 #[tokio::test]
 async fn full_ai_event_still_ships() {
     let server = MockServer::start().await;
-    let recorder = mount_path(&server, "POST", "/events/track_partial").await;
+    let recorder = mount_path(&server, "POST", "/events/track").await;
 
     let client = fast_client_builder(&server).build().expect("build client");
 
@@ -403,9 +407,9 @@ async fn full_ai_event_still_ships() {
 
     let _ = client.close().await;
 
-    let requests = recorder.requests();
+    let requests = items(&recorder);
     assert_eq!(requests.len(), 1);
-    let payload = requests[0].json();
+    let payload = requests[0].clone();
     assert_eq!(payload["ai_data"]["input"], "Hi");
     assert_eq!(payload["ai_data"]["output"], "Hello!");
     assert_eq!(payload["event"], "chat");

@@ -37,6 +37,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     retrieval.end();
 
     agent_run.end();
-    client.close().await?;
+    // Telemetry errors are safe to ignore: log them, don't fail your program on them.
+    if let Err(err) = client.close().await {
+        eprintln!("raindrop: {err}");
+    }
     Ok(())
 }

@@ -9,12 +9,12 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use raindrop::{AiEvent, Attachment, BeginOptions, Event, FinishOptions, PatchOptions};
 
-use crate::common::{fast_client_builder, json_get, mount_any_post, mount_path};
+use crate::common::{fast_client_builder, items, json_get, mount_any_post, mount_path};
 
 #[tokio::test]
-async fn track_ai_sends_track_partial_payload() {
+async fn track_ai_queues_and_ships_on_events_track() {
     let server = MockServer::start().await;
-    let recorder = mount_path(&server, "POST", "/events/track_partial").await;
+    let recorder = mount_path(&server, "POST", "/events/track").await;
 
     let client = fast_client_builder(&server).build().expect("build client");
 
@@ -36,11 +36,13 @@ async fn track_ai_sends_track_partial_payload() {
         })
         .await
         .expect("track_ai");
+    // track_ai only queues (CONTRACT 1.1); flush makes it durable.
+    assert_eq!(recorder.count(), 0);
+    client.flush().await.expect("flush");
 
-    let payload = recorder.requests()[0].json();
+    let payload = items(&recorder)[0].clone();
     assert_eq!(payload["event_id"], "evt_123");
     assert_eq!(payload["ai_data"]["model"], "gpt-4o");
-    assert_eq!(payload["is_pending"], false);
     let library_name = json_get(&payload, &["properties", "$context", "library", "name"])
         .and_then(|v| v.as_str())
         .unwrap_or_default();
@@ -234,7 +236,7 @@ async fn track_signal_and_identify_use_expected_endpoints() {
 #[tokio::test]
 async fn track_event_sends_non_ai_payload() {
     let server = MockServer::start().await;
-    let recorder = mount_path(&server, "POST", "/events/track_partial").await;
+    let recorder = mount_path(&server, "POST", "/events/track").await;
     let client = fast_client_builder(&server).build().expect("build");
 
     let mut props = BTreeMap::new();
@@ -251,7 +253,7 @@ async fn track_event_sends_non_ai_payload() {
         .expect("track_event");
     let _ = client.close().await;
 
-    let payload = recorder.requests().last().expect("a request").json();
+    let payload = items(&recorder).last().expect("an event").clone();
     assert_eq!(payload["event"], "session_started");
     assert_eq!(payload["user_id"], "user-123");
     assert_eq!(payload["properties"]["entrypoint"], "dashboard");
