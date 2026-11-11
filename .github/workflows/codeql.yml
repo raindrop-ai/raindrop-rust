@@ -6,6 +6,7 @@ on:
   schedule:
     # Mondays 06:00 UTC
     - cron: "0 6 * * 1"
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -42,11 +43,11 @@ jobs:
           persist-credentials: false
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
+        uses: github/codeql-action/init@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
         with:
           languages: ${{ matrix.language }}
           build-mode: ${{ matrix.build-mode }}
-          # Default (high-precision) suite; the relay only forwards High/Critical.
+          # Default (high-precision) suite; the relay only forwards Medium and above.
           config: |
             paths-ignore:
               - "tests/**"
@@ -54,12 +55,12 @@ jobs:
               - "conformance/**"
 
       - name: Perform CodeQL analysis
-        uses: github/codeql-action/analyze@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
+        uses: github/codeql-action/analyze@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
         with:
           category: "/language:${{ matrix.language }}"
 
   relay-alerts:
-    name: Relay new High/Critical alerts
+    name: Relay new Medium/High/Critical alerts
     needs: analyze
     # Run even if one language's scan failed, so alerts the other languages uploaded still go out.
     if: ${{ !cancelled() && github.event_name == 'push' }}
@@ -88,11 +89,12 @@ jobs:
               [ .[][]
                 | select(.created_at >= $since)
                 | select(.most_recent_instance.commit_sha == $sha)
-                | select((.rule.security_severity_level // "") | ascii_downcase | IN("high", "critical"))
+                | select((.rule.security_severity_level // "") | ascii_downcase | IN("medium", "high", "critical"))
                 | {
                     number,
                     rule: (.rule.id // .rule.name),
                     description: (.rule.description // ""),
+                    category: .most_recent_instance.category,
                     severity: ((.rule.security_severity_level // "") | ascii_downcase),
                     file: (.most_recent_instance.location.path // ""),
                     line: (.most_recent_instance.location.start_line // 0),
@@ -102,42 +104,68 @@ jobs:
 
           count="$(jq 'length' alerts.json)"
           echo "count=${count}" >> "$GITHUB_OUTPUT"
-          echo "${count} new High/Critical alert(s) from this run"
+          echo "${count} new Medium/High/Critical alert(s) from this run"
           jq -r '.[] | "- [\(.severity)] \(.rule) \(.file):\(.line) \(.url)"' alerts.json
 
-      - name: Notify Slack
-        if: steps.collect.outputs.count != '0'
-        env:
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_CODEQL_WEBHOOK_URL }}
-          REPO: ${{ github.repository }}
-          HEAD_SHA: ${{ github.sha }}
-        run: |
-          set -euo pipefail
-          while IFS= read -r alert; do
-            payload="$(jq -n --argjson a "$alert" --arg repo "$REPO" --arg sha "$HEAD_SHA" '{
-              text: (
-                ":rotating_light: New CodeQL *\($a.severity | ascii_upcase)* alert in \($repo)\n"
-                + "*Rule:* \($a.rule)"
-                + (if $a.description != "" then " — \($a.description)" else "" end) + "\n"
-                + "*File:* `\($a.file):\($a.line)`\n"
-                + "*Commit:* \($sha[0:12])\n"
-                + "<\($a.url)|View alert #\($a.number)>"
-              )
-            }')"
-            curl -sSf -X POST -H 'Content-Type: application/json' \
-              --data "$payload" "$SLACK_WEBHOOK_URL" > /dev/null
-          done < <(jq -c '.[]' alerts.json)
-
       - name: Notify Devin triage webhook
-        # Independent of the Slack step, so a Slack outage doesn't block triage.
-        if: ${{ !cancelled() && steps.collect.outcome == 'success' && steps.collect.outputs.count != '0' }}
         env:
+          GH_TOKEN: ${{ github.token }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          RUN_ID: ${{ github.run_id }}
           DEVIN_WEBHOOK_URL: ${{ secrets.DEVIN_CODEQL_WEBHOOK_URL }}
           DEVIN_WEBHOOK_SECRET: ${{ secrets.DEVIN_CODEQL_WEBHOOK_SECRET }}
           REPO: ${{ github.repository }}
           HEAD_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
+          run_started_at="$(gh api "repos/${REPO}/actions/runs/${RUN_ID}" --jq '.run_started_at')"
+          prior_categories="$(gh api --paginate -X GET "repos/${REPO}/code-scanning/analyses" \
+            -f ref="refs/heads/${DEFAULT_BRANCH}" -f tool_name=CodeQL -f per_page=100 \
+            | jq -sc --arg since "$run_started_at" '
+              [ .[][]
+                | select((.analysis_key // "") | startswith(".github/workflows/codeql.yml"))
+                | select(.created_at < $since)
+                | .category
+                | select(type == "string" and length > 0)
+              ] | unique')"
+          baselined="$(jq --argjson prior "$prior_categories" '
+            [.[] | select(.category as $category | $prior | index($category) | not)]
+          ' alerts.json)"
+          baseline_count="$(jq 'length' <<< "$baselined")"
+          if [ "$baseline_count" -gt 0 ]; then
+            categories="$(jq -r 'map(.category // "") | unique | join(",")' <<< "$baselined")"
+            echo "::notice title=codeql-relay-baselined::baselined=${baseline_count} categories=${categories}"
+          fi
+          jq --argjson prior "$prior_categories" '
+            [.[] | select(.category as $category | $prior | index($category))]
+          ' alerts.json > relay-alerts.json
+          count="$(jq 'length' relay-alerts.json)"
+
+          if [ "$count" -gt 20 ]; then
+            payload="$(jq -c --arg repo "$REPO" --arg sha "$HEAD_SHA" '{
+              source: "codeql",
+              batch: true,
+              repository: $repo,
+              commit: $sha,
+              count: length,
+              alerts: map({alert_number: .number, rule, description, severity, file, line, url})
+            }' relay-alerts.json)"
+            urls="$(jq -r 'map(.url) | join(" ")' relay-alerts.json)"
+            if ! curl -sSf --max-time 20 --retry 2 -X POST \
+              -H 'Content-Type: application/json' \
+              -H "Authorization: Bearer ${DEVIN_WEBHOOK_SECRET}" \
+              --data "$payload" "$DEVIN_WEBHOOK_URL" > /dev/null; then
+              echo "::warning title=codeql-relay-failed::failed=${count} batched ${urls}"
+              exit 1
+            fi
+            echo "::notice title=codeql-relay-sent::sent=${count} batched ${urls}"
+            exit 0
+          fi
+
+          sent=0
+          failed=0
+          sent_urls=""
+          failed_urls=""
           while IFS= read -r alert; do
             payload="$(jq -n --argjson a "$alert" --arg repo "$REPO" --arg sha "$HEAD_SHA" '{
               source: "codeql",
@@ -151,8 +179,21 @@ jobs:
               line: $a.line,
               url: $a.url
             }')"
-            curl -sSf -X POST \
+            if ! curl -sSf --max-time 20 --retry 2 -X POST \
               -H 'Content-Type: application/json' \
               -H "Authorization: Bearer ${DEVIN_WEBHOOK_SECRET}" \
-              --data "$payload" "$DEVIN_WEBHOOK_URL" > /dev/null
-          done < <(jq -c '.[]' alerts.json)
+              --data "$payload" "$DEVIN_WEBHOOK_URL" > /dev/null; then
+              failed=$((failed+1))
+              failed_urls+=" $(jq -r '.url' <<< "$alert")"
+            else
+              sent=$((sent+1))
+              sent_urls+=" $(jq -r '.url' <<< "$alert")"
+            fi
+          done < <(jq -c '.[]' relay-alerts.json)
+          if [ "$sent" -ne 0 ]; then
+            echo "::notice title=codeql-relay-sent::sent=${sent}${sent_urls}"
+          fi
+          if [ "$failed" -ne 0 ]; then
+            echo "::warning title=codeql-relay-failed::failed=${failed}${failed_urls}"
+            exit 1
+          fi
