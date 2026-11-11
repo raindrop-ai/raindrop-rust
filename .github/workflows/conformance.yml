@@ -74,7 +74,7 @@ env:
   CARGO_TERM_COLOR: always
   # invisible-tools/raindrop-sdk-harness — see "Harness pin" in the header.
   HARNESS_REPO: invisible-tools/raindrop-sdk-harness
-  HARNESS_REF: c109c6d294e4f73c04c04b6839d83e209dee2c2f # raindrop-sdk-harness main (SDK contract v1.3 merge commit)
+  HARNESS_REF: c0f22b23404b6c1fbc3c01c132481f5d3fe506c0 # raindrop-sdk-harness main (contract §9.3 merge commit)
   SERVER_URL: http://127.0.0.1:8787
   # Driver binary produced by `cargo build --manifest-path conformance/Cargo.toml`.
   # conformance/ is a standalone bin crate outside the workspace that depends on
