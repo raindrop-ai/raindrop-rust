@@ -2,7 +2,7 @@
 
 All notable changes to this crate are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versioning follows [SemVer](https://semver.org).
 
-## [0.0.10] - unreleased
+## [0.0.10] - 2026-11-12
 
 Brings the SDK in line with the cross-SDK behaviour contract checked by the
 conformance harness.
@@ -138,7 +138,7 @@ grow its memory without bound, or flood its logs.
   * attachment-only events with no AI text still ship (image upload events),
   * errored generations that ship the prompt as `input` (only `output` empty)
     still ship — the wrapper should attach an `LlmSpan` and call
-    `set_error(...)` on it to carry the error detail; Dawn associates the
+    `set_error(...)` on it to carry the error detail; Raindrop associates the
     error span with the event row by `event_id` via the `error_spans`
     extension, mirroring the JS SDK's `liveInteraction.setError` path,
   * pending intermediates (`is_pending=true`) still ship — the caller may
@@ -150,7 +150,7 @@ grow its memory without bound, or flood its logs.
 
 - **LLM span helpers.** `Client::start_llm_span`, `Interaction::start_llm_span`,
   `Tracer::start_llm_span`, `LlmSpan`, `LlmOptions`, and `LlmMessage` emit the
-  prompt, completion, model, provider, and token attributes that Dawn's trace
+  prompt, completion, model, provider, and token attributes that Raindrop's trace
   parser and span renderer understand.
 
 <!--
