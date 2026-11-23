@@ -51,6 +51,8 @@ jobs:
             --test empty_events_repro \
             --test events \
             --test hardening \
+            --test mask \
+            --test mask_log \
             --test traces \
             --test transport \
             --test wire_format \
@@ -95,6 +97,8 @@ jobs:
             --test empty_events_repro \
             --test events \
             --test hardening \
+            --test mask \
+            --test mask_log \
             --test traces \
             --test transport \
             --test wire_format

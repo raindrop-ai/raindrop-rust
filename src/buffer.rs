@@ -358,11 +358,28 @@ impl EventBuffer {
             );
         }
 
-        match client
-            .transport
-            .post_json_until("events/track_partial", &payload, deadline)
-            .await
-        {
+        // The caller's mask runs on every request, on the payload as built
+        // from the buffered (unmasked) state, so a restored update is never
+        // masked twice.
+        let sent = match &client.mask {
+            None => {
+                client
+                    .transport
+                    .post_json_until("events/track_partial", &payload, deadline)
+                    .await
+            }
+            Some(mask) => match serde_json::to_value(&payload) {
+                Ok(mut body) => {
+                    mask.payload(crate::mask::MaskKind::Event, &mut body);
+                    client
+                        .transport
+                        .post_json_until("events/track_partial", &body, deadline)
+                        .await
+                }
+                Err(err) => Err(SendFailure::Failed(err.into())),
+            },
+        };
+        match sent {
             Ok(()) => {
                 if payload.is_pending {
                     return Undelivered::default();

@@ -20,6 +20,7 @@ use crate::events::{
 use crate::helpers::{new_event_id, truncate_text_in_place};
 use crate::http::{format_endpoint, RetryingHttpClient, TransportConfig};
 use crate::local_debugger::{resolve_local_workshop_url, LocalWorkshopUrlConfig};
+use crate::mask::{Mask, MaskContext, MaskError, MaskKind};
 use crate::otlp::{create_span_ids, Attribute, OtlpKeyValue, OtlpSpan, OtlpStatus};
 use crate::outbox::{Outbox, Undelivered};
 use crate::signals::{track_signal, Signal};
@@ -70,6 +71,9 @@ pub(crate) struct ClientInner {
     /// Complete events, signals and identify calls awaiting delivery.
     pub(crate) outbox: Arc<Outbox>,
     pub(crate) max_text_field_chars: usize,
+    /// The caller's mask function, run on content just before it is queued
+    /// or sent.
+    pub(crate) mask: Option<Mask>,
     pub(crate) close_timeout: Duration,
     pub(crate) flush_timeout: Duration,
     pub(crate) closed: AtomicBool,
@@ -79,6 +83,17 @@ pub(crate) struct ClientInner {
     /// buffer's stop notify fires, so they MUST NOT live in `flush_tasks`:
     /// awaiting them from `flush()` would block until `close()`.
     pub(crate) periodic_tasks: std::sync::Mutex<Vec<JoinHandle<()>>>,
+}
+
+impl ClientInner {
+    /// Queue a complete event, signal or identify item, its content passed
+    /// through the caller's mask first.
+    pub(crate) fn queue(&self, route: &'static str, kind: MaskKind, mut item: Value) {
+        if let Some(mask) = &self.mask {
+            mask.payload(kind, &mut item);
+        }
+        self.outbox.push(route, item);
+    }
 }
 
 impl std::fmt::Debug for ClientInner {
@@ -124,6 +139,7 @@ pub struct ClientBuilder {
     http_client: Option<reqwest::Client>,
     app_git_enabled: bool,
     app_git: AppGitConfig,
+    mask: Option<Mask>,
 }
 
 impl Default for ClientBuilder {
@@ -153,6 +169,7 @@ impl Default for ClientBuilder {
             http_client: None,
             app_git_enabled: true,
             app_git: AppGitConfig::default(),
+            mask: None,
         }
     }
 }
@@ -358,6 +375,65 @@ impl ClientBuilder {
     }
 
     /// Build the [`Client`].
+    /// Install a masking function: it gets each piece of content just before
+    /// it is queued or sent, and returns the value to send in its place.
+    ///
+    /// It is called with a copy of the value and a [`MaskContext`] naming the
+    /// payload kind and field:
+    ///
+    /// * events: `ai_data.input` and `ai_data.output` (strings), `properties`
+    ///   (an object, without the SDK's own `$context` and application Git
+    ///   properties) and `attachments` (an array), on `track_event`,
+    ///   `track_ai` and every request an interaction sends (begin, patch,
+    ///   finish, resume);
+    /// * signals: `properties` (an object, with `comment` and `after` in it);
+    /// * identify: `traits` (an object);
+    /// * spans: each content attribute (prompts, completions, tool input and
+    ///   output, copies of caller properties), as a string, with the attribute
+    ///   name as the field, and the status message as `status.message`.
+    ///
+    /// Identity and routing fields (ids, user id, event name, model, timing,
+    /// token counts) are never passed. Return a value of the same JSON type
+    /// you were given.
+    ///
+    /// Fail-closed: if the function returns an error, panics, or returns a
+    /// different JSON type, the field is sent as [`crate::MASK_FAILED`] (an
+    /// object as `{"error": "<MASK FAILED>"}`, attachments as `[]`), the rest
+    /// of the payload still ships, and a rate-limited warning names the kind,
+    /// field and failure, never the content or the error's message. The SDK
+    /// never panics or returns an error to you because of the mask. Note that
+    /// a panic still runs the process's panic hook (which by default prints
+    /// the panic message), and is not caught under `panic = "abort"`; prefer
+    /// returning an error.
+    ///
+    /// The function must be quick and must not block: it runs on the calling
+    /// task for queued payloads and on the SDK's send path for interaction
+    /// updates.
+    ///
+    /// ```no_run
+    /// use raindrop::{Client, MaskKind};
+    /// use serde_json::Value;
+    ///
+    /// let client = Client::builder()
+    ///     .mask(|value, ctx| {
+    ///         Ok(match value {
+    ///             Value::String(s) if ctx.kind != MaskKind::Span => {
+    ///                 Value::String(s.replace("Jane Doe", "[name]"))
+    ///             }
+    ///             other => other,
+    ///         })
+    ///     })
+    ///     .build();
+    /// # drop(client);
+    /// ```
+    pub fn mask<F>(mut self, mask: F) -> Self
+    where
+        F: Fn(Value, &MaskContext) -> std::result::Result<Value, MaskError> + Send + Sync + 'static,
+    {
+        self.mask = Some(Mask::new(mask));
+        self
+    }
+
     pub fn build(self) -> Result<Client> {
         let endpoint = format_endpoint(&self.endpoint);
         let project_id = crate::project_id::resolve(self.project_id.as_deref());
@@ -433,6 +509,7 @@ impl ClientBuilder {
             trace_buffer,
             outbox,
             max_text_field_chars: effective_text_field_limit(self.max_text_field_chars),
+            mask: self.mask,
             close_timeout: self.close_timeout.unwrap_or(self.flush_timeout),
             flush_timeout: self.flush_timeout,
             closed: AtomicBool::new(false),
@@ -505,7 +582,7 @@ impl Client {
             app_git_snapshot,
         });
         self.inner.app_git_operations.remove(&event_id);
-        self.inner.outbox.push("events/track", item);
+        self.inner.queue("events/track", MaskKind::Event, item);
         Ok(())
     }
 
@@ -546,7 +623,7 @@ impl Client {
             app_git_snapshot,
         });
         self.inner.app_git_operations.remove(&event_id);
-        self.inner.outbox.push("events/track", item);
+        self.inner.queue("events/track", MaskKind::Event, item);
         Ok(())
     }
 
@@ -991,6 +1068,10 @@ impl Client {
     pub(crate) fn enqueue_span(&self, span: OtlpSpan) {
         if !self.inner.enabled {
             return;
+        }
+        let mut span = span;
+        if let Some(mask) = &self.inner.mask {
+            mask.span(&mut span);
         }
         let buffer = self.inner.trace_buffer.clone();
         let inner = self.inner.clone();

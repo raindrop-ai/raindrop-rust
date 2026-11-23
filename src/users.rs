@@ -34,8 +34,10 @@ pub(crate) async fn identify(client: &ClientInner, user: User) -> Result<()> {
     };
     // A hot-path call (CONTRACT 1.1): queued, sent batched on the next
     // background cycle or flush.
-    client
-        .outbox
-        .push("users/identify", serde_json::to_value(payload)?);
+    client.queue(
+        "users/identify",
+        crate::mask::MaskKind::Identify,
+        serde_json::to_value(payload)?,
+    );
     Ok(())
 }

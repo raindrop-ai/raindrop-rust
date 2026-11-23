@@ -108,8 +108,10 @@ pub(crate) async fn track_signal(client: &ClientInner, signal: Signal) -> Result
 
     // A hot-path call (CONTRACT 1.1): queued, sent batched with other
     // signals on the next background cycle or flush.
-    client
-        .outbox
-        .push("signals/track", serde_json::to_value(payload)?);
+    client.queue(
+        "signals/track",
+        crate::mask::MaskKind::Signal,
+        serde_json::to_value(payload)?,
+    );
     Ok(())
 }
