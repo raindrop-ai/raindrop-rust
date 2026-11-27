@@ -48,6 +48,7 @@ mod events;
 mod helpers;
 mod http;
 mod local_debugger;
+mod mask;
 mod otlp;
 mod outbox;
 mod project_id;
@@ -68,6 +69,7 @@ pub use local_debugger::{
     resolve_local_workshop_url, LocalWorkshopUrlConfig, DEFAULT_LOCAL_WORKSHOP_URL,
     LOCAL_DEBUGGER_ENV_VAR, WORKSHOP_ENV_VAR,
 };
+pub use mask::{MaskContext, MaskError, MaskKind, MASK_FAILED};
 pub use otlp::{Attribute, AttributeValue, SpanStatusCode};
 pub use signals::{Signal, SignalKind};
 pub use subagent::{ResumeSubagentOptions, SubagentDispatch, SubagentOptions, HANDOFF_HEADER};

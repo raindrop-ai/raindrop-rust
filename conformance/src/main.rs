@@ -32,11 +32,11 @@ use time::OffsetDateTime;
 
 use raindrop::{
     AiEvent, AppGitConfig, Attachment, BeginOptions, Client, ClientBuilder, Event, FinishOptions,
-    Interaction, PatchOptions, ResumeOptions, ResumeSubagentOptions, Signal, Span, SubagentOptions,
-    ToolOptions, TrackToolOptions, User,
+    Interaction, MaskContext, MaskError, PatchOptions, ResumeOptions, ResumeSubagentOptions,
+    Signal, Span, SubagentOptions, ToolOptions, TrackToolOptions, User,
 };
 
-const DRIVER_VERSION: &str = "1.2.0";
+const DRIVER_VERSION: &str = "1.3.0";
 const PROTOCOL: u64 = 1;
 const SDK_NAME: &str = "raindrop-rust";
 
@@ -84,6 +84,9 @@ const CAPABILITIES: &[&str] = &[
     // `wait`: sleep without an SDK call, so background delivery is
     // observable without an explicit flush.
     "timing.wait",
+    // init.mask -> ClientBuilder::mask with one of the harness's fixed test
+    // masks (README "Test masks"; CONTRACT 11.4).
+    "privacy.mask",
 ];
 const NOT_APPLICABLE: &[&str] = &["wrapper.capture", "events.track_ai_partial"];
 // A not_applicable claim must argue "not fixable" (README policy).
@@ -308,6 +311,18 @@ impl Driver {
                 ))
             })?;
             builder = builder.flush_timeout(std::time::Duration::from_millis(ms));
+        }
+        if let Some(raw) = args.get("mask") {
+            builder = match raw.as_str() {
+                Some("tag") => builder.mask(tag_mask),
+                Some("throw") => builder.mask(throw_mask),
+                Some("suffix") => builder.mask(suffix_mask),
+                _ => {
+                    return Err(Failure(format!(
+                        "init: mask must be \"tag\", \"throw\" or \"suffix\", got {raw}"
+                    )))
+                }
+            };
         }
         let client = builder
             .build()
@@ -592,6 +607,31 @@ impl Driver {
 }
 
 /// Hold the process for `ms` milliseconds without an SDK call.
+/// Test mask `tag`: strings become `<MASKED {kind} {field}>`, objects
+/// `{"masked": "{kind} {field}"}`, arrays (attachments) `[]`.
+fn tag_mask(value: Value, ctx: &MaskContext) -> Result<Value, MaskError> {
+    Ok(match value {
+        Value::String(_) => Value::String(format!("<MASKED {} {}>", ctx.kind, ctx.field)),
+        Value::Array(_) => Value::Array(Vec::new()),
+        _ => json!({ "masked": format!("{} {}", ctx.kind, ctx.field) }),
+    })
+}
+
+/// Test mask `throw`: fails on every value. Returning an error is the Rust
+/// API's throw; the SDK sends `<MASK FAILED>` in its place.
+fn throw_mask(_value: Value, _ctx: &MaskContext) -> Result<Value, MaskError> {
+    Err("test mask: throw".into())
+}
+
+/// Test mask `suffix`: strings get ` [masked by ops@example.com]` appended;
+/// objects and arrays are returned unchanged.
+fn suffix_mask(value: Value, _ctx: &MaskContext) -> Result<Value, MaskError> {
+    Ok(match value {
+        Value::String(s) => Value::String(format!("{s} [masked by ops@example.com]")),
+        other => other,
+    })
+}
+
 async fn step_wait(args: &Map<String, Value>) -> Result<(), Failure> {
     let ms = args
         .get("ms")
